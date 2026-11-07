@@ -34,7 +34,7 @@ config zone
 	list network 'lan'
 	option input 'ACCEPT'
 	option output 'ACCEPT'
-	option forward 'REJECT'
+	option forward 'ACCEPT'
 
 config zone
 	option name 'wan'
