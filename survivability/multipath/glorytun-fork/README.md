@@ -113,6 +113,6 @@ Or by hand, against a checkout of `ysurac/glorytun@203c5f2` with submodules:
 
 ## Validated
 
-See `../RESULTS.md`. In the three-lane lab: in-order reconstruction of a
+See `../docs/lab-results.md`. In the three-lane lab: in-order reconstruction of a
 39 %-out-of-order sprayed stream (ooo → 0), and 13.8 Mbit aggregated across
 8/5/3 Mbit links with 0 % loss.

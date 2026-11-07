@@ -510,7 +510,7 @@ V.setup = () => {
   <div class="grid g2">
     <div class="card"><h2>2 · Power-up order</h2><ol style="margin:0;padding-left:20px;font-size:13px;color:var(--ink-2)">
       <li><b>Modems first:</b> ISP, Starlink (needs open sky, up to 5 min), Spitz (cellular needs a SIM).</li>
-      <li><b>Then the CWWK.</b> It boots in about 1.5 minutes and starts everything itself.</li>
+      <li><b>Then the CWWK.</b> It is ready about 2 minutes after power-on and starts everything itself.</li>
       <li><b>Wait for green:</b> Health turns green when at least one modem carries the tunnel.</li>
       <li><b>Join Wi-Fi:</b> <span class="kbd">GL-X3000-0fd</span> (or <span class="kbd">-5G</span>), or plug a laptop into a free port; devices get a 10.40.0.x address.</li>
       <li><b>Run the self-test</b> (right) and fix anything red before relying on the kit.</li></ol></div>
@@ -577,7 +577,7 @@ V.help = () => `
       <ol><li><b>Open Health.</b> The "Fix it" boxes say what is wrong and what to do, worst first.</li>
       <li><b>Run the self-test</b> (Setup). Fix the first red line; later lines often depend on it.</li>
       <li><b>Wait 60 seconds</b> after any fix. Modems, DHCP and the tunnel recover on their own.</li>
-      <li><b>Last resort:</b> reboot the CWWK (power button). Everything starts by itself in ~1.5 min.</li></ol>
+      <li><b>Last resort:</b> reboot the CWWK (power button). Everything starts by itself in about 2 min.</li></ol>
       <h3>No internet at all</h3><ul>
       <li>Is at least one modem plugged in with a green port? If not: cables / modem power.</li>
       <li>Ports green but no lanes: the modems have no internet, or the hub is down.</li>

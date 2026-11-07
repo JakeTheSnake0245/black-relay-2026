@@ -20,7 +20,7 @@ On the edge (sender), send to the Hetzner tunnel-side address, CoT-like:
 
 Bulk-ish test: `--rate 1000 --size 1200`. `--echo` also measures RTT at the
 sender. `--json` on the receiver emits one JSON object per interval for
-logging into RESULTS.md.
+logging into docs/lab-results.md.
 
 Clock note: the two hosts' clocks are not synced, so one-way delay is
 reported *relative* to the running minimum (the queueing + jitter part,

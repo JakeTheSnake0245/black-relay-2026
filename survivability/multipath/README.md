@@ -18,10 +18,11 @@ modems ──► CWWK site box ──► 6 TLS lanes per modem ──► BR2026 
 | `edge/` | Site-edge tools on `br-edge`: `br-uplinks` (recognises the modem in each port; caps per device from `carriers.conf`), `br-ctl` (the controller's only commands), `br-selftest`, `br-lane-nurse`, firewall (`nftables.conf`). |
 | `controller/` | Site controller (one web UI for the whole box: health, multipath, network, Wi-Fi, compute, services, setup, field guide), plus host tools: `br-hostinfo`, `br-port-roles`, `br-port-layout`, `br-rotate-secrets`, `br-controller-oidc`. Runbook: `controller/README.md`. |
 | `site/cwwk01/` | As-built configuration of the first site box (secrets redacted), with a rebuild guide. Refresh with `deploy/snapshot-cwwk.sh`. |
-| `deploy/` | `snapshot-cwwk.sh` (redacted as-built snapshot), `deploy-test.sh`. The BR2026 side is Ansible: `survivability/identity-stack/ansible/roles/black_relay_hub` and the edge Caddyfile. |
+| `deploy/` | `snapshot-cwwk.sh` (redacted as-built snapshot), `capture-cold-start.sh` (logs after a power-off test), `deploy-test.sh`. The BR2026 side is Ansible: `survivability/identity-stack/ansible/roles/black_relay_hub` and the edge Caddyfile. |
 | `docs/` | Field card and site architecture (HTML sources; PDFs rendered from them), diagrams. |
 | `gt-lab/`, `analysis/` | Lab scripts and capture-analysis tools used to tune the tunnel. |
 | `docs/lab-results.md` | Lab measurements behind the defaults. |
+| `docs/cold-start-test.md` | Full power-off and re-setup test: timings, what broke, what was fixed. |
 
 ## How it fits together
 

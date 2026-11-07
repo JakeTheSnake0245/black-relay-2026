@@ -310,12 +310,14 @@ li { margin: 2px 0; font-size: 9pt; }
       <ul>
         <li><b>Fail closed.</b> Site traffic can only leave through the tunnel; if it is down, traffic is dropped, never sent out a raw modem.</li>
         <li><b>Leak guard.</b> Only the encrypted lanes to the hub (TLS 443, each pinned to its modem), DHCP and modem admin pages may use a modem.</li>
+        <li><b>Hostile modems can't steer traffic.</b> Routes a modem pushes are ignored, leases overlapping the site are refused, and site addresses always route via the router.</li>
         <li><b>Hub inside existing ports.</b> No new public ports on BR2026: lanes ride HTTPS 443 behind Caddy; a secret path plus the tunnel's own keys authenticate the site.</li>
-        <li><b>Hub egress is public-only.</b> Site traffic can't reach the hub's internal networks or private ranges.</li>
-        <li><b>Client ports are safe.</b> A modem plugged into a client port can't hand out addresses on the site LAN; it is detected and the port returns to modem mode.</li>
+        <li><b>Hub egress is public-only.</b> Site traffic can't reach the hub's internal networks or private ranges; the hub's own address only on 80/443.</li>
+        <li><b>No rogue DHCP on any port.</b> DHCP replies and IPv6 router adverts from a port only reach the modem side; nothing plugged in can take over the site LAN's addressing.</li>
         <li><b>Remote control needs Pocket ID.</b> The controller's remote listener accepts only the hub, and every person signs in (admin or view-only by group).</li>
         <li><b>Least privilege.</b> Proxmox token: view + power only; multipath changes through fixed commands; the three core containers can't be stopped from the UI.</li>
-        <li><b>Self-healing.</b> Moved cables, DHCP changes, stuck lanes and a wedged tunnel recover on their own; a full reboot is back in about 1.5 min.</li>
+        <li><b>No side doors.</b> SSH is key-only; no tailnet forwarders; the on-site password works on the site LAN only (break-glass).</li>
+        <li><b>Self-healing.</b> Moved cables, DHCP changes, stuck lanes and a wedged tunnel recover on their own; the CWWK is back about 2 min after power-on.</li>
       </ul>
       <h2>Tuning (November 2026)</h2>
       <table>
@@ -324,6 +326,7 @@ li { margin: 2px 0; font-size: 9pt; }
         <tr><td>Speed caps (up/down Mbit)</td><td>ISP 100/150 · Starlink 10/150 · Spitz 5/20 · follow the modem, not the port</td></tr>
         <tr><td>Lanes</td><td>6 HTTPS connections per modem</td></tr>
         <tr><td>Reorder hold</td><td>400 ms</td></tr>
+        <tr><td>Tunnel MTU</td><td>1400 (fixed for HTTPS lanes)</td></tr>
         <tr><td>Round trip to hub</td><td>~110–130 ms</td></tr>
       </table>
       <div class="note" style="margin-top:4px">Starlink's upload is ~9 Mbit raw, so uploads lean on the ISP by design. Change caps on the controller's Multipath page.</div>

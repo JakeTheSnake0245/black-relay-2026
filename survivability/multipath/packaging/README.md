@@ -6,11 +6,16 @@ Ubuntu and OpenWrt with no library dependencies.
 
 | file (in `../dist/`) | install on |
 |---|---|
-| `black-relay-glorytun_0.3.4+br4_amd64.deb` | Hetzner OMR server VM, test VPS, any x86_64 Debian/Ubuntu |
-| `black-relay-glorytun_0.3.4+br4_arm64.deb` | arm64 Debian/Ubuntu (Hetzner CAX, Lima/UTM lab VMs) |
-| `black-relay-glorytun_0.3.4-br4_x86_64.ipk` | OMR (OpenWrt x86_64) VM on CWWK Node 01 and Node 02 |
-| `black-relay-debug_0.3.4+br4_all.deb` | test/debug: per-interface capture + verification (see `debug/README.md`) |
-| `black-relay-debug-0.3.4+br4.tar.gz` | `br-verify` + Wireshark dissector for the Mac |
+| `black-relay-glorytun_0.3.4+br6_amd64.deb` | site edges (CWWK `br-edge`), any x86_64 Debian/Ubuntu |
+| `black-relay-glorytun_0.3.4+br6_arm64.deb` | arm64 Debian/Ubuntu (Hetzner CAX, lab VMs) |
+| `black-relay-glorytun_0.3.4-br6_x86_64.ipk` | OpenWrt x86_64 |
+| `black-relay-debug_0.3.4+br6_all.deb` | test/debug: per-interface capture + verification (see `debug/README.md`) |
+| `black-relay-debug-0.3.4+br6.tar.gz` | `br-verify` + Wireshark dissector for the Mac |
+| `black-relay-image_*.tar.gz` | the BR2026 hub container (`survivability/identity-stack/ansible/roles/black_relay_hub`) |
+
+Production today: the hub runs as a container on BR2026 behind Caddy (HTTPS 443 only); sites run
+the `.deb` on `br-edge` with `TRANSPORT=wss` (Use 2b). The OMR route (Use 3) is kept for reference
+only.
 
 Installing a package **starts nothing, enables nothing, and replaces no
 binary**. The fork sits at `/usr/lib/black-relay/glorytun` beside whatever
@@ -26,7 +31,7 @@ messages carry a role byte that br3 and older cannot read. Upgrading the
     ARCHES=x86_64 packaging/build.sh      # one arch
 
 Pins `ysurac/glorytun@203c5f2` (what OMR ships) and libsodium 1.0.20
-(sha256-checked), applies `0001-black-relay-bonding-reseq.patch`, runs the FEC
+(sha256-checked), applies the fork patches `0001`–`0003` (`../glorytun-fork/`), runs the FEC
 codec self-test, and writes `dist/` + `SHA256SUMS`.
 
 ## What's in it
@@ -45,11 +50,11 @@ codec self-test, and writes `dist/` + `SHA256SUMS`.
 | *deb only* `black-relay@.service` + `/usr/lib/black-relay/tunnel` | standalone tunnel (no OMR), per-uplink source routing |
 | *deb only* `black-relay-watch@.service` | re-ups a site tunnel when an uplink gets, loses or changes its address/gateway |
 
-## Use 1 — test server (DEPLOYMENT.md step B)
+## Use 1 — test server
 
 A throwaway VPS, both ends in network namespaces. No second host, no firewall change:
 
-    sudo apt install ./black-relay-glorytun_0.3.4+br4_amd64.deb
+    sudo apt install ./black-relay-glorytun_0.3.4+br6_amd64.deb
     sudo black-relay-lab up
     sudo black-relay-lab probe 10          # report: recv/lost/ooo/depth/latency
     sudo black-relay-lab spike on; sudo black-relay-lab probe 10; sudo black-relay-lab spike off
@@ -64,9 +69,9 @@ Check the CPU type on each box first: `dpkg --print-architecture` gives `amd64` 
 
 **Hetzner (server):**
 
-    scp dist/black-relay-glorytun_0.3.4+br4_amd64.deb root@HETZNER:/tmp/
+    scp dist/black-relay-glorytun_0.3.4+br6_amd64.deb root@HETZNER:/tmp/
     ssh root@HETZNER
-    apt install /tmp/black-relay-glorytun_0.3.4+br4_amd64.deb
+    apt install /tmp/black-relay-glorytun_0.3.4+br6_amd64.deb
     black-relay-setup server            # key + /etc/black-relay/br0.conf + starts black-relay@br0
 
 Then open **UDP 5000 inbound** yourself (Hetzner Cloud firewall and/or
@@ -75,7 +80,7 @@ Then open **UDP 5000 inbound** yourself (Hetzner Cloud firewall and/or
 **Local box (client):** run `ip -br addr` to get the uplink interface names, then:
 
     scp root@HETZNER:/etc/black-relay/br0.key ./br0.key
-    sudo apt install ./black-relay-glorytun_0.3.4+br4_amd64.deb
+    sudo apt install ./black-relay-glorytun_0.3.4+br6_amd64.deb
     sudo black-relay-setup client --server HETZNER_IPV4 --key ./br0.key \
          --uplink enp2s0:300 --uplink enp3s0:150 --uplink wwan0:40
     ping 10.255.0.2
@@ -171,7 +176,7 @@ arrived, and an annotated `.pcapng` for Wireshark. See `debug/README.md`.
     site$ sudo br-capture --seconds 60
     br-verify ./br-capture-site-* --peer ./br-capture-hub-* --key br0.key
 
-## Use 3 — production OMR pair (Phase 8.5, both ends together)
+## Use 3 — OMR pair (historical; superseded by the hub container + Use 2b)
 
 The fork's data wire format differs from stock: flip **both ends in the same
 window**. Do not do this without an explicit go-ahead. Do it only after
@@ -179,14 +184,14 @@ Phases 5/5b have passed.
 
 OMR server VM (Hetzner):
 
-    sudo apt install ./black-relay-glorytun_0.3.4+br4_amd64.deb
+    sudo apt install ./black-relay-glorytun_0.3.4+br6_amd64.deb
     sudo black-relay-switch status                 # finds OMR's glorytun-udp
     sudo black-relay-switch fork                   # stock kept as <path>.stock
     systemctl list-units 'glorytun*'               # restart the one(s) shown
 
 OMR router VM (Node 01, then Node 02 standby):
 
-    opkg install /tmp/black-relay-glorytun_0.3.4-br4_x86_64.ipk
+    opkg install /tmp/black-relay-glorytun_0.3.4-br6_x86_64.ipk
     black-relay-switch fork
     /etc/init.d/glorytun-udp restart
 

@@ -3,7 +3,7 @@
 # from-scratch power-up) into coldstart/<time>/ on this Mac. Secrets masked.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-OUT=coldstart/$(date +%Y%m%d-%H%M%S); mkdir -p "$OUT"
+OUT=archive/coldstart-captures/$(date +%Y%m%d-%H%M%S); mkdir -p "$OUT"
 H=root@100.64.0.11
 mask() { sed -E 's/multithread-[0-9a-f]{32}/multithread-<masked>/g; s/(token|secret|password)([^A-Za-z]{1,4})[A-Za-z0-9+\/=_-]{12,}/\1\2<masked>/Ig'; }
 run() { ssh -o BatchMode=yes -o ConnectTimeout=20 $H "$2" 2>&1 | mask >"$OUT/$1"; echo "  $1"; }
