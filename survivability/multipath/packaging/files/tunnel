@@ -96,7 +96,8 @@ lane_start() {   # <i> <ifc> <mark>
 	# file, never on the command line (visible in ps and the journal).
 	install -d -m 0700 /run/black-relay
 	envf=/run/black-relay/$NAME.wss.env
-	( umask 077; printf 'WSTUNNEL_HTTP_UPGRADE_PATH_PREFIX=%s\n' "$WSS_PREFIX" >"$envf" )
+	# written whole, then renamed: a lane restarting meanwhile never reads a partial file
+	( umask 077; printf 'WSTUNNEL_HTTP_UPGRADE_PATH_PREFIX=%s\n' "$WSS_PREFIX" >"$envf.tmp" && chmod 600 "$envf.tmp" && mv -f "$envf.tmp" "$envf" )
 	systemctl stop "$u" 2>/dev/null || true
 	systemctl reset-failed "$u" 2>/dev/null || true
 	systemd-run --quiet --unit="$u" --collect \
@@ -162,16 +163,23 @@ uplink_routes() {
 		[ -n "$gw" ] || gw=$(ip -4 route show default dev "$ifc" | awk '/ via / {for (n = 1; n < NF; n++) if ($n == "via") {print $(n + 1); exit}}')
 
 		ip route flush table "$t" 2>/dev/null || true
+		# never fall through to another table: a flushed route must not send this
+		# uplink's lanes out of a different modem
+		ip route add unreachable default metric 4294967295 table "$t" 2>/dev/null || true
+		# one bad uplink (off-subnet gateway, link flapping now) skips itself, never the rest
 		if [ -n "$gw" ]; then
-			ip route add "$SERVER/32" via "$gw" dev "$ifc" src "$src" table "$t"
+			ip route add "$SERVER/32" via "$gw" dev "$ifc" src "$src" table "$t" ||
+				{ log "uplink $ifc: route via $gw failed, skipped"; continue; }
 		else
 			# point-to-point links (wwan, ppp) need no gateway
-			ip route add "$SERVER/32" dev "$ifc" src "$src" table "$t"
+			ip route add "$SERVER/32" dev "$ifc" src "$src" table "$t" ||
+				{ log "uplink $ifc: route failed, skipped"; continue; }
 		fi
 		while ip rule del pref "$t" 2>/dev/null; do :; done
 		if [ "$TRANSPORT" = wss ]; then
 			# every lane of this uplink carries mark $t -> table $t -> uplink
-			ip rule add pref "$t" fwmark "$t" lookup "$t"
+			ip rule add pref "$t" fwmark "$t" lookup "$t" ||
+				{ log "uplink $ifc: rule failed, skipped"; continue; }
 			j=0
 			while [ $j -lt "$WSS_LANES" ]; do
 				k=$(( (i - 1) * WSS_LANES + j ))
@@ -292,11 +300,23 @@ watch() {
 	[ "$ROLE" = client ] && [ -n "$UPLINKS" ] || { log "watch: nothing to watch ($ROLE)"; exit 0; }
 	base=$(uplink_sig)
 	log "watching uplinks: $base"
+	# A flapping or hostile modem must not keep the whole site down: at most one
+	# restart per minute, and after 3 within 10 minutes, one per 5 minutes.
+	hist=/run/black-relay/$NAME.restarts
+	install -d -m 0700 /run/black-relay
 	while sleep "${WATCH_SECS:-5}"; do
 		now=$(uplink_sig)
 		[ "$now" = "$base" ] && continue
 		sleep 3                                   # let DHCP settle
 		[ "$(uplink_sig)" = "$now" ] || continue
+		ts=$(date +%s)
+		recent=$(awk -v n="$ts" '$1 > n - 600' "$hist" 2>/dev/null | wc -l)
+		last=$(tail -n 1 "$hist" 2>/dev/null || echo 0)
+		gap=60; [ "$recent" -ge 3 ] && gap=300
+		if [ $((ts - ${last:-0})) -lt $gap ]; then
+			continue                              # re-checked next round; base unchanged
+		fi
+		echo "$ts" >>"$hist"
 		log "uplinks changed: $base -> $now; restarting black-relay@$NAME"
 		systemctl restart --no-block "black-relay@$NAME"
 		exit 0                                    # PartOf restarts the watcher too

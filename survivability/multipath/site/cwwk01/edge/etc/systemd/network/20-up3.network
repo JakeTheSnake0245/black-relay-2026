@@ -1,6 +1,7 @@
-# Uplink up3 (CWWK nic3, untagged) = the Spitz's own network: its cellular
-# uplink. nic3 is the Wi-Fi AP port; the Spitz Wi-Fi arrives there as VLAN 40,
-# which the host bridges to the router, not to this container.
+# Uplink up3 (CWWK nic3): whatever modem is plugged in (any port takes any modem;
+# br-uplinks recognises it and sets its caps). DHCP gives the address and default
+# gateway only: routes a modem pushes (option 121/33) are ignored, so a hostile
+# modem can't steer site traffic.
 [Match]
 Name=up3
 
@@ -11,6 +12,9 @@ LinkLocalAddressing=no
 
 [DHCPv4]
 RouteMetric=103
+UseRoutes=no
+UseGateway=yes
 UseDNS=no
+UseNTP=no
 UseHostname=no
 SendHostname=no

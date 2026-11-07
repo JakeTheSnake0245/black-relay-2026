@@ -10,14 +10,16 @@
 # config stops its tunnel. A tunnel that dies restarts after a short backoff.
 #
 # Environment:
-#   BR_PUBLIC_IP   hub only: public IPv4 written into join tokens (first run)
+#   BR_PUBLIC_IP   hub only: public IPv4 written into join tokens (first run);
+#                  tunnels are never forwarded to it
 #   BR_PORT_BASE   hub only: site N listens on BR_PORT_BASE+N/udp (default 5000)
 #   BR_NAT=1       masquerade tunnel traffic leaving the egress interface
 #   BR_FORWARD     which forwarding the container allows (inside its own netns):
 #                    egress (default)  tunnels -> public internet via the default
-#                                      route only: never tunnel <-> tunnel, and
-#                                      never to private/CGNAT/link-local ranges
-#                                      (the container's own Docker networks)
+#                                      route only: never tunnel <-> tunnel, never
+#                                      to private/CGNAT/link-local/special ranges
+#                                      (the container's own Docker networks among
+#                                      them), never to BR_PUBLIC_IP
 #                    none              no forwarding at all (overlay links only)
 #   BR_WS_LISTEN   hub only, e.g. 0.0.0.0:8080: also run a wstunnel server so
 #                  sites reach their UDP site ports through HTTPS (a reverse
@@ -29,7 +31,13 @@
 #                  the reverse proxy may reach at multithread:<port>, one per line
 #                  "<hub port> <site ip> <site port>" (TCP). DNAT to the site,
 #                  SNAT to the tunnel address so replies return through the tunnel.
-#                  Never from a tunnel; only the exact address:port listed.
+#                  Never from a tunnel; only the exact address:port listed, and
+#                  only when addressed to BR_PUBLISH_ADDR.
+#   BR_PUBLISH_ADDR hub only: this hub's own address on the reverse proxy's
+#                  network. Required by publish; without it nothing is published.
+#
+# The identity snapshot (:8099) answers only each site tunnel's peer address
+# (PEER= in its config) arriving on that tunnel's own device.
 set -eu
 
 ETC=/etc/black-relay
@@ -57,9 +65,17 @@ case "${1:-}" in
 	*) log "unknown command: $1 (use: health, publish)"; exit 2 ;;
 esac
 
+# Fails closed: without BR_PUBLISH_ADDR nothing is published. Only the
+# destination can be pinned: Caddy has no fixed address on the proxy network,
+# so any container there can reach a published service; the service's own
+# sign-in is what gates it.
 publish() {
 	nft delete table inet br_publish 2>/dev/null || true
 	[ -s "$ETC/publish.conf" ] || return 0
+	addr=${BR_PUBLISH_ADDR:-}
+	case "$addr" in
+		''|*[!0-9.]*) log "publish: BR_PUBLISH_ADDR is not an IPv4 address; nothing published"; return 1 ;;
+	esac
 	pre=''
 	while read -r hp ip sp _; do
 		case "$hp" in ''|\#*) continue ;; esac
@@ -67,7 +83,7 @@ publish() {
 		case "$ip" in *[!0-9.]*|'') log "publish: bad address '$ip'"; continue ;; 10.*.*.*) ;; *) log "publish: site address must be 10.x: '$ip'"; continue ;; esac
 		[ "$hp" -ge 1 ] && [ "$hp" -le 65535 ] && [ "$sp" -ge 1 ] && [ "$sp" -le 65535 ] || continue
 		pre="$pre
-		iifname != \"br*\" tcp dport $hp dnat ip to $ip:$sp"
+		ip daddr $addr iifname != \"br*\" tcp dport $hp dnat ip to $ip:$sp"
 	done < "$ETC/publish.conf"
 	[ -n "$pre" ] || return 0
 	nft -f - <<EOF
@@ -111,9 +127,18 @@ fi
 # eth0 is not necessarily it).
 EGRESS=$(ip -4 route show default | awk '{for (n = 1; n < NF; n++) if ($n == "dev") {print $(n + 1); exit}}')
 [ -n "$EGRESS" ] || EGRESS=eth0
-PRIVATE='{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8 }'
+# Never forwarded to: this-network, private, CGNAT, loopback, link-local,
+# IETF protocol assignments, benchmarking, multicast and reserved.
+EXCLUDED='{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 }'
+# Nor to this host's own public address: that would reach the host's own
+# services from a Docker network instead of from the internet.
+own=''
+case "${BR_PUBLIC_IP:-}" in
+	''|*[!0-9.]*) ;;
+	*) own="iifname \"br*\" ip daddr $BR_PUBLIC_IP drop" ;;
+esac
 case "${BR_FORWARD:-egress}" in
-	egress) fwd="iifname \"br*\" oifname \"$EGRESS\" ip daddr != $PRIVATE accept" ;;
+	egress) fwd="iifname \"br*\" oifname \"$EGRESS\" ip daddr != $EXCLUDED accept" ;;
 	none) fwd='' ;;
 	*) log "BR_FORWARD must be egress or none"; exit 1 ;;
 esac
@@ -122,10 +147,15 @@ nat=''
 nft delete table inet br 2>/dev/null || true
 nft -f - <<EOF
 table inet br {
+	# identity snapshot: each site's own peer address on its own tunnel
+	# device (filled by id_peers); everyone else is dropped
+	set id_peers {
+		type ifname . ipv4_addr
+	}
 	chain br_input {
 		type filter hook input priority filter; policy accept;
-		# identity snapshot: sites only, through their tunnels
-		tcp dport 8099 iifname != "br*" drop
+		tcp dport 8099 iifname . ip saddr @id_peers accept
+		tcp dport 8099 drop
 	}
 	chain br_forward {
 		type filter hook forward priority filter; policy drop;
@@ -133,13 +163,15 @@ table inet br {
 		ct state { established, related } accept
 		# published site services (br_publish DNAT; nothing else DNATs here)
 		iifname != "br*" oifname "br*" ct status dnat accept
+		$own
 		$fwd
 	}
 	$nat
 }
 EOF
+rm -f "$RUN/id_peers"
 log "forwarding: ${BR_FORWARD:-egress} via $EGRESS, nat: ${BR_NAT:-1}"
-publish
+publish || true
 
 # wstunnel server (HTTPS transport for sites). It may only forward to this
 # hub's own site ports on loopback, and only for the secret path prefix.
@@ -224,8 +256,33 @@ shutdown() {
 }
 trap shutdown TERM INT
 
+# Who may fetch the identity snapshot: each tunnel's peer (the site end of the
+# overlay, PEER= in its config) arriving on that tunnel's device. A device
+# behind a site's edge keeps its own LAN source address and is dropped. The
+# set is rewritten only when the site configs change.
+id_peers() {
+	els=''
+	for n in $(tunnels); do
+		peer=$(sed -n 's/^PEER=//p' "$ETC/$n.conf" | head -n 1 | tr -d '"')
+		d=$(dev_of "$n"); [ -n "$d" ] || d=br-$n
+		case "$peer" in ''|*[!0-9.]*) continue ;; esac
+		case "$d" in *[!A-Za-z0-9_.-]*) continue ;; esac
+		els="$els${els:+, }\"$d\" . $peer"
+	done
+	[ "$els" = "$(cat "$RUN/id_peers" 2>/dev/null || true)" ] && return 0
+	if {
+		echo "flush set inet br id_peers"
+		[ -z "$els" ] || echo "add element inet br id_peers { $els }"
+	} | nft -f -; then
+		printf '%s\n' "$els" >"$RUN/id_peers"
+		log "identity snapshot allowed from: ${els:-no site}"
+	else
+		log "identity snapshot: could not update the allowed site peers"
+	fi
+}
+
 # Identity/policy snapshot for sites (written by br-identity-export on the
-# host), served read-only on :8099, reachable only through site tunnels.
+# host), served read-only on :8099, reachable only by the site peers above.
 id_start() {
 	[ -e "$ETC/identity-snapshot.json" ] || return 0
 	pid=$(cat "$RUN/identity.ws" 2>/dev/null || true)
@@ -245,11 +302,12 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(("0.0.0.0", 8099), H).serve_forever()
 PY
 	echo $! >"$RUN/identity.ws"
-	log "identity snapshot served on :8099 (site tunnels only)"
+	log "identity snapshot served on :8099 (site tunnel peers only)"
 }
 
 wd_tick=0
 while :; do
+	id_peers
 	id_start
 	now=$(date +%s)
 	ws_start

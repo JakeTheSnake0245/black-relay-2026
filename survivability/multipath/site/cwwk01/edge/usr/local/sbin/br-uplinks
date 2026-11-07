@@ -13,6 +13,7 @@ follow the modem, not the port.
 The tunnel restarts by itself when a port's address or gateway changes (a
 cable moved), and runs `apply` before every start.
 """
+import fcntl
 import ipaddress
 import json
 import os
@@ -20,6 +21,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 
 ETC = "/etc/black-relay"
 CONF = os.path.join(ETC, "br0.conf")
@@ -97,6 +99,24 @@ def classify(ifc, ip, gw, rows):
     return DEFAULT
 
 
+def conf_value(key):
+    m = re.search(rf'^{key}="?([^"\n]*)', open(CONF).read(), re.M)
+    return m.group(1).strip() if m else ""
+
+
+def site_routes():
+    """Destinations inside the site always route via the router leg (tr0),
+    whatever a modem's lease or pushed routes say; unreachable otherwise."""
+    tr = [l for l in sh("ip", "-4", "route", "show", "dev", "tr0").splitlines() if l.strip()]
+    sh("ip", "route", "flush", "table", str(SITE_TABLE))
+    for l in tr:
+        sh("ip", "route", "replace", *l.split(), "dev", "tr0", "table", str(SITE_TABLE))
+    sh("ip", "route", "replace", "unreachable", SITE, "metric", "4096", "table", str(SITE_TABLE))
+    for _ in sh("ip", "rule", "show", "pref", "898").splitlines():
+        sh("ip", "rule", "del", "pref", "898")
+    sh("ip", "rule", "add", "pref", "898", "to", SITE, "lookup", str(SITE_TABLE))
+
+
 def link_up(ifc):
     try:
         return open(f"/sys/class/net/{ifc}/carrier").read().strip() == "1"
@@ -105,6 +125,7 @@ def link_up(ifc):
 
 
 def detect():
+    server = conf_value("SERVER")
     rows = carriers()
     load_probes(rows)
     out = []
@@ -112,21 +133,58 @@ def detect():
         present = os.path.exists(f"/sys/class/net/{ifc}")
         a = sh("ip", "-4", "-o", "addr", "show", "dev", ifc, "scope", "global").split()
         ip = a[3].split("/")[0] if len(a) > 3 else None
+        plen = a[3].split("/")[1] if len(a) > 3 and "/" in a[3] else "32"
         g = sh("ip", "-4", "route", "show", "default", "dev", ifc).split()
         gw = g[g.index("via") + 1] if "via" in g else None
         r = classify(ifc, ip, gw, rows) if ip else {**DEFAULT, "kind": None, "label": None}
         u = {"if": ifc, "port": nic, "present": present, "link": present and link_up(ifc),
              "ip": ip, "gw": gw, "kind": r["kind"], "label": r["label"], "caps": r["caps"],
              "admin": [], "warn": None}
-        if gw:
+        if ip and not lease_ok(ip, plen, server):
+            u["warn"] = f"{nic}: the modem handed out {ip}/{plen}, which overlaps the site's own addresses; ignored"
+            u.update(kind=None, label="Rejected modem", admin=[])
+            out.append(u)
+            continue
+        prefix = ipaddress.ip_network(f"{ip}/{plen}", strict=False) if ip else None
+        if gw and safe_admin(gw, prefix):
             u["admin"].append(gw)
             # a probe target that answered (e.g. the Starlink dish) is an admin page too
             if r["match"].startswith("probe="):
                 host = r["match"][6:].rpartition(":")[0]
-                if host != gw:
+                if host != gw and safe_admin(host):
                     u["admin"].append(host)
         out.append(u)
     return out
+
+
+PRIVATE = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+PROTECTED = [ipaddress.ip_network(n) for n in ("10.32.0.0/11", "10.255.0.0/16", "127.0.0.0/8", "169.254.0.0/16")]
+SITE = "10.32.0.0/11"
+SITE_TABLE = 201
+
+
+def safe_admin(addr, prefix=None):
+    """A modem admin address must be a private address outside the site's own
+    ranges (and, for the gateway, on the port's own subnet): a hostile modem
+    could otherwise name any internet address as its "gateway" and have site
+    traffic to it skip the tunnel."""
+    try:
+        a = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if not any(a in n for n in PRIVATE) or any(a in n for n in PROTECTED):
+        return False
+    return prefix is None or a in prefix
+
+
+def lease_ok(ip, plen, server):
+    """Refuse leases that overlap the site, the tunnel overlay or the hub."""
+    try:
+        net = ipaddress.ip_network(f"{ip}/{plen}", strict=False)
+        hub = ipaddress.ip_address(server) if server else None
+    except ValueError:
+        return False
+    return not any(net.overlaps(n) for n in PROTECTED) and not (hub and hub in net)
 
 
 def write_uplinks(ups):
@@ -136,10 +194,12 @@ def write_uplinks(ups):
     if 'UPLINKS=' not in text:
         new = text.rstrip("\n") + f'\nUPLINKS="{spec}"\n'
     if new != text:
-        tmp = CONF + ".tmp"
-        with open(tmp, "w") as f:
+        fd, tmp = tempfile.mkstemp(dir=ETC, prefix=".br0.conf.")
+        os.fchmod(fd, os.stat(CONF).st_mode & 0o777)
+        with os.fdopen(fd, "w") as f:
             f.write(new)
-        os.chmod(tmp, os.stat(CONF).st_mode & 0o777)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, CONF)
     return spec
 
@@ -163,18 +223,26 @@ def load_admin(ups):
         sh("ip", "rule", "del", "pref", "899")
     for a in sorted(set(addrs)):
         sh("ip", "rule", "add", "pref", "899", "from", "10.32.0.0/11", "to", f"{a}/32", "lookup", "main")
+    for line in sh("ip", "-4", "route", "show", "proto", "static").splitlines():
+        if line.split()[0].endswith("/32") or re.match(r"\d+\.\d+\.\d+\.\d+ via", line):
+            if "dev up" in line:
+                sh("ip", "route", "del", *line.split())   # stale admin routes from earlier applies
     for a, gw, ifc in routes:
-        sh("ip", "route", "replace", f"{a}/32", "via", gw, "dev", ifc)
+        sh("ip", "route", "replace", f"{a}/32", "via", gw, "dev", ifc, "proto", "static")
 
 
 def main():
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
     ups = detect()
     if len(sys.argv) > 1 and sys.argv[1] == "apply":
-        spec = write_uplinks(ups)
-        load_admin(ups)
-        os.makedirs(os.path.dirname(OUT), exist_ok=True)
-        tmp = OUT + ".tmp"
-        with open(tmp, "w") as f:
+        with open("/run/black-relay/uplinks.lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            spec = write_uplinks(ups)
+            load_admin(ups)
+            site_routes()
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(OUT), prefix=".uplinks.")
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w") as f:
             json.dump({"uplinks": ups, "spec": spec}, f)
         os.replace(tmp, OUT)
         for u in ups:

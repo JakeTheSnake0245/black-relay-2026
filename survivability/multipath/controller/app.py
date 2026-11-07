@@ -27,46 +27,100 @@ import secrets
 import socket
 import ssl
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, wait
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONF_PATH = os.environ.get("BRC_CONFIG", "/etc/br-controller/config.json")
 WEB = os.environ.get("BRC_WEB", "/opt/br-controller/index.html")
 POLL = 5  # seconds between backend polls
 SESSION_TTL = 12 * 3600
+MAX_SERVICES = 50
+STREAM_MAX, STREAM_PER = 20, 4   # long-lived streams: total / per session
 
 LOCK = threading.Lock()
+CONF_LOCK = threading.RLock()    # every CONF mutate + save
 SESSIONS = {}          # token -> {"exp": t, "csrf": str}
-SSO_SECRET = secrets.token_bytes(32)
-GW_SESSIONS = {}       # tailnet gateway: token -> {"exp", "csrf", "login", "oidc_role", "sub"}
-OIDC_PENDING = {}      # state -> {"exp", "verifier", "nonce", "bind", "login"}
+GW_SESSIONS = {}       # tailnet gateway: token -> {"exp", "csrf", "login", "uid", "oidc_role", "sub"}
+OIDC_SECRET = secrets.token_bytes(32)   # signs the brst sign-in cookie (per process)
 OIDC_META = {"doc": None, "t": 0}
 FAILS = {}             # ip -> [count, first_t]  (login rate limit)
+GFAILS = []            # failed login times, all sources
+LOGIN_BLOCK = {"until": 0}
+LOGIN_SEM = threading.BoundedSemaphore(2)   # PBKDF2 is expensive: 2 checks at a time
+STREAMS = {}           # session token -> open long-lived streams
 STATE = {"t": 0}       # last aggregated snapshot
 EVENTS = []            # recent changes / alerts
 
 
+def write_atomic(path, data):
+    """Temp file in the same dir, fsync, rename, fsync the dir (power-cut safe)."""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
 def load_conf():
-    with open(CONF_PATH) as f:
-        return json.load(f)
+    try:
+        with open(CONF_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        try:   # torn / empty config: last good copy
+            with open(CONF_PATH + ".bak") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            raise e
 
 
 def save_conf(c):
-    tmp = CONF_PATH + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(c, f, indent=2)
-    os.replace(tmp, CONF_PATH)
+    with CONF_LOCK:
+        data = json.dumps(c, indent=2).encode()
+        try:
+            with open(CONF_PATH, "rb") as f:
+                cur = f.read()
+            json.loads(cur)
+            write_atomic(CONF_PATH + ".bak", cur)   # keep the previous good file
+        except (OSError, ValueError):
+            pass
+        write_atomic(CONF_PATH, data)
 
 
 CONF = load_conf()
 
 
-def event(level, text):
+def event(level, text, key=None):
+    """key: collapse repeats (same key within 15 min) into one entry with a count."""
+    now = time.time()
     with LOCK:
-        EVENTS.insert(0, {"t": time.time(), "level": level, "text": text})
+        if key:
+            for i, e in enumerate(EVENTS):
+                if e.get("key") == key and now - e.get("first", e["t"]) < 900:
+                    n = e.get("n", 1) + 1
+                    EVENTS.pop(i)
+                    EVENTS.insert(0, {"t": now, "level": level, "text": f"{text} ({n}x in {int((now - e.get('first', e['t'])) / 60) + 1} min)",
+                                      "key": key, "n": n, "first": e.get("first", e["t"])})
+                    return
+        EVENTS.insert(0, {"t": now, "level": level, "text": text, **({"key": key, "n": 1, "first": now} if key else {})})
         del EVENTS[60:]
 
 
@@ -87,10 +141,14 @@ def pw_check(pw, stored):
 
 
 # ---------------------------------------------------------------- backends
-def https_json(host, port, method, path, body=None, headers=None, cafile=None, timeout=6):
-    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl._create_unverified_context()
+def https_json(host, port, method, path, body=None, headers=None, cafile=None, insecure=False, timeout=6):
     if cafile:
+        ctx = ssl.create_default_context(cafile=cafile)
         ctx.check_hostname = False  # CA-pinned by file; certs carry no LAN hostname
+    elif insecure:   # explicit opt-in per backend ("insecure": true)
+        ctx = ssl._create_unverified_context()
+    else:
+        raise RuntimeError(f"{host}: no cafile configured (refusing unverified TLS)")
     c = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
     data = None
     h = dict(headers or {})
@@ -123,16 +181,16 @@ class Proxmox:
     def __init__(self, c):
         self.host, self.port = c["host"], c.get("port", 8006)
         self.auth = "PVEAPIToken=%s=%s" % (c["token_id"], c["token_secret"])
-        self.ca = c.get("cafile")
+        self.ca, self.insecure = c.get("cafile"), c.get("insecure") is True
         self.node = c.get("node", "pve")
 
     def get(self, path):
         return https_json(self.host, self.port, "GET", "/api2/json" + path,
-                          headers={"Authorization": self.auth}, cafile=self.ca)["data"]
+                          headers={"Authorization": self.auth}, cafile=self.ca, insecure=self.insecure)["data"]
 
     def post(self, path):
         return https_json(self.host, self.port, "POST", "/api2/json" + path, body="",
-                          headers={"Authorization": self.auth}, cafile=self.ca)["data"]
+                          headers={"Authorization": self.auth}, cafile=self.ca, insecure=self.insecure)["data"]
 
 
 class Router:
@@ -140,12 +198,12 @@ class Router:
 
     def __init__(self, c):
         self.host, self.user, self.pw = c["host"], c.get("user", "root"), c["password"]
-        self.ca = c.get("cafile")
+        self.ca, self.insecure = c.get("cafile"), c.get("insecure") is True
         self.sid = None
 
     def _call(self, sid, obj, method, args):
         body = {"jsonrpc": "2.0", "id": 1, "method": "call", "params": [sid, obj, method, args]}
-        r = https_json(self.host, 443, "POST", "/ubus", body=body, cafile=self.ca)
+        r = https_json(self.host, 443, "POST", "/ubus", body=body, cafile=self.ca, insecure=self.insecure)
         res = r.get("result") or [r.get("error", {}).get("code", -1)]
         return res
 
@@ -266,14 +324,17 @@ def service_parse(text):
             d = d["services"]
         if isinstance(d, dict) and not any(k in d for k in ("name", "title", "service")):
             d = [{"name": k, **(v if isinstance(v, dict) else {"url": v})} for k, v in d.items()]
-        return d if isinstance(d, list) else [d]
-    out = []
-    for line in t.splitlines():
-        f = [x.strip() for x in line.split("|")]
-        if not f[0] or f[0].startswith("#"):
-            continue
-        out.append({"name": f[0], "url": f[1] if len(f) > 1 else "", "health_url": f[2] if len(f) > 2 else "",
-                    "kind": f[3] if len(f) > 3 else ""})
+        out = d if isinstance(d, list) else [d]
+    else:
+        out = []
+        for line in t.splitlines():
+            f = [x.strip() for x in line.split("|")]
+            if not f[0] or f[0].startswith("#"):
+                continue
+            out.append({"name": f[0], "url": f[1] if len(f) > 1 else "", "health_url": f[2] if len(f) > 2 else "",
+                        "kind": f[3] if len(f) > 3 else ""})
+    if len(out) > MAX_SERVICES:
+        raise ValueError(f"at most {MAX_SERVICES} services")
     return out
 
 
@@ -304,6 +365,39 @@ def http_health(url, timeout=4):
         return r.status < 500, f"HTTP {r.status}"
     except Exception as e:
         return False, str(e)[:80]
+
+
+HEALTH_POOL = ThreadPoolExecutor(max_workers=8)
+HEALTH = {}   # health url -> {"fut", "last"}; poller thread only
+
+
+def health_checks(urls, deadline=6):
+    """Run checks in parallel; a check still running at the deadline keeps its
+    last result (and is not started again until it finishes)."""
+    def res(f):
+        try:
+            return f.result()
+        except Exception as e:
+            return False, str(e)[:80]
+    pend = []
+    for u in urls:
+        h = HEALTH.setdefault(u, {"fut": None, "last": (False, f"no answer within {deadline} s")})
+        if h["fut"] is None or h["fut"].done():
+            if h["fut"] is not None:
+                h["last"] = res(h["fut"])
+            h["fut"] = HEALTH_POOL.submit(http_health, u)
+        pend.append(h["fut"])
+    if pend:
+        wait(pend, timeout=deadline)
+    out = {}
+    for u in urls:
+        h = HEALTH[u]
+        if h["fut"].done():
+            h["last"] = res(h["fut"])
+        out[u] = h["last"]
+    for u in [u for u in HEALTH if u not in out]:
+        HEALTH.pop(u, None)
+    return out
 
 
 # ---------------------------------------------------------------- poller
@@ -411,12 +505,15 @@ def poll_once(pve, router):
 
     # services
     svcs = []
-    for s in CONF.get("services", []):
+    with CONF_LOCK:
+        conf_svcs = [dict(s) for s in CONF.get("services", [])[:MAX_SERVICES]]
+    checks = health_checks(sorted({s["health_url"] for s in conf_svcs if s.get("deployed") and s.get("health_url")}))
+    for s in conf_svcs:
         st = dict(s)
         if not s.get("deployed"):
             st["level"], st["detail"] = "unknown", "not deployed yet"
         elif s.get("health_url"):
-            ok, d = http_health(s["health_url"])
+            ok, d = checks[s["health_url"]]
             st["level"] = "good" if ok else ("unknown" if ok is None else "critical")
             st["detail"] = d
         else:
@@ -433,7 +530,7 @@ def poll_once(pve, router):
     if age is None or age > 6 * 3600:
         snap.setdefault("_access_level", "warning")
     snap["problems"] = problems(snap, subs)
-    snap["protected"] = CONF.get("protected_guests", [])
+    snap["protected"] = sorted(protected_ids())
     snap["subsystems"] = subs
     snap["overall"] = worst(*[v["level"] for v in subs.values()])
     return snap
@@ -469,16 +566,44 @@ def strip_hujson(t):
         if t.startswith("/*", i):
             j = t.find("*/", i + 2); i = n if j < 0 else j + 2; continue
         out.append(c); i += 1
-    import re as _re
-    return _re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+ID_MAX = 2 << 20   # bytes
+
+
+def identity_check(snap):
+    """Schema check before a snapshot is trusted; raises ValueError."""
+    if not isinstance(snap, dict):
+        raise ValueError("snapshot is not an object")
+    users = snap.get("users", [])
+    if not isinstance(users, list):
+        raise ValueError("users is not a list")
+    for u in users:
+        if not isinstance(u, dict) or not isinstance(u.get("id"), str) or not u["id"]:
+            raise ValueError("user without a string id")
+        if u.get("email") is not None and not isinstance(u["email"], str):
+            raise ValueError(f"user {u['id'][:40]}: email is not a string")
+        if u.get("name") is not None and not isinstance(u["name"], str):
+            raise ValueError(f"user {u['id'][:40]}: name is not a string")
+        g = u.get("groups", [])
+        if not isinstance(g, list) or not all(isinstance(x, str) for x in g):
+            raise ValueError(f"user {u['id'][:40]}: groups is not a list of strings")
+    for k in ("groups", "nodes"):
+        if not isinstance(snap.get(k, []), list):
+            raise ValueError(f"{k} is not a list")
+    if not isinstance(snap.get("policy"), str):
+        raise ValueError("policy missing")
+    json.loads(strip_hujson(snap["policy"]))  # must parse before we trust it
+    return snap
 
 
 def identity_load():
     try:
         with open(ID_CACHE) as f:
             d = json.load(f)
-        IDENT.update(snap=d.get("snap"), synced=d.get("synced"))
-    except (OSError, ValueError):
+        IDENT.update(snap=identity_check(d.get("snap")), synced=d.get("synced"))
+    except (OSError, ValueError, AttributeError):
         pass
 
 
@@ -486,22 +611,21 @@ def identity_sync():
     try:
         c = http.client.HTTPConnection(urllib.parse.urlparse(ID_URL).hostname,
                                        urllib.parse.urlparse(ID_URL).port or 80, timeout=10)
-        c.request("GET", urllib.parse.urlparse(ID_URL).path)
-        r = c.getresponse()
-        raw = r.read()
-        c.close()
+        try:
+            c.request("GET", urllib.parse.urlparse(ID_URL).path)
+            r = c.getresponse()
+            raw = r.read(ID_MAX + 1)
+        finally:
+            c.close()
         if r.status != 200:
             raise RuntimeError(f"HTTP {r.status}")
-        snap = json.loads(raw)
-        json.loads(strip_hujson(snap["policy"]))  # must parse before we trust it
+        if len(raw) > ID_MAX:
+            raise RuntimeError("identity snapshot larger than 2 MB")
+        snap = identity_check(json.loads(raw))
         with LOCK:
             changed = (IDENT["snap"] or {}).get("generated") != snap.get("generated")
             IDENT.update(snap=snap, synced=time.time(), error=None)
-        tmp = ID_CACHE + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump({"snap": snap, "synced": IDENT["synced"]}, f)
-        os.replace(tmp, ID_CACHE)
+        write_atomic(ID_CACHE, json.dumps({"snap": snap, "synced": IDENT["synced"]}).encode())
         if changed:
             event("good", f"access rules updated from hub ({len(snap.get('users', []))} people)")
     except Exception as e:
@@ -517,7 +641,7 @@ def identity_loop():
 
 
 def role_for_groups(groups):
-    g = set(groups or [])
+    g = {x for x in groups if isinstance(x, str)} if isinstance(groups, (list, tuple, set)) else set()
     if g & set(CONF.get("admin_groups", ["survivability"])):
         return "admin"
     if g & set(CONF.get("viewer_groups", ["headscale-users"])):
@@ -525,20 +649,33 @@ def role_for_groups(groups):
     return None
 
 
+def _str(v):
+    return v if isinstance(v, str) else ""
+
+
+def _groups(u):
+    g = u.get("groups")
+    return [x for x in g if isinstance(x, str)] if isinstance(g, list) else []
+
+
 def principal_for(login):
-    """Tailnet login (Pocket ID email) -> {user, role} by LLDAP group, or None."""
-    snap = IDENT.get("snap") or {}
-    login = (login or "").strip().lower()
-    if not login:
+    """Tailnet login (Pocket ID email) -> {user, role} by LLDAP group, or None.
+    An email shared by two LLDAP users matches nobody."""
+    snap = IDENT.get("snap")
+    users = snap.get("users") if isinstance(snap, dict) else None
+    login = _str(login).strip().lower()
+    if not login or not isinstance(users, list):
         return None
-    for u in snap.get("users", []):
-        if (u.get("email") or "").lower() == login:
-            role = role_for_groups(u.get("groups", []))
-            if not role:
-                return None
-            return {"user": u["id"], "name": u.get("name") or u["id"], "role": role,
-                    "groups": sorted(set(u.get("groups", [])))}
-    return None
+    hits = [u for u in users if isinstance(u, dict) and _str(u.get("id"))
+            and _str(u.get("email")).strip().lower() == login]
+    if len(hits) != 1:
+        return None
+    u = hits[0]
+    role = role_for_groups(_groups(u))
+    if not role:
+        return None
+    return {"user": u["id"], "name": _str(u.get("name")) or u["id"], "role": role,
+            "groups": sorted(set(_groups(u)))}
 
 
 # ---------------------------------------------------------------- Pocket ID (OIDC)
@@ -606,7 +743,49 @@ def jwt_claims(tok):
     if len(parts) != 3:
         raise RuntimeError("malformed ID token")
     p = parts[1] + "=" * (-len(parts[1]) % 4)
-    return json.loads(base64.urlsafe_b64decode(p))
+    d = json.loads(base64.urlsafe_b64decode(p))
+    if not isinstance(d, dict):
+        raise RuntimeError("malformed ID token")
+    return d
+
+
+# Sign-in state lives in the browser (brst cookie), not in a server table that
+# anyone on the internet could fill: base64url(json) "." HMAC-SHA256.
+def oidc_state_pack(d):
+    p = b64url(json.dumps(d, separators=(",", ":")).encode())
+    return p + "." + b64url(hmac.new(OIDC_SECRET, p.encode(), hashlib.sha256).digest())
+
+
+def oidc_state_unpack(cookie, state):
+    """Verified {state, nonce, verifier, exp} for this callback's state, or None."""
+    try:
+        p, _, sig = (cookie or "").partition(".")
+        good = b64url(hmac.new(OIDC_SECRET, p.encode(), hashlib.sha256).digest())
+        if not p or not hmac.compare_digest(sig.encode(), good.encode()):
+            return None
+        d = json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))
+        if not isinstance(d, dict) or float(d.get("exp", 0)) < time.time():
+            return None
+        if not state or not hmac.compare_digest(_str(d.get("state")).encode(), state.encode()):
+            return None
+        if not (_str(d.get("nonce")) and _str(d.get("verifier"))):
+            return None
+        return d
+    except Exception:
+        return None
+
+
+def oidc_identity_ok(ui, idt, pr):
+    """Extra identity checks beyond the email match; returns a refusal reason or None."""
+    for d in (ui, idt):
+        ev = d.get("email_verified")
+        if ev is False or (isinstance(ev, str) and ev.strip().lower() == "false"):
+            return "email address not verified in Pocket ID"
+    for d in (ui, idt):
+        pu = d.get("preferred_username")
+        if pu is not None and _str(pu).strip().lower() != pr["user"].strip().lower():
+            return "Pocket ID username does not match the LLDAP account for that email"
+    return None
 
 
 def gw_base():
@@ -623,19 +802,24 @@ def lower_role(a, b):
 
 
 def identity_view():
-    snap = IDENT.get("snap") or {}
+    snap = IDENT.get("snap")
+    snap = snap if isinstance(snap, dict) else {}
     pol = {}
     try:
         pol = json.loads(strip_hujson(snap.get("policy", "{}")))
     except Exception:
         pass
+    pol = pol if isinstance(pol, dict) else {}
     users = []
-    for u in snap.get("users", []):
+    for u in snap.get("users") if isinstance(snap.get("users"), list) else []:
+        if not isinstance(u, dict) or not _str(u.get("id")):
+            continue
         pr = principal_for(u.get("email"))
         users.append({"id": u["id"], "name": u.get("name"), "email": u.get("email"),
-                      "groups": u.get("groups", []), "cwwk_role": pr["role"] if pr else "none"})
+                      "groups": _groups(u), "cwwk_role": pr["role"] if pr and pr["user"] == u["id"] else "none"})
+    lst = lambda k: snap.get(k) if isinstance(snap.get(k), list) else []
     return {"generated": snap.get("generated"), "synced": IDENT.get("synced"), "error": IDENT.get("error"),
-            "users": users, "groups": snap.get("groups", []), "nodes": snap.get("nodes", []),
+            "users": users, "groups": lst("groups"), "nodes": lst("nodes"),
             "policy": {"groups": pol.get("groups", {}), "hosts": pol.get("hosts", {}),
                        "tagOwners": pol.get("tagOwners", {}), "grants": pol.get("grants", []),
                        "autoApprovers": pol.get("autoApprovers", {})},
@@ -737,16 +921,41 @@ def poller():
 
 
 # ---------------------------------------------------------------- actions
+_CAP = r"[a-z][a-z0-9_-]{0,15}:[1-9][0-9]{0,3}/[1-9][0-9]{0,3}"
+MP_ACTIONS = {   # verb -> exact value pattern (None: takes no value)
+    "set-sched": re.compile(r"random|arrival|scatter"),
+    "set-hold": re.compile(r"[0-9]{2,4}"),
+    "set-lanes": re.compile(r"[1-6]"),
+    "set-caps": re.compile(_CAP + "(?: " + _CAP + "){0,7}"),
+    "restart-tunnel": None,
+}
+
+
+def protected_ids():
+    out = set()
+    for x in CONF.get("protected_guests", []):
+        try:
+            out.add(int(x))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def do_action(body):
     area, action = body.get("area"), body.get("action")
     if area == "multipath":
         v = str(body.get("value", "")).strip()
-        allowed = {"set-sched", "set-hold", "set-lanes", "set-caps", "restart-tunnel"}
-        if action not in allowed:
+        if action not in MP_ACTIONS:
             raise ValueError("unknown multipath action")
-        if any(ch in v for ch in ";|&$`'\"\\<>()\n"):
-            raise ValueError("bad value")
-        out = edge_ctl(action, v) if v else edge_ctl(action)
+        pat = MP_ACTIONS[action]
+        if pat is None:
+            if v:
+                raise ValueError(f"{action} takes no value")
+            out = edge_ctl(action)
+        elif not pat.fullmatch(v):
+            raise ValueError(f"bad value for {action}")
+        else:
+            out = edge_ctl(action, v)
         event("good", f"multipath {action} {v}".strip())
         return out
     if area == "setup":
@@ -768,42 +977,60 @@ def do_action(body):
         vmid, kind = int(body["vmid"]), body.get("type")
         if kind not in ("lxc", "qemu") or action not in ("start", "shutdown", "reboot"):
             raise ValueError("bad compute action")
-        if vmid in CONF.get("protected_guests", []) and action != "start":
+        if vmid in protected_ids() and action != "start":
             raise ValueError(f"{vmid} is protected (it carries the site's network)")
         pve = Proxmox(CONF["proxmox"])
         out = pve.post(f"/nodes/{pve.node}/{kind}/{vmid}/status/{action}")
         event("good", f"{kind} {vmid}: {action}")
         return out
     if area == "services":
-        svcs = CONF.setdefault("services", [])
+        def store(new):   # caller holds CONF_LOCK
+            if len(new) > MAX_SERVICES:
+                raise ValueError(f"at most {MAX_SERVICES} services")
+            old = CONF.get("services")
+            CONF["services"] = new
+            try:
+                save_conf(CONF)
+            except Exception:
+                CONF["services"] = old
+                raise
         if action == "save":
             clean = service_clean(body.get("service") or {})
-            svcs[:] = [x for x in svcs if x.get("id") != clean["id"]] + [clean]
-            save_conf(CONF)
+            with CONF_LOCK:
+                store([x for x in CONF.get("services", []) if x.get("id") != clean["id"]] + [clean])
             event("good", f"service saved: {clean['name']}")
             return "saved"
         if action == "import":
             items = service_parse(str(body.get("text", ""))[:200000])
             cleaned = [service_clean(x) for x in items]
             ids = {c["id"] for c in cleaned}
-            svcs[:] = [x for x in svcs if x.get("id") not in ids] + cleaned
-            save_conf(CONF)
+            with CONF_LOCK:
+                store([x for x in CONF.get("services", []) if x.get("id") not in ids] + cleaned)
             event("good", f"imported {len(cleaned)} service(s)")
             return f"imported {len(cleaned)} service(s)"
         if action == "delete":
             sid = body.get("id")
-            svcs[:] = [x for x in svcs if x.get("id") != sid]
-            save_conf(CONF)
+            with CONF_LOCK:
+                store([x for x in CONF.get("services", []) if x.get("id") != sid])
             return "deleted"
         raise ValueError("bad services action")
     if area == "settings" and action == "password":
-        new = body.get("new", "")
-        if not pw_check(body.get("current", ""), CONF["admin_hash"]):
+        new = str(body.get("new", ""))
+        with LOGIN_SEM:
+            ok = pw_check(str(body.get("current", "")), CONF["admin_hash"])
+        if not ok:
             raise PermissionError("current password is wrong")
         if len(new) < 12:
             raise ValueError("use at least 12 characters")
-        CONF["admin_hash"] = pw_hash(new)
-        save_conf(CONF)
+        h = pw_hash(new)
+        with CONF_LOCK:
+            old = CONF["admin_hash"]
+            CONF["admin_hash"] = h
+            try:
+                save_conf(CONF)
+            except Exception:
+                CONF["admin_hash"] = old
+                raise
         with LOCK:
             SESSIONS.clear()
         event("good", "admin password changed")
@@ -812,9 +1039,40 @@ def do_action(body):
 
 
 # ---------------------------------------------------------------- http
+DASH_PATHS = ("/", "/index.html", "/api/state", "/api/events")   # br-dash, under /mp/
+
+
+def stream_open(key):
+    with LOCK:
+        if sum(STREAMS.values()) >= STREAM_MAX or STREAMS.get(key, 0) >= STREAM_PER:
+            return False
+        STREAMS[key] = STREAMS.get(key, 0) + 1
+        return True
+
+
+def stream_close(key):
+    with LOCK:
+        n = STREAMS.get(key, 0) - 1
+        if n > 0:
+            STREAMS[key] = n
+        else:
+            STREAMS.pop(key, None)
+
+
+def state_for(s):
+    """Snapshot for one session: viewers don't get the people / policy section."""
+    with LOCK:
+        out = dict(STATE)
+        out["events"] = list(EVENTS[:30])
+    if s.get("role") != "admin":
+        out.pop("access", None)
+    return out
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "br-controller"
     sys_version = ""
+    timeout = 30   # per socket op (slowloris); streams keep it as a write timeout
 
     def log_message(self, *a):
         pass
@@ -863,19 +1121,10 @@ class H(BaseHTTPRequestHandler):
                     GW_SESSIONS.pop(tok, None)
                     s = None
             pr = principal_for(s["login"]) if s else None
-            if not pr:   # removed from the controller groups since sign-in
+            if not pr or pr["user"] != s.get("uid"):   # removed from the groups / email moved since sign-in
                 return None, None
             return tok, {"csrf": s["csrf"], "role": lower_role(pr["role"], s["oidc_role"]),
                          "user": pr["name"], "via": "Pocket ID"}
-        # Legacy tailnet sign-in (Tailscale Serve, plain HTTP); off once the gateway is live.
-        if getattr(self.server, "sso", False):
-            if self.client_address[0] != CONF.get("sso_proxy", "10.40.0.2"):
-                return None, None
-            pr = principal_for(self.headers.get("Tailscale-User-Login"))
-            if not pr:
-                return None, None
-            csrf = hmac.new(SSO_SECRET, pr["user"].encode(), hashlib.sha256).hexdigest()[:32]
-            return "sso:" + pr["user"], {"csrf": csrf, "role": pr["role"], "user": pr["name"], "via": "tailnet"}
         ck = self.headers.get("Cookie", "")
         for part in ck.split(";"):
             k, _, v = part.strip().partition("=")
@@ -888,10 +1137,16 @@ class H(BaseHTTPRequestHandler):
         return None, None
 
     def body(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > 65536:
-            raise ValueError("body too large")
-        return json.loads(self.rfile.read(n) or b"{}")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("bad Content-Length")
+        if n < 0 or n > 65536:
+            raise ValueError("bad body length")
+        d = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        if not isinstance(d, dict):
+            raise ValueError("expected a JSON object")
+        return d
 
     def page(self, code, title, msg, retry=True):
         b = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
@@ -910,22 +1165,15 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             self.page(503, "Pocket ID sign-in unavailable", f"{str(e)[:160]}. If the tunnel is down, sign in on the site LAN at https://10.40.0.10.", False)
             return
-        state, nonce, verifier, bind = (secrets.token_urlsafe(24), secrets.token_urlsafe(24),
-                                        secrets.token_urlsafe(48), secrets.token_urlsafe(24))
-        now = time.time()
-        with LOCK:
-            for k in [k for k, v in OIDC_PENDING.items() if v["exp"] < now]:
-                OIDC_PENDING.pop(k, None)
-            while len(OIDC_PENDING) >= 1000:   # internet-facing: evict the oldest, never lock out
-                OIDC_PENDING.pop(min(OIDC_PENDING, key=lambda k: OIDC_PENDING[k]["exp"]), None)
-            OIDC_PENDING[state] = {"exp": now + 600, "verifier": verifier, "nonce": nonce, "bind": bind}
+        state, nonce, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(24), secrets.token_urlsafe(48)
+        brst = oidc_state_pack({"state": state, "nonce": nonce, "verifier": verifier, "exp": int(time.time()) + 600})
         q = urllib.parse.urlencode({
             "response_type": "code", "client_id": o["client_id"], "redirect_uri": oidc_redirect_uri(),
             "scope": o.get("scope", "openid email profile groups"), "state": state, "nonce": nonce,
             "code_challenge": b64url(hashlib.sha256(verifier.encode()).digest()), "code_challenge_method": "S256"})
         self.send_response(302)
         self.send_header("Location", m["authorization_endpoint"] + "?" + q)
-        self.send_header("Set-Cookie", f"brst={bind}; Path={gw_base()}/oidc; Secure; HttpOnly; SameSite=Lax; Max-Age=600")
+        self.send_header("Set-Cookie", f"brst={brst}; Path={gw_base()}/oidc; Secure; HttpOnly; SameSite=Lax; Max-Age=600")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -936,13 +1184,9 @@ class H(BaseHTTPRequestHandler):
             self.page(403, "Pocket ID refused the sign-in", qs.get("error_description", qs["error"])[0][:200])
             return
         state, code = qs.get("state", [""])[0], qs.get("code", [""])[0]
-        with LOCK:
-            p = OIDC_PENDING.pop(state, None)
-        if not p or p["exp"] < time.time() or not code:
-            self.page(400, "Sign-in expired", "Start again from the controller.")
-            return
-        if not hmac.compare_digest((self.cookie("brst") or "").encode(), p["bind"].encode()):
-            self.page(400, "Sign-in must finish in the same browser", "Start again from the controller.")
+        p = oidc_state_unpack(self.cookie("brst"), state)
+        if not p or not code:
+            self.page(400, "Sign-in expired or started in another browser", "Start again from the controller.")
             return
         try:
             o, m = oidc_conf(), oidc_meta()
@@ -954,29 +1198,36 @@ class H(BaseHTTPRequestHandler):
             aud = aud if isinstance(aud, list) else [aud]
             if idt.get("iss") != o["issuer"] or o["client_id"] not in aud:
                 raise RuntimeError("ID token not issued for this controller")
+            if (len(aud) > 1 or "azp" in idt) and idt.get("azp") != o["client_id"]:
+                raise RuntimeError("ID token authorized party is not this controller")
             if float(idt.get("exp", 0)) < time.time() - 60:
                 raise RuntimeError("ID token expired")
             if not hmac.compare_digest(str(idt.get("nonce", "")).encode(), p["nonce"].encode()):
                 raise RuntimeError("ID token nonce mismatch")
             ui = oidc_https_json("GET", m["userinfo_endpoint"], bearer=tok.get("access_token"))
-            if ui.get("sub") != idt.get("sub"):
+            if not isinstance(ui, dict) or ui.get("sub") != idt.get("sub"):
                 raise RuntimeError("userinfo subject mismatch")
         except Exception as e:
-            event("warning", f"Pocket ID sign-in failed: {str(e)[:120]}")
+            event("warning", f"Pocket ID sign-in failed: {str(e)[:120]}", key="oidc-fail")
             self.page(502, "Pocket ID sign-in failed", str(e)[:200])
             return
-        login = str(ui.get("email") or idt.get("email") or "").strip().lower()
+        login = _str(ui.get("email") or idt.get("email")).strip().lower()
         orole = role_for_groups(ui.get("groups") or idt.get("groups") or [])
         pr = principal_for(login)
         if not orole or not pr:
-            event("warning", f"Pocket ID sign-in by {login} refused: no controller group")
+            event("warning", f"Pocket ID sign-in by {login[:80]} refused: no controller group", key="oidc-refused")
             self.page(403, "Not allowed", f"{login or 'This account'} has no controller access. Ask a survivability admin.", False)
+            return
+        why = oidc_identity_ok(ui, idt, pr)
+        if why:
+            event("warning", f"Pocket ID sign-in by {login[:80]} refused: {why}", key="oidc-refused")
+            self.page(403, "Not allowed", f"{why}. Ask a survivability admin.", False)
             return
         stok, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
         with LOCK:
             for k in [k for k, v in GW_SESSIONS.items() if v["exp"] < time.time()]:
                 GW_SESSIONS.pop(k, None)
-            GW_SESSIONS[stok] = {"exp": time.time() + SESSION_TTL, "csrf": csrf, "login": login,
+            GW_SESSIONS[stok] = {"exp": time.time() + SESSION_TTL, "csrf": csrf, "login": login, "uid": pr["user"],
                                  "oidc_role": orole, "sub": idt.get("sub")}
         event("good", f"{pr['name']} signed in remotely (Pocket ID, {lower_role(pr['role'], orole)})")
         self.send_response(302)
@@ -1039,78 +1290,86 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/session":
             tok, s = self.session()
             gw = getattr(self.server, "gw", False)
-            if gw:
-                allowed, sso_login = True, None
-            else:
-                sso_login = self.headers.get("Tailscale-User-Login") if getattr(self.server, "sso", False) else None
-                allowed = False
             self.json(200, {"authed": bool(s), "csrf": s["csrf"] if s else None,
                             "role": s.get("role") if s else None, "user": s.get("user") if s else None,
-                            "via": s.get("via") if s else None, "sso": getattr(self.server, "sso", False) or gw,
-                            "gateway": gw, "tailnet_login": sso_login if gw else None,
-                            "login_url": "/oidc/login" if (gw and allowed and not s) else None,
-                            "denied_login": sso_login if (sso_login and not s and not allowed) else None})
+                            "via": s.get("via") if s else None, "sso": gw,
+                            "gateway": gw, "tailnet_login": None,
+                            "login_url": "/oidc/login" if (gw and not s) else None,
+                            "denied_login": None})
             return
         tok, s = self.session()
         if not s:
             self.json(401, {"error": "login required"})
             return
         if path == "/api/state":
-            with LOCK:
-                out = dict(STATE)
-                out["events"] = list(EVENTS[:30])
-            self.json(200, out)
+            self.json(200, state_for(s))
         elif path == "/api/events":
-            self.hdr(200, "text/event-stream")
-            self.end_headers()
+            if not stream_open(tok):
+                self.json(429, {"error": "too many open live views"})
+                return
             try:
-                while True:
-                    with LOCK:
-                        out = dict(STATE)
-                        out["events"] = list(EVENTS[:30])
-                    self.wfile.write(b"data: " + json.dumps(out).encode() + b"\n\n")
+                self.hdr(200, "text/event-stream")
+                self.end_headers()
+                while s:
+                    self.wfile.write(b"data: " + json.dumps(state_for(s)).encode() + b"\n\n")
                     self.wfile.flush()
                     time.sleep(POLL)
-                    if not self.session()[1]:
-                        return
-            except (BrokenPipeError, ConnectionResetError):
-                return
+                    s = self.session()[1]
+            except OSError:   # gone, or not reading for H.timeout seconds
+                self.close_connection = True
+            finally:
+                stream_close(tok)
         elif path.startswith("/mp/"):
-            self.proxy_dash(path[3:] or "/")
+            sub = path[3:]
+            if sub not in DASH_PATHS:
+                self.json(404, {"error": "not found"})
+                return
+            self.proxy_dash(tok, sub)
         else:
             self.json(404, {"error": "not found"})
 
-    def proxy_dash(self, sub):
-        """Multithread dashboard (br-edge) under /mp/, so one origin serves all."""
+    def proxy_dash(self, tok, sub):
+        """Multithread dashboard (br-edge) under /mp/, so one origin serves all.
+        GET only, fixed paths (DASH_PATHS)."""
         e = CONF["edge"]
-        stream = sub.startswith("/api/events")
+        stream = sub == "/api/events"
+        if stream and not stream_open(tok):
+            self.json(429, {"error": "too many open live views"})
+            return
+        sent = False
         try:
-            # live event stream: no read timeout (the dashboard sends every
-            # second); everything else: a normal bounded request
-            c = http.client.HTTPConnection(e["host"], e.get("dash_port", 8088), timeout=None if stream else 10)
-            c.request("GET", sub)
-            r = c.getresponse()
-            self.hdr(r.status, r.getheader("Content-Type", "application/octet-stream"))
-            self.end_headers()
-            if stream:
-                while True:
-                    chunk = r.read1(4096)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                    if not self.session()[1]:   # logged out: stop relaying
-                        break
-            else:
-                self.wfile.write(r.read())
-            c.close()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as ex:
+            # the dashboard sends every second, so a 30 s read timeout only
+            # trips on a hung edge
+            c = http.client.HTTPConnection(e["host"], e.get("dash_port", 8088), timeout=30 if stream else 10)
             try:
-                self.json(502, {"error": f"dashboard: {ex}"})
-            except Exception:
-                pass
+                c.request("GET", sub)
+                r = c.getresponse()
+                self.hdr(r.status, r.getheader("Content-Type", "application/octet-stream"))
+                self.end_headers()
+                sent = True
+                if stream:
+                    while True:
+                        chunk = r.read1(4096)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        if not self.session()[1]:   # logged out: stop relaying
+                            break
+                else:
+                    self.wfile.write(r.read(4 << 20))
+            finally:
+                c.close()
+        except Exception as ex:
+            self.close_connection = True
+            if not sent:
+                try:
+                    self.json(502, {"error": f"dashboard: {ex}"[:200]})
+                except Exception:
+                    pass
+        finally:
+            if stream:
+                stream_close(tok)
 
     # ----- POST
     def do_POST(self):
@@ -1119,33 +1378,11 @@ class H(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         ip = self.client_address[0]
         try:
-            if path == "/api/login" and (getattr(self.server, "gw", False) or getattr(self.server, "sso", False)):
+            if path == "/api/login" and getattr(self.server, "gw", False):
                 self.json(403, {"error": "password sign-in is LAN-only; use Pocket ID"})
                 return
             if path == "/api/login":
-                with LOCK:
-                    n, t0 = FAILS.get(ip, [0, time.time()])
-                    if time.time() - t0 > 900:
-                        n, t0 = 0, time.time()
-                    if n >= 8:
-                        self.json(429, {"error": "too many attempts; wait 15 minutes"})
-                        return
-                b = self.body()
-                if pw_check(b.get("password", ""), CONF["admin_hash"]):
-                    tok, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
-                    with LOCK:
-                        SESSIONS[tok] = {"exp": time.time() + SESSION_TTL, "csrf": csrf,
-                                         "role": "admin", "user": "admin (password)", "via": "password"}
-                        FAILS.pop(ip, None)
-                    event("good", f"admin login from {ip}")
-                    self.json(200, {"ok": True, "csrf": csrf}, {
-                        "Set-Cookie": f"brc={tok}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}"})
-                else:
-                    with LOCK:
-                        FAILS[ip] = [n + 1, t0]
-                    event("warning", f"failed login from {ip}")
-                    time.sleep(1)
-                    self.json(401, {"error": "wrong password"})
+                self.login(ip)
                 return
             tok, s = self.session()
             if not s:
@@ -1176,12 +1413,63 @@ class H(BaseHTTPRequestHandler):
             self.json(403, {"error": str(e)})
         except (ValueError, KeyError) as e:
             self.json(400, {"error": str(e)})
+        except (TimeoutError, ConnectionError):   # client stalled / went away
+            self.close_connection = True
         except Exception as e:
             self.json(502, {"error": str(e)[:200]})
+
+    def login(self, ip):
+        """LAN password sign-in. The attempt is counted before the (slow) check,
+        so parallel guesses can't slip past the limit."""
+        now = time.time()
+        with LOCK:
+            if now < LOGIN_BLOCK["until"]:
+                self.json(429, {"error": "sign-in paused after many failed attempts; try again in a few minutes"})
+                return
+            n, t0 = FAILS.get(ip, [0, now])
+            if now - t0 > 900:
+                n, t0 = 0, now
+            if n >= 8:
+                self.json(429, {"error": "too many attempts; wait 15 minutes"})
+                return
+            FAILS[ip] = [n + 1, t0]
+            for k in [k for k, v in FAILS.items() if now - v[1] > 900]:
+                FAILS.pop(k, None)
+        b = self.body()
+        if not LOGIN_SEM.acquire(timeout=10):
+            self.json(503, {"error": "busy; try again"})
+            return
+        try:
+            ok = pw_check(str(b.get("password", "")), CONF["admin_hash"])
+        finally:
+            LOGIN_SEM.release()
+        if ok:
+            tok, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
+            with LOCK:
+                SESSIONS[tok] = {"exp": time.time() + SESSION_TTL, "csrf": csrf,
+                                 "role": "admin", "user": "admin (password)", "via": "password"}
+                FAILS.pop(ip, None)
+            event("good", f"admin login from {ip}")
+            self.json(200, {"ok": True, "csrf": csrf}, {
+                "Set-Cookie": f"brc={tok}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}"})
+            return
+        blocked = False
+        with LOCK:
+            now = time.time()
+            GFAILS[:] = [t for t in GFAILS if now - t < 900] + [now]
+            if len(GFAILS) >= 30 and now >= LOGIN_BLOCK["until"]:
+                LOGIN_BLOCK["until"], blocked = now + 300, True
+                GFAILS.clear()
+        event("warning", f"failed login from {ip}", key="login-fail")
+        if blocked:
+            event("critical", "30 failed logins in 15 min: password sign-in paused for 5 min")
+        time.sleep(1)
+        self.json(401, {"error": "wrong password"})
 
 
 class Redirect(BaseHTTPRequestHandler):
     """Port 80: send everyone to HTTPS (status.lan -> the public status page)."""
+    timeout = 10
 
     def log_message(self, *a):
         pass
@@ -1198,35 +1486,53 @@ class Redirect(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
 
+class TLSServer(ThreadingHTTPServer):
+    """Accepts plain TCP; the TLS handshake runs in the connection's own thread
+    with a deadline, so a silent client can't stall the accept loop."""
+    daemon_threads = True
+    HANDSHAKE_TIMEOUT = 15
+
+    def __init__(self, addr, handler, ctx, gw=False):
+        self.ctx, self.gw = ctx, gw
+        super().__init__(addr, handler)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            request.settimeout(self.HANDSHAKE_TIMEOUT)
+            request = self.ctx.wrap_socket(request, server_side=True)
+        except Exception:   # ssl.SSLError / timeout / reset
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        super().process_request_thread(request, client_address)
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], OSError):   # dropped / stalled clients are routine
+            super().handle_error(request, client_address)
+
+
+class RedirectServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+
 def main():
     threading.Thread(target=identity_loop, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(CONF["tls_cert"], CONF["tls_key"])
-    if CONF.get("legacy_sso", False):
-        try:
-            sso = ThreadingHTTPServer((CONF.get("sso_listen", "10.40.0.10"), int(CONF.get("sso_port", 8081))), H)
-            sso.sso = True
-            sso.daemon_threads = True
-            threading.Thread(target=sso.serve_forever, daemon=True).start()
-        except OSError:
-            pass
     if CONF.get("gateway_port"):
         # Remote access via BR2026 Caddy -> hub -> tunnel: TLS, Pocket ID sign-in.
-        gw = ThreadingHTTPServer((CONF.get("gateway_listen", "10.40.0.10"), int(CONF.get("gateway_port", 8444))), H)
-        gw.gw = True
-        gw.daemon_threads = True
-        gw.socket = ctx.wrap_socket(gw.socket, server_side=True)
+        gw = TLSServer((CONF.get("gateway_listen", "10.40.0.10"), int(CONF.get("gateway_port", 8444))), H, ctx, gw=True)
         threading.Thread(target=gw.serve_forever, daemon=True).start()
     try:
-        r = ThreadingHTTPServer((CONF.get("listen", "0.0.0.0"), 80), Redirect)
+        r = RedirectServer((CONF.get("listen", "0.0.0.0"), 80), Redirect)
         threading.Thread(target=r.serve_forever, daemon=True).start()
     except OSError:
         pass
-    srv = ThreadingHTTPServer((CONF.get("listen", "0.0.0.0"), int(CONF.get("port", 443))), H)
-    srv.daemon_threads = True
-    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    srv = TLSServer((CONF.get("listen", "0.0.0.0"), int(CONF.get("port", 443))), H, ctx)
     srv.serve_forever()
 
 

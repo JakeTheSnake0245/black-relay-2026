@@ -4,6 +4,13 @@
 black_relay_hub_image: "black-relay:0.3.5-mt3"
 black_relay_hub_image_tar: "black-relay-image_0.3.5-mt3_amd64.tar.gz"
 black_relay_hub_image_sha256: "7e6ba5ef625d8cf6f40490262bfd4981daeb40261ced01351a79ce2352d2e307"
+# What `docker image inspect` reports as .Id for that build: the config digest
+# (classic image store) or the manifest digest (containerd image store). The
+# role fails if the image under the tag is anything else; an empty list skips
+# the check.
+black_relay_hub_image_ids:
+  - "sha256:3712e7238ec32ffaf17d8c4164d0698c112913508b067ef5cb803cd668dcbe1b"
+  - "sha256:a706e0d7a68d8826aea74c42d03c9bcac280840e7dbdc6809732649b6c77328e"
 black_relay_hub_dir: /srv/black-relay
 black_relay_hub_container: survivability-black-relay
 black_relay_hub_public_ip: "{{ ansible_default_ipv4.address }}"

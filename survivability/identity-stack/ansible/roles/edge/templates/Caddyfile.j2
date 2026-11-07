@@ -18,6 +18,8 @@
 				request>headers>Cookie delete
 				request>headers>Proxy-Authorization delete
 				resp_headers>Set-Cookie delete
+				# Multithread lane paths carry the hub's secret upgrade prefix.
+				request>uri regexp "multithread-[0-9a-f]+" "multithread-REDACTED"
 			}
 		}
 	}

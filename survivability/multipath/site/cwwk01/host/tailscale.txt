@@ -1,8 +1,5 @@
 # tailscale serve status
-http://cwwk-node01 (tailnet only)
-http://cwwk-node01.tail.l8s.dev (tailnet only)
-|-- / proxy http://10.40.0.10:8081
-
+No serve config
 
 # tailscale ip / tags
 100.64.0.11

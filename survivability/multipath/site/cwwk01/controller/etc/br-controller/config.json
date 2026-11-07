@@ -78,5 +78,6 @@
     "client_id": "a4bc6874-1bc9-41c8-b65e-206c0e836a79",
     "client_secret": "<REDACTED>"
   },
-  "gateway_base": "/cwwk"
+  "gateway_base": "/cwwk",
+  "legacy_sso": false
 }

@@ -293,7 +293,7 @@ V.health = () => {
   const order = [["multipath", "Multipath uplinks", "Bonded HTTPS tunnel to the hub"], ["network", "Router", "LAN, DHCP, DNS, firewall"], ["wifi", "Wi-Fi", "Spitz access point"], ["compute", "Compute", "Proxmox host and containers"], ["services", "Services", "Cameras, TAK, sensors, ..."]];
   const tiles = order.map(([k, n, d]) => {
     const s = subs[k] || { level: "unknown", detail: "waiting for data" };
-    return `<div class="card tile" onclick="location.hash='${k}'"><div class="name">${ICON[s.level] || ICON.unknown}${esc(n)}</div><div class="detail">${esc(s.detail)}</div><div class="help" style="margin:0">${esc(d)}</div></div>`;
+    return `<div class="card tile" data-k="${esc(k)}" onclick="location.hash=this.dataset.k"><div class="name">${ICON[s.level] || ICON.unknown}${esc(n)}</div><div class="detail">${esc(s.detail)}</div><div class="help" style="margin:0">${esc(d)}</div></div>`;
   }).join("");
   const mp = S.multipath || {}, eg = mp.egress || {};
   const ev = (S.events || []).map((e) => `<li><time class="num">${hhmm(e.t)}</time>${ICON[e.level] || ICON.unknown}<span>${esc(e.text)}</span></li>`).join("") || '<li class="empty">No events yet.</li>';
@@ -332,7 +332,7 @@ function portMap(withButtons) {
       <div class="pn">${esc(p.nic)}</div><div class="pr">${esc(portRole(p))}</div>
       ${(() => { const d = detected()[p.nic]; if (!d) return ""; if (p.mode === "client") return `<div class="det">${ICON.good} device on the site LAN</div>`; return d.label ? `<div class="det">${ICON.good} ${esc(d.label)}</div>` : (p.link ? `<div class="det">working out what this is (up to a minute)</div>` : ""); })()}
       <div class="ps">${p.link ? st("good", "connected" + (p.speed ? " · " + (p.speed >= 1000 ? p.speed / 1000 + " Gbit" : p.speed + " Mbit") : "")) : st("warning", "no cable / no link")}</div>
-      ${withButtons ? `<button class="btn" onclick="blink('${p.nic}')">${bl ? "Blinking…" : "Blink port"}</button>` : ""}</div>`;
+      ${withButtons ? `<button class="btn" data-nic="${esc(p.nic)}" onclick="blink(this.dataset.nic)">${bl ? "Blinking…" : "Blink port"}</button>` : ""}</div>`;
   }).join("") + `</div>`;
 }
 window.blink = async (nic) => { BLINKING[nic] = Date.now() + 15000; render(true); await act({ area: "setup", action: "blink", nic }, `${nic}: look for the flashing LED on the CWWK`); setTimeout(() => render(true), 15500); };
@@ -366,8 +366,8 @@ V.multipath = () => {
         <div><label>Reorder hold (ms)</label><input id="m-hold" type="number" min="50" max="2000" value="${esc(cf.hold || 400)}"></div>
         <div><label>Connections per uplink</label><select id="m-lanes">${["1", "2", "3", "4", "5", "6"].map((v) => opt(v, cf.lanes)).join("")}</select></div>
         <div><label>Speed caps per modem, Mbit up/down</label>
-          <div class="row">${capKinds().map(([k, t]) => `<input id="cap-${k}" value="${esc(caps[k] || "")}" title="${t}" style="width:${Math.floor(96 / Math.max(1, capKinds().length))}%">`).join("")}</div>
-          <div class="help">${capKinds().map(([, t]) => t).join(" · ")}, as TX/RX. Follows the modem into whichever port it's in.</div></div>
+          <div class="row">${capKinds().map(([k, t]) => `<input data-cap="${esc(k)}" value="${esc(caps[k] || "")}" title="${esc(t)}" style="width:${Math.floor(96 / Math.max(1, capKinds().length))}%">`).join("")}</div>
+          <div class="help">${esc(capKinds().map(([, t]) => t).join(" · "))}, as TX/RX. Follows the modem into whichever port it's in.</div></div>
       </div>
       <div class="row" style="margin-top:12px"><button class="btn primary" onclick="applyMp()">Apply and restart tunnel</button><span class="help">Current: ${esc(cf.sched)} · hold ${esc(cf.hold)} ms · FEC ${esc(cf.fec)} · ${esc(cf.transport)} · service ${esc(cf.service)}</span></div>
     </div>
@@ -376,7 +376,7 @@ V.multipath = () => {
 window.applyMp = async () => {
   const cf = S.multipath_conf || {}, steps = [];
   const s = $("#m-sched").value, h = $("#m-hold").value, l = $("#m-lanes").value;
-  const caps = capKinds().map(([k]) => `${k}:${$("#cap-" + k).value.trim()}`).join(" ");
+  const caps = [...document.querySelectorAll("input[data-cap]")].map((el) => `${el.dataset.cap}:${el.value.trim()}`).join(" ");
   if (s !== cf.sched) steps.push({ action: "set-sched", value: s });
   if (String(h) !== String(cf.hold)) steps.push({ action: "set-hold", value: h });
   if (String(l) !== String(cf.lanes)) steps.push({ action: "set-lanes", value: l });
@@ -424,10 +424,10 @@ V.compute = () => {
   const cpu = (ns.cpu || 0) * 100, mem = pct(ns.memory.used, ns.memory.total), disk = pct(ns.rootfs.used, ns.rootfs.total);
   const m = (v) => `<div class="meter"><div style="width:${Math.min(100, v).toFixed(0)}%"></div></div>`;
   const rows = c.guests.map((g) => {
-    const on = g.status === "running";
-    return `<tr><td class="num">${g.vmid}</td><td>${esc(g.name)}</td><td>${g.type === "lxc" ? "container" : "VM"}</td><td>${on ? st("good", "running") : st("unknown", g.status)}</td>
+    const on = g.status === "running", gd = `data-vmid="${esc(g.vmid)}" data-type="${esc(g.type)}"`;
+    return `<tr><td class="num">${esc(g.vmid)}</td><td>${esc(g.name)}</td><td>${g.type === "lxc" ? "container" : "VM"}</td><td>${on ? st("good", "running") : st("unknown", g.status)}</td>
       <td class="num">${on ? (g.cpu * 100).toFixed(0) + "%" : "–"}</td><td class="num">${on ? gb(g.mem) + " / " + gb(g.maxmem) + " GB" : "–"}</td><td class="num">${on ? dur(g.uptime) : "–"}</td>
-      <td style="text-align:right">${(S.protected || []).includes(g.vmid) ? (on ? '<span class="help" style="margin:0">protected</span>' : `<button class="btn" onclick="pw(${g.vmid},'${g.type}','start')">Start</button>`) : on ? `<button class="btn" onclick="pw(${g.vmid},'${g.type}','reboot')">Reboot</button> <button class="btn danger" onclick="pw(${g.vmid},'${g.type}','shutdown')">Stop</button>` : `<button class="btn" onclick="pw(${g.vmid},'${g.type}','start')">Start</button>`}</td></tr>`;
+      <td style="text-align:right">${(S.protected || []).includes(g.vmid) ? (on ? '<span class="help" style="margin:0">protected</span>' : `<button class="btn" ${gd} onclick="pwb(this,'start')">Start</button>`) : on ? `<button class="btn" ${gd} onclick="pwb(this,'reboot')">Reboot</button> <button class="btn danger" ${gd} onclick="pwb(this,'shutdown')">Stop</button>` : `<button class="btn" ${gd} onclick="pwb(this,'start')">Start</button>`}</td></tr>`;
   }).join("");
   return `
     <header class="page"><h1>Compute</h1><span class="sub">Proxmox node ${esc(c.node)} · ${esc((ns.cpuinfo || {}).model || "")}</span><span class="spacer"></span>
@@ -441,6 +441,7 @@ V.compute = () => {
     <div class="card"><h2>Containers and VMs</h2><table><tr><th>ID</th><th>Name</th><th>Type</th><th>State</th><th>CPU</th><th>Memory</th><th>Up</th><th></th></tr>${rows}</table>
       <div class="help">101 multipath, 102 router and 103 this controller carry the site network: they can be started here but not stopped.</div></div>`;
 };
+window.pwb = (el, action) => pw(Number(el.dataset.vmid), el.dataset.type, action);
 window.pw = (vmid, type, action) => { if (action !== "start" && !confirm(`${action} ${vmid}?`)) return; act({ area: "compute", vmid, type, action }, `${vmid}: ${action} requested`); };
 
 V.services = () => {
@@ -450,7 +451,7 @@ V.services = () => {
     : `<span class="kbd" title="${esc(l.label || "")}">${esc((l.label ? l.label + ": " : "") + l.url)}</span>`;
   const cards = svcs.map((s) => `
     <div class="card svc"><div class="head">${ICON[s.level] || ICON.unknown}<div><div style="font-weight:650">${esc(s.name)}</div><div class="kind">${esc(s.kind || "Service")}</div></div><span class="spacer"></span>
-      <button class="btn" onclick='editSvc(${JSON.stringify(s.id)})'>Edit</button></div>
+      <button class="btn" data-id="${esc(s.id)}" onclick="editSvc(this.dataset.id)">Edit</button></div>
       ${s.description ? `<p>${esc(s.description)}</p>` : ""}
       <div class="help" style="margin:0">${esc(s.detail || "")}${s.address ? " · " + esc(s.address) : ""}</div>
       <div class="row" style="flex-wrap:wrap;gap:6px">${s.url ? (openable(s.url) ? `<a class="btn primary" href="${esc(s.url)}" target="_blank" rel="noopener">Open</a>` : linkEl({ label: "Main", url: s.url })) : ""}${(s.links || []).map(linkEl).join("")}${!s.url && !(s.links || []).length ? `<span class="help" style="margin:0">No links yet</span>` : ""}</div>

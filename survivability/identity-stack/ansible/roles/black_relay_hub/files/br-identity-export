@@ -6,8 +6,12 @@ Reads Headscale (users, devices, policy) through its local CLI and LLDAP
 (users, groups) with a read-only account. Writes
 /srv/black-relay/etc/identity-snapshot.json, which the Multithread hub serves
 to sites through their tunnels only. No keys, tokens or passwords included.
+
+That directory is bind-mounted read-write into the hub container, so this
+script (running as root on the host) never opens a path that already exists
+there: anything in it may be a symlink the container planted.
 """
-import json, os, subprocess, time, urllib.request
+import json, os, subprocess, tempfile, time, urllib.request
 
 OUT = "/srv/black-relay/etc/identity-snapshot.json"
 HS = ["docker", "exec", "survivability-headscale", "headscale"]
@@ -30,6 +34,34 @@ def lldap():
              for u in d["users"] if u["id"] != env["LLDAP_RO_USER"]]
     return users, sorted(g["displayName"] for g in d["groups"])
 
+def write_snapshot(snap, out=OUT):
+    """Atomically replace `out` with `snap` as world-readable JSON.
+
+    mkstemp creates a new, randomly named file with O_EXCL (and no symlink
+    following), the mode is set on the open descriptor, and the rename
+    replaces whatever sits at `out` without following it.
+    """
+    d = os.path.dirname(out)
+    fd, tmp = tempfile.mkstemp(prefix=".identity-snapshot.", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(snap, f, indent=1)
+            f.flush()
+            os.fchmod(f.fileno(), 0o644)
+            os.fsync(f.fileno())
+        os.replace(tmp, out)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
 def main():
     users, groups = lldap()
     hsu = json.loads(hs("users", "list", "-o", "json"))
@@ -44,11 +76,8 @@ def main():
             "users": users, "groups": groups,
             "tailnet_users": [{"name": u.get("name"), "email": u.get("email")} for u in hsu],
             "nodes": nodes, "policy": hs("policy", "get")}
-    tmp = OUT + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(snap, f, indent=1)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, OUT)
+    write_snapshot(snap)
     print(f"snapshot: {len(users)} users, {len(groups)} groups, {len(nodes)} devices")
 
-main()
+if __name__ == "__main__":
+    main()

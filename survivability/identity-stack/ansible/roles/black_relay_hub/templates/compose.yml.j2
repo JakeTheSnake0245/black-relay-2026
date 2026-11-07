@@ -26,6 +26,8 @@ services:
       BR_FORWARD: "egress"
       BR_NAT: "1"
       BR_WS_LISTEN: "0.0.0.0:8080"
+      # Published site services answer only on this address (br-supervise publish).
+      BR_PUBLISH_ADDR: "{{ black_relay_hub_proxy_address }}"
     env_file:
       - path: "{{ black_relay_hub_dir }}/ws.env"
         format: raw

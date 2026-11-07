@@ -3,14 +3,8 @@
   ansible.builtin.command: sysctl -q -p /etc/sysctl.d/90-black-relay.conf
   changed_when: true
 
-# Recreating the container drops every site tunnel for ~40 s (and anything
-# riding them, such as a site's own Tailscale).
-- name: Restart black-relay hub
-  ansible.builtin.command: >-
-    docker compose -f {{ black_relay_hub_dir }}/compose.yml up -d --force-recreate
-  changed_when: true
-
-# Runs after the restart handler when both fire. The guard matters: an older
+# Runs after "Hub running" (a recreated hub has already applied publish.conf;
+# re-applying is harmless). The guard matters: an older
 # br-supervise without `publish` would treat it as its entrypoint and start a
 # second supervisor that fights the first over the tunnels.
 - name: Re-apply published site services

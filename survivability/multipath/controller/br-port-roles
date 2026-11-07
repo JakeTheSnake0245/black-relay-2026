@@ -19,10 +19,13 @@ Per port:
           modem's own Wi-Fi clients also ask for addresses on its LAN).
   wifi    tagged Wi-Fi-VLAN frames from the wire: an access point is here.
 
-In client mode, DHCP server packets arriving on that port are dropped (nft
-bridge table br_port_roles), so a modem plugged in there can never hand out
-its addresses on the site LAN; seeing one returns the port to modem mode at
-once, as does unplugging the cable. Modem mode is the default and what the
+A standing guard (nft bridge table br_port_roles) drops DHCP/DHCPv6 server
+replies and IPv6 router adverts/redirects arriving on ANY physical port unless
+they are headed to br-edge's uplink legs: only a modem answering br-edge passes.
+So no device on any port (or on the Wi-Fi VLAN) can take over the site LAN's
+addressing or gateway. Ports also get spanning-tree root protection. Seeing a
+DHCP server on a client port returns it to modem mode at once, as does
+unplugging the cable. Modem mode is the default and what the
 host boots with, so the box works even if this service never starts.
 State: /run/br-port-roles.json (br-hostinfo -> controller).
 """
@@ -98,18 +101,35 @@ def set_mode(nic, mode, pvid, wifi):
         run("bridge", "vlan", "add", "dev", nic, "vid", str(wifi))   # Wi-Fi stays allowed, tagged
 
 
-def guard(clients):
-    """Drop DHCP server packets arriving on client-mode ports."""
-    run("nft", "delete", "table", "bridge", "br_port_roles")
-    if not clients:
-        return
-    rules = "".join(f'\t\tiifname "{n}" udp sport 67 drop\n' for n in sorted(clients))
+def guard(ports):
+    """Standing rogue-DHCP / router-advert guard, applied in one transaction."""
+    edge = f'"veth{EDGE_CT}i*"'
+    nics = "{ " + ", ".join(f'"{n}"' for n in sorted(ports)) + " }"
+    rules = (f"\t\tiifname {nics} oifname != {edge} udp sport {{ 67, 547 }} drop\n"
+             f"\t\tiifname {nics} oifname != {edge} vlan type ip udp sport {{ 67, 547 }} drop\n"
+             f"\t\tiifname {nics} oifname != {edge} icmpv6 type {{ nd-router-advert, nd-redirect }} drop\n"
+             f"\t\tiifname {nics} oifname != {edge} vlan type ip6 icmpv6 type {{ nd-router-advert, nd-redirect }} drop\n")
     p = subprocess.run(["nft", "-f", "-"], text=True, capture_output=True, input=(
+        "table bridge br_port_roles {}\nflush table bridge br_port_roles\n"
         "table bridge br_port_roles {\n\tchain forward {\n"
         "\t\ttype filter hook forward priority filter; policy accept;\n"
         f"{rules}\t}}\n}}\n"))
     if p.returncode:
-        log(f"guard failed: {p.stderr.strip()[:120]}")
+        log(f"guard failed: {p.stderr.strip()[:160]}")
+    for n in ports:   # nothing outside may become spanning-tree root through a port
+        run("bridge", "link", "set", "dev", n, "root_block", "on")
+
+
+def current_pvid(nic):
+    out = run("bridge", "-j", "vlan", "show", "dev", nic).stdout
+    try:
+        for e in json.loads(out or "[]"):
+            for v in e.get("vlans", []):
+                if "PVID" in v.get("flags", []):
+                    return v["vlan"]
+    except ValueError:
+        pass
+    return None
 
 
 def classify(frame, tagged):
@@ -120,9 +140,11 @@ def classify(frame, tagged):
     et, off = struct.unpack("!H", frame[12:14])[0], 14
     if et == 0x8100 and len(frame) >= 18:           # tag left in the frame (no offload)
         tagged, (et,), off = True, struct.unpack("!H", frame[16:18]), 18
-    if et != 0x0800 or len(frame) < off + 28 or frame[off + 9] != 17:
+    if et != 0x0800 or len(frame) < off + 20 or frame[off + 9] != 17:
         return None, src, tagged
     ihl = (frame[off] & 0x0F) * 4
+    if ihl < 20 or len(frame) < off + ihl + 4:
+        return None, src, tagged
     sport, dport = struct.unpack("!HH", frame[off + ihl:off + ihl + 4])
     if (sport, dport) == (67, 68):
         return "server", src, tagged
@@ -146,9 +168,10 @@ def main():
     st = {n: {"mode": "modem", "server": 0.0, "since": None, "client_mac": None, "wifi": 0.0,
               "link_since": time.time()} for n in ports}
     leased, leased_at = None, 0.0
-    for n, pv in ports.items():          # start clean: every port in modem mode
-        set_mode(n, "modem", pv, wifi)
-    guard(set())
+    for n, pv in ports.items():          # start clean: every port in modem mode (no churn if already)
+        if current_pvid(n) != pv:
+            set_mode(n, "modem", pv, wifi)
+    guard(ports)
     log(f"watching {', '.join(sorted(ports))} (Wi-Fi VLAN {wifi})")
     last_write = 0.0
     while True:
@@ -158,7 +181,10 @@ def main():
             leased, leased_at = edge_leases(), now
         for fd in r:
             s, nic = socks[fd]
-            frame, anc, _, addr = s.recvmsg(2048, socket.CMSG_SPACE(20))
+            try:
+                frame, anc, _, addr = s.recvmsg(2048, socket.CMSG_SPACE(20))
+            except OSError:
+                continue
             if addr[2] == PACKET_OUTGOING:
                 continue
             tagged = False
@@ -166,7 +192,10 @@ def main():
                 if lvl == SOL_PACKET and typ == PACKET_AUXDATA and len(data) >= 20:
                     status = struct.unpack("I", data[:4])[0]
                     tagged = bool(status & TP_STATUS_VLAN_VALID)
-            kind, src, tagged = classify(frame, tagged)
+            try:
+                kind, src, tagged = classify(frame, tagged)
+            except Exception:
+                continue                  # malformed frame: ignore, never crash
             if not src or src.startswith(LOCAL_OUI):
                 continue
             p = st[nic]
@@ -178,7 +207,6 @@ def main():
                 if p["mode"] == "client":
                     set_mode(nic, "modem", ports[nic], wifi)
                     p.update(mode="modem", since=None, client_mac=None)
-                    guard({n for n, q in st.items() if q["mode"] == "client"})
                     log(f"{nic}: a DHCP server appeared (a modem): back to modem mode")
                     last_write = 0
             elif kind == "client" and p["mode"] == "modem" and p["since"] is None:
@@ -188,7 +216,6 @@ def main():
                 p["link_since"] = now
                 if p["mode"] == "client":
                     set_mode(nic, "modem", ports[nic], wifi)
-                    guard({n for n, q in st.items() if q["mode"] == "client" and n != nic})
                     log(f"{nic}: cable unplugged: back to modem mode")
                     last_write = 0
                 p.update(mode="modem", since=None, client_mac=None, wifi=0.0)
@@ -198,7 +225,6 @@ def main():
                     p.update(since=None, client_mac=None)       # a modem is (or was) answering: uplink
                 elif now - p["link_since"] >= SETTLE and now - p["since"] >= DECIDE:
                     p["mode"] = "client"
-                    guard({n for n, q in st.items() if q["mode"] == "client"})
                     set_mode(nic, "client", ports[nic], wifi)
                     log(f"{nic}: client device {p['client_mac']} and no modem: joined the site LAN")
                     last_write = 0

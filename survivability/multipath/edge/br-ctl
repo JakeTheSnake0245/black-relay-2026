@@ -1,7 +1,7 @@
 #!/bin/sh
 # br-ctl — the only commands the CWWK controller may run on the multipath box
 # (forced command for its SSH key). Every argument is validated.
-set -eu
+set -euf   # -f: no globbing of the forced command's words
 CONF=/etc/black-relay/br0.conf
 CARRIERS=/etc/black-relay/carriers.conf
 ENV=/etc/black-relay/black-relay.env
@@ -13,11 +13,27 @@ setkv() {  # file key value
 log() { logger -t br-ctl "$*"; }
 case "$verb" in
 	status)
-		printf '{"sched":"%s","hold":"%s","lanes":"%s","uplinks":"%s","transport":"%s","fec":"%s","service":"%s"}\n' \
-			"$(sed -n 's/^GT_SCHED=//p' $ENV)" "$(sed -n 's/^GT_RESEQ_MS=//p' $ENV)" \
-			"$(sed -n 's/^WSS_LANES=//p' $CONF)" "$(sed -n 's/^UPLINKS=//p' $CONF | tr -d '"')" \
-			"$(sed -n 's/^TRANSPORT=//p' $CONF)" "$(sed -n 's/^GT_FEC=//p' $ENV)" \
-			"$(systemctl is-active black-relay@br0)" | sed "s|}$|,\"caps\":\"$(awk '!/^#/ && NF>=3 && !seen[$1]++ {printf "%s%s:%s", (n++?" ":""), $1, $3}' $CARRIERS)\"}|" ;;
+		python3 - "$ENV" "$CONF" "$CARRIERS" "$(systemctl is-active black-relay@br0)" <<'PY'
+import json, re, sys
+env, conf, carriers, svc = sys.argv[1:]
+def kv(path):
+    out = {}
+    for line in open(path):
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"')
+    return out
+e, c, caps, seen = kv(env), kv(conf), [], set()
+for line in open(carriers):
+    f = line.split("#", 1)[0].split()
+    if len(f) >= 3 and f[0] not in seen and re.fullmatch(r"\d+/\d+", f[2]):
+        seen.add(f[0]); caps.append(f"{f[0]}:{f[2]}")
+print(json.dumps({"sched": e.get("GT_SCHED", ""), "hold": e.get("GT_RESEQ_MS", ""), "lanes": c.get("WSS_LANES", ""),
+                  "uplinks": c.get("UPLINKS", ""), "transport": c.get("TRANSPORT", ""), "fec": e.get("GT_FEC", ""),
+                  "service": svc, "caps": " ".join(caps)}))
+PY
+		;;
 	set-sched)
 		case "${1:-}" in random|arrival|scatter) ;; *) echo "sched: random|arrival|scatter" >&2; exit 2 ;; esac
 		setkv $ENV GT_SCHED "$1"; log "sched=$1"; echo "ok (applies on restart-tunnel)" ;;
@@ -32,7 +48,7 @@ case "$verb" in
 		# per device, not per port: KIND:TX/RX ... (kinds from carriers.conf)
 		[ $# -ge 1 ] || { echo "caps: KIND:TX/RX ... (kinds in carriers.conf, e.g. isp starlink spitz)" >&2; exit 2; }
 		for kv in "$@"; do
-			echo "$kv" | grep -qE '^[a-z][a-z0-9_-]{0,15}:[0-9]{1,4}/[0-9]{1,4}$' ||
+			echo "$kv" | grep -qE '^[a-z][a-z0-9_-]{0,15}:[1-9][0-9]{0,3}/[1-9][0-9]{0,3}$' ||
 				{ echo "caps: KIND:TX/RX ... (Mbit)" >&2; exit 2; }
 			k=${kv%%:*}; c=${kv#*:}
 			grep -qE "^$k[[:space:]]" $CARRIERS || { echo "caps: unknown kind $k" >&2; exit 2; }
@@ -52,12 +68,22 @@ case "$verb" in
 		exec python3 /usr/local/sbin/br-selftest ;;
 	spitz)
 		# local management reachability of the Spitz (never the internet)
-		gw=$(python3 -c 'import json; print(next((u["gw"] for u in json.load(open("/run/black-relay/uplinks.json"))["uplinks"] if u["kind"] == "spitz" and u["gw"]), "192.168.9.1"))' 2>/dev/null || echo 192.168.9.1)
-		port=$(python3 -c 'import json; print(next((u["port"] for u in json.load(open("/run/black-relay/uplinks.json"))["uplinks"] if u["kind"] == "spitz"), ""))' 2>/dev/null || true)
-		if python3 -c "import socket; socket.create_connection(('$gw', 443), 3).close()" 2>/dev/null; then
-			echo "{\"reachable\":true,\"port\":\"$port\"}"
-		else
-			echo "{\"reachable\":false,\"port\":\"$port\"}"
-		fi ;;
+		python3 - <<'PY'
+import json, socket
+try:
+    ups = json.load(open("/run/black-relay/uplinks.json"))["uplinks"]
+except Exception:
+    ups = []
+sp = next((u for u in ups if u.get("kind") == "spitz" and u.get("admin")), {})
+ok = False
+if sp:
+    try:
+        socket.create_connection((sp["admin"][0], 443), 3).close()
+        ok = True
+    except OSError:
+        pass
+print(json.dumps({"reachable": ok, "port": sp.get("port", "")}))
+PY
+		;;
 	*) echo "verbs: status set-sched set-hold set-lanes set-caps restart-tunnel spitz uplinks selftest" >&2; exit 2 ;;
 esac

@@ -10,7 +10,9 @@ from pathlib import Path
 import json
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -663,6 +665,60 @@ class BlackRelayHubTests(unittest.TestCase):
         self.assertNotIn("ports", hub)
         self.assertEqual(hub["cap_drop"], ["ALL"])
         self.assertIn("multithread", hub["networks"]["identity_proxy"]["aliases"])
+        # Published site services answer only on the address Caddy reaches.
+        self.assertEqual(
+            hub["environment"]["BR_PUBLISH_ADDR"],
+            hub["networks"]["identity_proxy"]["ipv4_address"],
+        )
+
+    def test_caddy_access_log_redacts_the_hub_prefix(self):
+        caddyfile = render.render_template("edge", "Caddyfile.j2")
+        logging = caddyfile[caddyfile.index("(logging) {"):]
+        logging = logging[:logging.index("\n}\n")]
+        filters = [
+            shlex.split(line)
+            for line in logging.splitlines()
+            if line.strip().startswith("request>uri ")
+        ]
+        self.assertEqual(len(filters), 1)
+        field, kind, pattern, replacement = filters[0]
+        self.assertEqual(kind, "regexp")
+        secret = "multithread-" + "0123456789abcdef" * 2
+        uri = f"/{secret}/v1/events"
+        redacted = re.sub(pattern, replacement, uri)
+        self.assertNotIn("0123456789abcdef", redacted)
+        self.assertTrue(redacted.startswith("/multithread-"))
+        # Other sites' paths pass through untouched.
+        self.assertEqual(re.sub(pattern, replacement, "/cwwk/api"), "/cwwk/api")
+
+    def test_identity_export_never_follows_a_planted_symlink(self):
+        # The output directory is writable from inside the hub container, so a
+        # planted symlink must never redirect the host-side root write.
+        source = ROLES / "black_relay_hub" / "files" / "br-identity-export"
+        exporter = {"__name__": "br_identity_export"}
+        exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"), exporter)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            victim = tmp / "victim"
+            victim.write_text("host file")
+            victim.chmod(0o600)
+            shared = tmp / "etc"
+            shared.mkdir()
+            out = shared / "identity-snapshot.json"
+            (shared / "identity-snapshot.json.tmp").symlink_to(victim)
+            out.symlink_to(victim)
+
+            exporter["write_snapshot"]({"users": []}, out=str(out))
+
+            self.assertEqual(victim.read_text(), "host file")
+            self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o600)
+            self.assertFalse(out.is_symlink())
+            self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o644)
+            self.assertEqual(json.loads(out.read_text()), {"users": []})
+            self.assertEqual(
+                sorted(p.name for p in shared.iterdir()),
+                ["identity-snapshot.json", "identity-snapshot.json.tmp"],
+            )
 
     def test_edge_routes_hub_paths_and_pins_the_site_certificate(self):
         caddyfile = render.render_template("edge", "Caddyfile.j2")

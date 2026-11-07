@@ -74,6 +74,7 @@ def temps():
 class H(BaseHTTPRequestHandler):
     server_version = "br-hostinfo"
     sys_version = ""
+    timeout = 10   # slow / silent clients don't pile up
 
     def log_message(self, *a):
         pass
@@ -107,7 +108,10 @@ class H(BaseHTTPRequestHandler):
         if self.path != "/blink":
             return self.out(404, {"error": "not found"})
         try:
-            n = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 256)) or b"{}").get("nic")
+            ln = int(self.headers.get("Content-Length") or 0)
+            if not 0 <= ln <= 256:   # a negative length would read to EOF
+                return self.out(400, {"error": "bad body length"})
+            n = json.loads(self.rfile.read(ln) or b"{}").get("nic")
         except Exception:
             n = None
         if n not in phys_nics():
@@ -121,4 +125,6 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    ThreadingHTTPServer(LISTEN, H).serve_forever()
+    srv = ThreadingHTTPServer(LISTEN, H)
+    srv.daemon_threads = True
+    srv.serve_forever()
