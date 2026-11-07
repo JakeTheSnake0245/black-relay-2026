@@ -1,0 +1,151 @@
+---
+# Black Relay Multithread hub (+ identity snapshot for field sites).
+# Runtime state NOT managed here: site keys/configs and black-relay.env tuning
+# in {{ black_relay_hub_dir }}/etc (black-relay-hub add <site>).
+
+- name: Require the secret WebSocket path prefix
+  ansible.builtin.assert:
+    that:
+      - black_relay_hub_ws_prefix is defined
+      - black_relay_hub_ws_prefix is match('^multithread-[0-9a-f]{32}$')
+    fail_msg: "Set black_relay_hub_ws_prefix (multithread-<32 hex>) in secrets.sops.yml."
+    quiet: true
+  no_log: true
+
+- name: Socket buffer sysctls for the tunnel
+  ansible.builtin.template:
+    src: 90-black-relay.conf.j2
+    dest: /etc/sysctl.d/90-black-relay.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply sysctls
+
+- name: Hub directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: "{{ black_relay_hub_dir }}", mode: "0755"}
+    - {path: "{{ black_relay_hub_dir }}/etc", mode: "0700"}
+
+- name: Check whether the hub image is loaded
+  ansible.builtin.command: docker image inspect {{ black_relay_hub_image }}
+  register: black_relay_hub_image_check
+  changed_when: false
+  failed_when: false
+
+- name: Copy, verify and load the hub image
+  when: black_relay_hub_image_check.rc != 0
+  block:
+    - name: Copy the hub image archive
+      ansible.builtin.copy:
+        src: "{{ black_relay_hub_image_tar }}"
+        dest: "/root/{{ black_relay_hub_image_tar }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Verify the hub image archive checksum
+      ansible.builtin.stat:
+        path: "/root/{{ black_relay_hub_image_tar }}"
+        checksum_algorithm: sha256
+      register: black_relay_hub_tar
+      failed_when: black_relay_hub_tar.stat.checksum != black_relay_hub_image_sha256
+
+    - name: Load the hub image
+      ansible.builtin.command: docker load -i /root/{{ black_relay_hub_image_tar }}
+      changed_when: true
+
+# br-supervise is bind-mounted as a single file. Replacing it gives it a new
+# inode, so the running container keeps the old copy until it is recreated;
+# the restart handler does that.
+- name: Supervisor (watchdog, identity server, publish; until the image carries it)
+  ansible.builtin.copy:
+    src: br-supervise
+    dest: "{{ black_relay_hub_dir }}/br-supervise"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart black-relay hub
+
+- name: WebSocket path prefix (secret)
+  ansible.builtin.template:
+    src: ws.env.j2
+    dest: "{{ black_relay_hub_dir }}/ws.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  diff: false
+  notify: Restart black-relay hub
+
+- name: Published site services
+  ansible.builtin.template:
+    src: publish.conf.j2
+    dest: "{{ black_relay_hub_dir }}/etc/publish.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Re-apply published site services
+
+- name: Hub compose file
+  ansible.builtin.template:
+    src: compose.yml.j2
+    dest: "{{ black_relay_hub_dir }}/compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart black-relay hub
+
+- name: Hub running
+  ansible.builtin.command: docker compose -f {{ black_relay_hub_dir }}/compose.yml up -d
+  register: black_relay_hub_up
+  changed_when: "'Started' in black_relay_hub_up.stderr or 'Recreated' in black_relay_hub_up.stderr"
+
+- name: Identity snapshot exporter (secret-free; served to sites through tunnels)
+  ansible.builtin.copy:
+    src: br-identity-export
+    dest: /usr/local/sbin/br-identity-export
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Identity exporter units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: br-identity-export.service
+      content: |
+        [Unit]
+        Description=Black Relay: secret-free identity/policy snapshot for field sites
+        After=docker.service
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/python3 /usr/local/sbin/br-identity-export
+        NoNewPrivileges=yes
+        PrivateTmp=yes
+    - name: br-identity-export.timer
+      content: |
+        [Unit]
+        Description=Black Relay identity snapshot every 15 minutes
+        [Timer]
+        OnBootSec=2min
+        OnUnitActiveSec=15min
+        Persistent=true
+        [Install]
+        WantedBy=timers.target
+
+- name: Identity exporter timer enabled
+  ansible.builtin.systemd_service:
+    name: br-identity-export.timer
+    enabled: true
+    state: started
+    daemon_reload: true

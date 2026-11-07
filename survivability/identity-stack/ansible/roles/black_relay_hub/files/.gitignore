@@ -1,0 +1,2 @@
+# Hub image tarball (~large binary); stage it here before converging, never commit it.
+*.tar.gz

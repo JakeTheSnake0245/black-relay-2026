@@ -1,0 +1,22 @@
+---
+# Black Relay "Multithread" hub on BR2026. Sites reach it over HTTPS 443
+# through Caddy (no published ports, no public UDP).
+black_relay_hub_image: "black-relay:0.3.5-mt3"
+black_relay_hub_image_tar: "black-relay-image_0.3.5-mt3_amd64.tar.gz"
+black_relay_hub_image_sha256: "7e6ba5ef625d8cf6f40490262bfd4981daeb40261ced01351a79ce2352d2e307"
+black_relay_hub_dir: /srv/black-relay
+black_relay_hub_container: survivability-black-relay
+black_relay_hub_public_ip: "{{ ansible_default_ipv4.address }}"
+black_relay_hub_port_base: 5000
+# Fixed address on edge_proxy_network (the edge role's identity_proxy network).
+black_relay_hub_proxy_address: "172.29.0.10"
+# Secret upgrade-path prefix "multithread-<32 hex>": secrets.sops.yml only.
+# black_relay_hub_ws_prefix:
+
+# Site services Caddy may reach at multithread:<hub_port>, through the site's
+# tunnel (br-supervise publish). The edge Caddyfile routes /cwwk/* on the
+# Headscale host to the CWWK controller, which requires a Pocket ID sign-in.
+black_relay_hub_publish:
+  - hub_port: 8444
+    site_ip: "10.40.0.10"
+    site_port: 8444

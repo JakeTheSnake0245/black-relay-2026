@@ -654,5 +654,39 @@ class FirewallPolicyTests(unittest.TestCase):
         self.assertNotIn("flush ruleset", policy)
 
 
+class BlackRelayHubTests(unittest.TestCase):
+    """The Multithread hub and the routes the edge gives it."""
+
+    def test_hub_publishes_no_ports_and_joins_the_proxy_network(self):
+        compose = yaml.safe_load(render.render_template("black_relay_hub", "compose.yml.j2"))
+        hub = compose["services"]["hub"]
+        self.assertNotIn("ports", hub)
+        self.assertEqual(hub["cap_drop"], ["ALL"])
+        self.assertIn("multithread", hub["networks"]["identity_proxy"]["aliases"])
+
+    def test_edge_routes_hub_paths_and_pins_the_site_certificate(self):
+        caddyfile = render.render_template("edge", "Caddyfile.j2")
+        site = caddyfile[caddyfile.index("hs.example.test {"):]
+        site = site[:site.index("\n}\n")]
+        self.assertIn("handle /multithread-* {", site)
+        self.assertIn("handle_path /cwwk/* {", site)
+        self.assertEqual(site.count("reverse_proxy multithread:8080"), 1)
+        self.assertEqual(site.count("reverse_proxy https://multithread:8444"), 1)
+        self.assertIn("tls_trust_pool inline", site)
+        self.assertNotIn("tls_insecure_skip_verify", caddyfile)
+        # Everything else on the host still reaches Headscale.
+        self.assertIn("reverse_proxy headscale:8080", site)
+
+    def test_supervisor_refuses_unknown_commands(self):
+        # An unknown argument used to fall through to the entrypoint and start
+        # a second supervisor that fought the first over the tunnels.
+        supervisor = ROLES / "black_relay_hub" / "files" / "br-supervise"
+        result = subprocess.run(
+            ["sh", str(supervisor), "bogus"], capture_output=True, text=True, timeout=10
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("unknown command", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

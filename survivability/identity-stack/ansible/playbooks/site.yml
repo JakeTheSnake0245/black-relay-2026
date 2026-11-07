@@ -56,6 +56,10 @@
       tags: [edge]
     - role: identity_stack
       tags: [identity]
+    # Multithread hub: joins the edge proxy network as `multithread`, which
+    # the edge Caddyfile routes /multithread-* to. Needs the edge role first.
+    - role: black_relay_hub
+      tags: [black_relay]
     # Last: the client enrolls against the Headscale the role above converges.
     - role: tailnet_node
       tags: [tailnet]

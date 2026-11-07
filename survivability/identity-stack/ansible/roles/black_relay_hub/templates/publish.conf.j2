@@ -1,0 +1,6 @@
+# Managed by Ansible (black_relay_hub role). Local edits are overwritten.
+# <hub port> <site ip> <site port>   (br-supervise publish)
+# Site services BR2026's Caddy reaches at multithread:<hub port>, through the tunnel.
+{% for p in black_relay_hub_publish %}
+{{ p.hub_port }} {{ p.site_ip }} {{ p.site_port }}
+{% endfor %}

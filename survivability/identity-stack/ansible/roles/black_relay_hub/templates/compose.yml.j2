@@ -1,0 +1,49 @@
+---
+# Managed by Ansible (black_relay_hub role). Local edits are overwritten.
+# Black Relay Multithread hub. Userspace only: tunnel devices, forwarding and
+# NAT live in this container's network namespace. No published ports: Caddy
+# proxies wss://{{ headscale_domain }}/multithread-* to multithread:8080.
+name: black-relay
+services:
+  hub:
+    image: "{{ black_relay_hub_image }}"
+    pull_policy: never
+    container_name: "{{ black_relay_hub_container }}"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /run:size=16m,mode=0755
+      - /tmp:size=16m,mode=1777
+    environment:
+      BR_PUBLIC_IP: "{{ black_relay_hub_public_ip }}"
+      BR_PORT_BASE: "{{ black_relay_hub_port_base }}"
+      BR_FORWARD: "egress"
+      BR_NAT: "1"
+      BR_WS_LISTEN: "0.0.0.0:8080"
+    env_file:
+      - path: "{{ black_relay_hub_dir }}/ws.env"
+        format: raw
+    volumes:
+      - "{{ black_relay_hub_dir }}/etc:/etc/black-relay"
+      - "{{ black_relay_hub_dir }}/br-supervise:/usr/sbin/br-supervise:ro"
+    networks:
+      black_relay: {}
+      {{ edge_proxy_network }}:
+        ipv4_address: "{{ black_relay_hub_proxy_address }}"
+        aliases: [multithread]
+    deploy:
+      resources:
+        limits: {memory: "256M", cpus: "2.00"}
+
+networks:
+  black_relay:
+    name: "black_relay"
+  {{ edge_proxy_network }}:
+    external: true
+    name: "{{ edge_proxy_network }}"

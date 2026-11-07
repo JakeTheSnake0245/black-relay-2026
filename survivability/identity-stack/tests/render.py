@@ -64,6 +64,13 @@ FIXTURES = {
             "https://hc-ping.example.invalid/00000000-0000-4000-8000-000000000002"
         ),
     },
+    "black_relay_hub": {
+        "playbook_dir": "/workspace/ansible/playbooks",
+        "ansible_default_ipv4": {"address": "192.0.2.10"},
+        "edge_proxy_network": "identity_proxy",
+        "headscale_domain": "hs.example.test",
+        "black_relay_hub_ws_prefix": "multithread-" + "0" * 32,
+    },
     "host_firewall": {
         "inventory_hostname": "identity.example.test",
     },

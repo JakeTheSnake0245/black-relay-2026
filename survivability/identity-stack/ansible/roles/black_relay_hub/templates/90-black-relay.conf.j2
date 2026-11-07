@@ -1,0 +1,8 @@
+# Managed by Ansible (black_relay_hub role). Local edits are overwritten.
+# Black Relay hub (survivability-black-relay): glorytun uses default socket
+# buffers; 208 KB overflowed under 100+ Mbit bursts (UDP RcvbufErrors).
+# Not namespaced on this kernel, so it is set host-wide.
+net.core.rmem_default = 4194304
+net.core.rmem_max = 8388608
+net.core.wmem_default = 4194304
+net.core.wmem_max = 8388608

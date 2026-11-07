@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""br-identity-export: secret-free snapshot of who-is-who and who-can-reach-what,
+for field sites to enforce the same access control while offline.
+
+Reads Headscale (users, devices, policy) through its local CLI and LLDAP
+(users, groups) with a read-only account. Writes
+/srv/black-relay/etc/identity-snapshot.json, which the Multithread hub serves
+to sites through their tunnels only. No keys, tokens or passwords included.
+"""
+import json, os, subprocess, time, urllib.request
+
+OUT = "/srv/black-relay/etc/identity-snapshot.json"
+HS = ["docker", "exec", "survivability-headscale", "headscale"]
+
+def hs(*a):
+    p = subprocess.run(HS + list(a), capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr[-200:])
+    return p.stdout
+
+def lldap():
+    env = dict(l.rstrip("\n").split("=", 1) for l in open("/etc/black-relay-identity/export.env") if "=" in l)
+    B = "http://127.0.0.1:17170"
+    req = lambda p, b, t=None: json.load(urllib.request.urlopen(urllib.request.Request(
+        B + p, json.dumps(b).encode(), {"Content-Type": "application/json", **({"Authorization": "Bearer " + t} if t else {})}), timeout=10))
+    tok = req("/auth/simple/login", {"username": env["LLDAP_RO_USER"], "password": env["LLDAP_RO_PASS"]})["token"]
+    d = req("/api/graphql", {"query": "{ users { id email displayName groups { displayName } } groups { displayName } }"}, tok)["data"]
+    users = [{"id": u["id"], "email": u["email"], "name": u["displayName"],
+              "groups": sorted(g["displayName"] for g in u["groups"])}
+             for u in d["users"] if u["id"] != env["LLDAP_RO_USER"]]
+    return users, sorted(g["displayName"] for g in d["groups"])
+
+def main():
+    users, groups = lldap()
+    hsu = json.loads(hs("users", "list", "-o", "json"))
+    nodes = []
+    for n in json.loads(hs("nodes", "list", "-o", "json")):
+        u = n.get("user") or {}
+        nodes.append({"name": n.get("given_name") or n.get("name"), "user": u.get("email") or u.get("name"),
+                      "tags": sorted(set((n.get("tags") or []) + (n.get("forced_tags") or []) + (n.get("valid_tags") or []))),
+                      "ips": n.get("ip_addresses") or [], "online": bool(n.get("online")),
+                      "last_seen": (n.get("last_seen") or {}).get("seconds") if isinstance(n.get("last_seen"), dict) else n.get("last_seen")})
+    snap = {"generated": int(time.time()), "source": "BR2026",
+            "users": users, "groups": groups,
+            "tailnet_users": [{"name": u.get("name"), "email": u.get("email")} for u in hsu],
+            "nodes": nodes, "policy": hs("policy", "get")}
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(snap, f, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, OUT)
+    print(f"snapshot: {len(users)} users, {len(groups)} groups, {len(nodes)} devices")
+
+main()

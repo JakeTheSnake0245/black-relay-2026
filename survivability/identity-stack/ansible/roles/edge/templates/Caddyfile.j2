@@ -41,9 +41,35 @@
 {{ headscale_domain }} {
 	import logging
 	import security_headers
-	reverse_proxy headscale:8080 {
-		header_up X-Real-IP {remote_host}
-		stream_close_delay 5m
+	# Multithread: site lanes upgrade to WebSocket on /multithread-<secret>/...
+	# The hub (wstunnel) accepts only its exact secret prefix; no secret here.
+	handle /multithread-* {
+		reverse_proxy multithread:8080 {
+			stream_close_delay 5m
+		}
+	}
+	# CWWK site controller (field site) through the Multithread hub and tunnel.
+	# Sign-in is Pocket ID inside the controller; the pinned certificate is the
+	# controller's own self-signed one (public, not a secret).
+	handle /cwwk {
+		redir * /cwwk/ 308
+	}
+	handle_path /cwwk/* {
+		reverse_proxy https://multithread:8444 {
+			flush_interval -1
+			transport http {
+				tls_server_name br-controller
+				tls_trust_pool inline {
+					trust_der MIIB3TCCAYSgAwIBAgIUfHo3MpGP5C3ZzdWxw3o2j6bxKZcwCgYIKoZIzj0EAwIwGTEXMBUGA1UEAwwOY29udHJvbGxlci5sYW4wHhcNMjYxMTA3MDMzNzMzWhcNMzExMTA2MDMzNzMzWjAZMRcwFQYDVQQDDA5jb250cm9sbGVyLmxhbjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABCBqL1neb6LHVZXqXEIqAOf7/gqefhY1/4evTEFoNXxc+3GPi/9Qgf4VLUcvZ06W6/ny8qqP0Y7J2bUWw4/pQpmjgakwgaYwHQYDVR0OBBYEFDwdX+rsbYkVd8nLD0VLfO6wW/dbMB8GA1UdIwQYMBaAFDwdX+rsbYkVd8nLD0VLfO6wW/dbMA8GA1UdEwEB/wQFMAMBAf8wUwYDVR0RBEwwSoIOY29udHJvbGxlci5sYW6CCnN0YXR1cy5sYW6CDWJyLWNvbnRyb2xsZXKCEWJyLWNvbnRyb2xsZXIubGFuhwQKKAAKhwRkQAALMAoGCCqGSM49BAMCA0cAMEQCIDOKXNebCtdHoKTKVEYZkLHvvlCPg/pPv17ZdkH4ZzuuAiAjr2nq0P5OYt9LzQ8Y1TlbG5ZOFW7p9a30ZTA//IpoRw==
+				}
+			}
+		}
+	}
+	handle {
+		reverse_proxy headscale:8080 {
+			header_up X-Real-IP {remote_host}
+			stream_close_delay 5m
+		}
 	}
 }
 
