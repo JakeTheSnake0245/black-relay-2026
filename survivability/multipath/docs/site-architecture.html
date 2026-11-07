@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Black Relay Site Architecture</title>
+<style>
+@page { size: 11in 8.5in; margin: 0.35in; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 10.5pt/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #0b0b0b; background: #fff; }
+.page { height: 7.75in; page-break-after: always; display: flex; flex-direction: column; }
+.page:last-child { page-break-after: auto; }
+header { display: flex; align-items: baseline; gap: 14px; border-bottom: 2px solid #0b0b0b; padding-bottom: 6px; margin-bottom: 8px; }
+header h1 { font-size: 17pt; margin: 0; letter-spacing: -.01em; white-space: nowrap; }
+header .sub { color: #52514e; font-size: 10pt; }
+header .right { margin-left: auto; color: #898781; font-size: 9pt; white-space: nowrap; }
+svg { width: 100%; flex: 1; min-height: 0; }
+svg text { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; }
+.legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 9pt; color: #52514e; margin-top: 4px; }
+.legend i { display: inline-block; width: 22px; height: 0; border-top: 4px solid; vertical-align: middle; margin-right: 6px; }
+.legend i.d { border-top: 2px dashed; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+h2 { font-size: 11.5pt; margin: 8px 0 5px; }
+table { width: 100%; border-collapse: collapse; font-size: 8.8pt; }
+th { text-align: left; color: #52514e; font-weight: 600; border-bottom: 1px solid #c3c2b7; padding: 3px 6px; }
+td { border-bottom: 1px solid #e1e0d9; padding: 3px 6px; vertical-align: top; }
+ul { margin: 4px 0; padding-left: 18px; }
+li { margin: 2px 0; font-size: 9pt; }
+.note { color: #52514e; font-size: 9pt; }
+.mono { font-family: "SF Mono", Menlo, monospace; font-size: 8.3pt; }
+</style>
+</head>
+<body>
+
+<!-- ============================ PAGE 1: end to end ============================ -->
+<section class="page">
+  <header><h1>Black Relay: how the site reaches the internet</h1><span class="sub">every modem carries its own encrypted lanes, over its own carrier, to the hub in Hetzner</span><span class="right">November 2026</span></header>
+  <svg viewBox="0 0 1100 600" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+      <marker id="aI" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2a78d6"/></marker>
+      <marker id="aS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#7a4fd6"/></marker>
+      <marker id="aC" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d9751e"/></marker>
+    </defs>
+
+    <!-- ===== site ===== -->
+    <rect x="8" y="40" width="200" height="400" rx="12" fill="#f3f2ee" stroke="#0b0b0b" stroke-width="1.5"/>
+    <text x="20" y="62" font-size="14" font-weight="700">CWWK site box</text>
+    <rect x="20" y="74" width="176" height="56" rx="7" fill="#fff" stroke="#52514e"/>
+    <text x="30" y="94" font-size="12" font-weight="650">4 ports: any cable, any port</text>
+    <text x="30" y="110" font-size="10.5" fill="#52514e">modems · Spitz (Wi-Fi) · laptop</text>
+    <text x="30" y="123" font-size="10.5" fill="#52514e">each port detected by itself</text>
+    <rect x="20" y="142" width="176" height="150" rx="7" fill="#fff" stroke="#0b0b0b" stroke-width="1.3"/>
+    <text x="30" y="162" font-size="12" font-weight="650">br-edge (multipath)</text>
+    <text x="30" y="179" font-size="10.5">• names each modem + caps</text>
+    <text x="30" y="195" font-size="10.5">• 6 TLS lanes per modem, each</text>
+    <text x="40" y="209" font-size="10.5">pinned to its own modem</text>
+    <text x="30" y="225" font-size="10.5">• glorytun splits every flow</text>
+    <text x="40" y="239" font-size="10.5">across all lanes, encrypted</text>
+    <text x="30" y="255" font-size="10.5">• leak guard: nothing else</text>
+    <text x="40" y="269" font-size="10.5">leaves a modem; fail closed</text>
+    <text x="30" y="285" font-size="10.5" fill="#52514e">tunnel end 10.255.1.2</text>
+    <rect x="20" y="304" width="176" height="62" rx="7" fill="#fff" stroke="#52514e"/>
+    <text x="30" y="323" font-size="12" font-weight="650">br-router</text>
+    <text x="30" y="339" font-size="10.5" fill="#52514e">site LAN + Wi-Fi 10.40.0.x</text>
+    <text x="30" y="354" font-size="10.5" fill="#52514e">services 10.41.0.x</text>
+    <rect x="20" y="378" width="176" height="50" rx="7" fill="#fff" stroke="#52514e"/>
+    <text x="30" y="398" font-size="12" font-weight="650">br-controller</text>
+    <text x="30" y="414" font-size="10.5" fill="#52514e">web UI 10.40.0.10</text>
+    <line x1="108" y1="304" x2="108" y2="294" stroke="#52514e" stroke-width="1.5"/>
+    <text x="114" y="301" font-size="9" fill="#52514e">all site traffic</text>
+
+    <!-- ===== carrier rows ===== -->
+    <!-- ISP -->
+    <text x="222" y="86" font-size="11.5" font-weight="700" fill="#2a78d6">ISP</text>
+    <path d="M196,185 C210,185 212,110 232,110" fill="none" stroke="#2a78d6" stroke-width="5"/>
+    <rect x="232" y="92" width="96" height="38" rx="7" fill="#fff" stroke="#2a78d6" stroke-width="1.6"/>
+    <text x="280" y="115" font-size="11.5" text-anchor="middle">ISP router</text>
+    <line x1="328" y1="111" x2="352" y2="111" stroke="#2a78d6" stroke-width="5"/>
+    <rect x="352" y="92" width="110" height="38" rx="19" fill="#fff" stroke="#2a78d6" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <text x="407" y="115" font-size="11.5" text-anchor="middle">ISP network</text>
+    <line x1="462" y1="111" x2="652" y2="111" stroke="#2a78d6" stroke-width="5" marker-end="url(#aI)"/>
+    <text x="555" y="103" font-size="10" text-anchor="middle" fill="#2a78d6">6 lanes · TLS · TCP 443</text>
+
+    <!-- Starlink -->
+    <text x="222" y="196" font-size="11.5" font-weight="700" fill="#7a4fd6">STARLINK</text>
+    <path d="M196,215 L232,221" fill="none" stroke="#7a4fd6" stroke-width="5"/>
+    <rect x="232" y="202" width="96" height="38" rx="7" fill="#fff" stroke="#7a4fd6" stroke-width="1.6"/>
+    <text x="280" y="225" font-size="11.5" text-anchor="middle">Starlink router</text>
+    <line x1="328" y1="221" x2="346" y2="221" stroke="#7a4fd6" stroke-width="5"/>
+    <rect x="346" y="202" width="60" height="38" rx="7" fill="#fff" stroke="#7a4fd6" stroke-width="1.6"/>
+    <text x="376" y="225" font-size="11.5" text-anchor="middle">Dish</text>
+    <line x1="406" y1="221" x2="424" y2="221" stroke="#7a4fd6" stroke-width="5" stroke-dasharray="7 4"/>
+    <rect x="424" y="202" width="70" height="38" rx="19" fill="#fff" stroke="#7a4fd6" stroke-width="1.6"/>
+    <text x="459" y="225" font-size="11.5" text-anchor="middle">Satellite</text>
+    <line x1="494" y1="221" x2="512" y2="221" stroke="#7a4fd6" stroke-width="5" stroke-dasharray="7 4"/>
+    <rect x="512" y="202" width="112" height="38" rx="7" fill="#fff" stroke="#7a4fd6" stroke-width="1.6"/>
+    <text x="568" y="218" font-size="10.5" text-anchor="middle">Ground station</text>
+    <text x="568" y="232" font-size="10.5" text-anchor="middle">+ Starlink PoP</text>
+    <line x1="624" y1="221" x2="652" y2="221" stroke="#7a4fd6" stroke-width="5" marker-end="url(#aS)"/>
+    <text x="415" y="256" font-size="10" text-anchor="middle" fill="#7a4fd6">6 lanes · radio hops dashed · dish answers 192.168.100.1</text>
+
+    <!-- Spitz -->
+    <text x="222" y="306" font-size="11.5" font-weight="700" fill="#d9751e">SPITZ (CELLULAR)</text>
+    <path d="M196,250 C214,250 212,331 232,331" fill="none" stroke="#d9751e" stroke-width="5"/>
+    <rect x="232" y="312" width="96" height="38" rx="7" fill="#fff" stroke="#d9751e" stroke-width="1.6"/>
+    <text x="280" y="329" font-size="11" text-anchor="middle">Spitz</text>
+    <text x="280" y="343" font-size="10" text-anchor="middle" fill="#52514e">4G/5G + Wi-Fi</text>
+    <line x1="328" y1="331" x2="352" y2="331" stroke="#d9751e" stroke-width="5" stroke-dasharray="7 4"/>
+    <rect x="352" y="312" width="86" height="38" rx="7" fill="#fff" stroke="#d9751e" stroke-width="1.6"/>
+    <text x="395" y="335" font-size="11.5" text-anchor="middle">Cell tower</text>
+    <line x1="438" y1="331" x2="458" y2="331" stroke="#d9751e" stroke-width="5"/>
+    <rect x="458" y="312" width="100" height="38" rx="7" fill="#fff" stroke="#d9751e" stroke-width="1.6"/>
+    <text x="508" y="335" font-size="11.5" text-anchor="middle">Carrier core</text>
+    <line x1="558" y1="331" x2="652" y2="331" stroke="#d9751e" stroke-width="5" marker-end="url(#aC)"/>
+    <text x="400" y="368" font-size="10" text-anchor="middle" fill="#d9751e">6 lanes · capped at normal 4G (5 up / 20 down)</text>
+
+    <text x="224" y="400" font-size="10.5" fill="#52514e">Any other internet (a second ISP, a phone hotspot) is treated as "ISP" and gets the same 6 lanes.</text>
+    <text x="224" y="416" font-size="10.5" fill="#52514e">A modem with no internet just has idle lanes; the others carry everything.</text>
+
+    <!-- ===== internet ===== -->
+    <rect x="656" y="70" width="70" height="300" rx="35" fill="#fafaf8" stroke="#52514e" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="691" y="214" font-size="12.5" font-weight="650" text-anchor="middle">Public</text>
+    <text x="691" y="230" font-size="12.5" font-weight="650" text-anchor="middle">internet</text>
+    <line x1="726" y1="200" x2="762" y2="106" stroke="#52514e" stroke-width="3" marker-end="url(#a)"/>
+
+    <!-- ===== Hetzner ===== -->
+    <rect x="752" y="40" width="340" height="400" rx="12" fill="#f3f2ee" stroke="#0b0b0b" stroke-width="1.5"/>
+    <text x="764" y="62" font-size="14" font-weight="700">BR2026 hub · Hetzner Helsinki</text>
+    <text x="764" y="78" font-size="10.5" fill="#52514e">89.167.30.202 · headscale.l8s.dev</text>
+    <rect x="764" y="88" width="316" height="34" rx="7" fill="#fff" stroke="#52514e"/>
+    <text x="774" y="110" font-size="11.5"><tspan font-weight="650">Hetzner firewall</tspan> · only TCP 80/443 open</text>
+    <line x1="922" y1="122" x2="922" y2="134" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+    <rect x="764" y="136" width="316" height="72" rx="7" fill="#fff" stroke="#0b0b0b" stroke-width="1.3"/>
+    <text x="774" y="155" font-size="11.5" font-weight="650">Caddy :443 (public certificate)</text>
+    <text x="774" y="171" font-size="10.5">/multithread-* → hub lanes (wstunnel :8080)</text>
+    <text x="774" y="186" font-size="10.5">/cwwk/* → hub :8444 → site controller</text>
+    <text x="774" y="201" font-size="10.5">everything else → Headscale</text>
+    <line x1="922" y1="208" x2="922" y2="220" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+    <rect x="764" y="222" width="316" height="96" rx="7" fill="#fff" stroke="#0b0b0b" stroke-width="1.3"/>
+    <text x="774" y="241" font-size="11.5" font-weight="650">Hub container (alias "multithread")</text>
+    <text x="774" y="257" font-size="10.5">wstunnel server: unwraps each lane</text>
+    <text x="774" y="272" font-size="10.5">glorytun hub 10.255.1.1 ⇄ site 10.255.1.2</text>
+    <text x="774" y="287" font-size="10.5">decrypts, puts packets back in order</text>
+    <text x="774" y="302" font-size="10.5">(up to 400 ms reorder hold)</text>
+    <line x1="850" y1="318" x2="850" y2="330" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+    <rect x="764" y="332" width="166" height="48" rx="7" fill="#fff" stroke="#0b0b0b" stroke-width="1.3"/>
+    <text x="774" y="352" font-size="11.5" font-weight="650">NAT exit</text>
+    <text x="774" y="368" font-size="10.5">site appears as 89.167.30.202</text>
+    <rect x="940" y="332" width="140" height="48" rx="7" fill="#fff" stroke="#52514e"/>
+    <text x="950" y="352" font-size="11" font-weight="650">Identity (same host)</text>
+    <text x="950" y="368" font-size="10">Headscale · Pocket ID · LLDAP</text>
+    <line x1="847" y1="380" x2="847" y2="412" stroke="#0b0b0b" stroke-width="3" marker-end="url(#a)"/>
+    <text x="857" y="402" font-size="10.5" fill="#52514e">websites and services on the internet</text>
+    <text x="764" y="432" font-size="10" fill="#52514e">Only the hub sees the site's real traffic; carriers see TLS to 443.</text>
+
+    <!-- ===== remote access ===== -->
+    <rect x="8" y="456" width="1084" height="138" rx="12" fill="#fff" stroke="#52514e" stroke-dasharray="5 4"/>
+    <text x="20" y="478" font-size="13" font-weight="700">Remote access to the site controller (from anywhere)</text>
+    <g font-size="10.5">
+      <rect x="20" y="490" width="128" height="44" rx="7" fill="#f3f2ee" stroke="#52514e"/><text x="84" y="509" text-anchor="middle">Browser</text><text x="84" y="524" text-anchor="middle" fill="#52514e">anywhere</text>
+      <line x1="148" y1="512" x2="170" y2="512" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+      <rect x="172" y="490" width="190" height="44" rx="7" fill="#f3f2ee" stroke="#52514e"/><text x="267" y="509" text-anchor="middle" class="mono">headscale.l8s.dev/cwwk/</text><text x="267" y="524" text-anchor="middle" fill="#52514e">Caddy on BR2026</text>
+      <line x1="362" y1="512" x2="384" y2="512" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+      <rect x="386" y="490" width="170" height="44" rx="7" fill="#f3f2ee" stroke="#52514e"/><text x="471" y="509" text-anchor="middle">hub :8444</text><text x="471" y="524" text-anchor="middle" fill="#52514e">forwarded through the tunnel</text>
+      <line x1="556" y1="512" x2="578" y2="512" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+      <rect x="580" y="490" width="170" height="44" rx="7" fill="#f3f2ee" stroke="#52514e"/><text x="665" y="509" text-anchor="middle">controller 10.40.0.10</text><text x="665" y="524" text-anchor="middle" fill="#52514e">accepts the hub only</text>
+      <line x1="750" y1="512" x2="772" y2="512" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+      <rect x="774" y="490" width="306" height="44" rx="7" fill="#f3f2ee" stroke="#52514e"/><text x="927" y="509" text-anchor="middle">Pocket ID sign-in (id.l8s.dev)</text><text x="927" y="524" text-anchor="middle" fill="#52514e">survivability = admin · headscale-users = view</text>
+    </g>
+    <text x="20" y="556" font-size="10.5" fill="#52514e">Needs the tunnel up. On site, the controller is also at https://10.40.0.10 (admin password = break-glass when the tunnel or Pocket ID is down).</text>
+    <text x="20" y="573" font-size="10.5" fill="#52514e">The CWWK's own Tailscale (100.64.0.11) also rides the tunnel, so a tunnel outage takes it off the tailnet too.</text>
+  </svg>
+  <div class="legend"><span><i style="border-color:#2a78d6"></i>ISP lanes</span><span><i style="border-color:#7a4fd6"></i>Starlink lanes</span><span><i style="border-color:#d9751e"></i>Spitz lanes</span><span><i class="d" style="border-color:#52514e"></i>radio hop / public internet</span><span>Speed weights (up/down Mbit): ISP 100/150 · Starlink 10/150 · Spitz 5/20; downloads split evenly ISP/Starlink.</span></div>
+</section>
+
+<!-- ============================ PAGE 2: site side ============================ -->
+<section class="page">
+  <header><h1>Inside the CWWK: any cable, any port</h1><span class="sub">one port bridge, three containers, the site networks</span><span class="right">Black Relay · cwwk01</span></header>
+  <svg viewBox="0 0 1100 470" xmlns="http://www.w3.org/2000/svg">
+    <defs><marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker></defs>
+    <!-- ports -->
+    <g font-size="11">
+      <rect x="20" y="30" width="110" height="46" rx="7" fill="#fff" stroke="#0b0b0b"/><text x="75" y="50" text-anchor="middle" font-weight="650">nic0</text><text x="75" y="66" text-anchor="middle" fill="#52514e">anything</text>
+      <rect x="20" y="96" width="110" height="46" rx="7" fill="#fff" stroke="#0b0b0b"/><text x="75" y="116" text-anchor="middle" font-weight="650">nic1</text><text x="75" y="132" text-anchor="middle" fill="#52514e">anything</text>
+      <rect x="20" y="162" width="110" height="46" rx="7" fill="#fff" stroke="#0b0b0b"/><text x="75" y="182" text-anchor="middle" font-weight="650">nic2</text><text x="75" y="198" text-anchor="middle" fill="#52514e">anything</text>
+      <rect x="20" y="228" width="110" height="46" rx="7" fill="#fff" stroke="#0b0b0b"/><text x="75" y="248" text-anchor="middle" font-weight="650">nic3</text><text x="75" y="264" text-anchor="middle" fill="#52514e">anything</text>
+    </g>
+    <text x="20" y="300" font-size="10.5" fill="#52514e">physical jacks</text>
+    <!-- bridge -->
+    <rect x="170" y="20" width="250" height="264" rx="10" fill="#f3f2ee" stroke="#0b0b0b" stroke-width="1.4"/>
+    <text x="182" y="42" font-size="13" font-weight="700">Port bridge vmbr10</text>
+    <text x="182" y="58" font-size="10.5" fill="#52514e">VLAN-aware · spanning tree on (CWWK is root)</text>
+    <g font-size="10.5">
+      <text x="182" y="88">nic0 untagged → VLAN 100</text>
+      <text x="182" y="154">nic1 untagged → VLAN 101</text>
+      <text x="182" y="220">nic2 untagged → VLAN 102</text>
+      <text x="182" y="268">nic3 untagged → VLAN 103</text>
+    </g>
+    <g stroke="#52514e" stroke-width="1.4"><line x1="130" y1="53" x2="170" y2="84"/><line x1="130" y1="119" x2="170" y2="150"/><line x1="130" y1="185" x2="170" y2="216"/><line x1="130" y1="251" x2="170" y2="264"/></g>
+    <rect x="182" y="100" width="226" height="34" rx="6" fill="#fff" stroke="#2a78d6"/>
+    <text x="192" y="114" font-size="10.5" fill="#2a78d6" font-weight="650">VLAN 40 tagged on every port</text>
+    <text x="192" y="128" font-size="10" fill="#52514e">= Wi-Fi / site LAN (the Spitz tags its Wi-Fi)</text>
+    <rect x="182" y="166" width="226" height="34" rx="6" fill="#fff" stroke="#0c7a0c"/>
+    <text x="192" y="180" font-size="10.5" fill="#0c7a0c" font-weight="650">client device on a port?</text>
+    <text x="192" y="194" font-size="10" fill="#52514e">that port's untagged traffic → VLAN 40</text>
+
+    <!-- edge -->
+    <rect x="470" y="20" width="260" height="190" rx="10" fill="#fff" stroke="#0b0b0b" stroke-width="1.4"/>
+    <text x="482" y="42" font-size="13" font-weight="700">CT 101 br-edge</text>
+    <g font-size="10.5">
+      <text x="482" y="62">up0..up3 ← VLAN 100..103 (one per port)</text>
+      <text x="482" y="80">br-uplinks: names each modem</text>
+      <text x="494" y="95" fill="#52514e">(Starlink: dish answers · Spitz: gateway</text>
+      <text x="494" y="110" fill="#52514e">192.168.9.1 · anything else: ISP)</text>
+      <text x="482" y="128">6 lanes per modem → wss://…:443</text>
+      <text x="482" y="146">glorytun br0 10.255.1.2 · leak guard</text>
+      <text x="482" y="164">lane nurse + watchdog: self-healing</text>
+      <text x="482" y="182">tr0 10.39.0.1 · live dashboard :8088</text>
+      <text x="482" y="200" fill="#52514e">modem admin pages reachable from site</text>
+    </g>
+    <line x1="420" y1="120" x2="468" y2="100" stroke="#52514e" stroke-width="1.6" marker-end="url(#b)"/>
+    <text x="424" y="96" font-size="9.5" fill="#52514e">100–103</text>
+    <line x1="730" y1="80" x2="800" y2="80" stroke="#0b0b0b" stroke-width="3" marker-end="url(#b)"/>
+    <text x="808" y="76" font-size="11" font-weight="650">tunnel → hub</text>
+    <text x="808" y="92" font-size="10" fill="#52514e">(page 1)</text>
+
+    <!-- router -->
+    <rect x="470" y="250" width="260" height="120" rx="10" fill="#fff" stroke="#0b0b0b" stroke-width="1.4"/>
+    <text x="482" y="272" font-size="13" font-weight="700">CT 102 br-router (OpenWrt)</text>
+    <g font-size="10.5">
+      <text x="482" y="292">br-lan 10.40.0.1 = site LAN + VLAN 40</text>
+      <text x="482" y="310">DHCP .100–.199 · DNS (*.lan names)</text>
+      <text x="482" y="328">wan 10.39.0.2 → br-edge (no NAT)</text>
+      <text x="482" y="346">svc 10.41.0.1 · firewall deny-by-default</text>
+      <text x="482" y="362" fill="#52514e">LuCI https://10.40.0.1</text>
+    </g>
+    <line x1="420" y1="117" x2="470" y2="290" stroke="#2a78d6" stroke-width="2"/>
+    <text x="430" y="230" font-size="9.5" fill="#2a78d6">VLAN 40</text>
+    <line x1="600" y1="250" x2="600" y2="212" stroke="#52514e" stroke-width="1.6" marker-end="url(#b)"/>
+    <text x="606" y="236" font-size="9.5" fill="#52514e">transit vmbr2 10.39.0.0/30</text>
+
+    <!-- site LAN + services -->
+    <rect x="790" y="240" width="290" height="96" rx="10" fill="#f3f2ee" stroke="#0b0b0b"/>
+    <text x="802" y="262" font-size="13" font-weight="700">Site LAN 10.40.0.0/24 (vmbr1)</text>
+    <g font-size="10.5">
+      <text x="802" y="282">router .1 · controller .10 · Proxmox host .2</text>
+      <text x="802" y="300">Wi-Fi devices (GL-X3000-0fd) · laptops</text>
+      <text x="802" y="318" fill="#52514e">all reach the internet only via the tunnel</text>
+    </g>
+    <line x1="730" y1="300" x2="790" y2="295" stroke="#52514e" stroke-width="1.6"/>
+    <rect x="790" y="350" width="290" height="58" rx="10" fill="#fff" stroke="#52514e"/>
+    <text x="802" y="371" font-size="12" font-weight="650">Services 10.41.0.0/24 (vmbr3)</text>
+    <text x="802" y="389" font-size="10.5" fill="#52514e">cameras, TAK, sensors: cards on Services page</text>
+    <line x1="730" y1="345" x2="790" y2="378" stroke="#52514e" stroke-width="1.6"/>
+    <rect x="790" y="150" width="290" height="70" rx="10" fill="#fff" stroke="#0b0b0b" stroke-width="1.3"/>
+    <text x="802" y="172" font-size="13" font-weight="700">CT 103 br-controller</text>
+    <text x="802" y="190" font-size="10.5">one web UI: health, setup, self-test, services</text>
+    <text x="802" y="207" font-size="10.5" fill="#52514e">https://10.40.0.10 · remote via headscale.l8s.dev/cwwk/</text>
+
+    <!-- decision strip -->
+    <rect x="20" y="320" width="420" height="140" rx="10" fill="#fff" stroke="#52514e" stroke-dasharray="5 4"/>
+    <text x="32" y="342" font-size="12.5" font-weight="700">What the CWWK decides per port (within ~1 min)</text>
+    <g font-size="10.5">
+      <text x="32" y="362"><tspan font-weight="650">A modem answers DHCP</tspan> → modem: joins the tunnel with its caps</text>
+      <text x="32" y="380"><tspan font-weight="650">Tagged Wi-Fi (VLAN 40) seen</tspan> → access point (the Spitz)</text>
+      <text x="32" y="398"><tspan font-weight="650">Only a device asking for an address,</tspan></text>
+      <text x="44" y="413">no modem for 45 s → client port: gets 10.40.0.x</text>
+      <text x="32" y="431"><tspan font-weight="650">Cable out / a modem appears</tspan> → back to modem port</text>
+      <text x="32" y="449" fill="#52514e">Same box in two ports: spanning tree blocks the loop</text>
+    </g>
+  </svg>
+</section>
+
+<!-- ============================ PAGE 3: reference ============================ -->
+<section class="page">
+  <header><h1>Reference</h1><span class="sub">addresses, web interfaces, security controls, tuning</span><span class="right">Black Relay · cwwk01</span></header>
+  <div class="cols">
+    <div>
+      <h2>Networks and addresses</h2>
+      <table>
+        <tr><th>Network</th><th>Range</th><th>Where</th></tr>
+        <tr><td>Site LAN + Wi-Fi</td><td class="mono">10.40.0.0/24</td><td>router .1 · controller .10 · host .2 · DHCP .100–.199 · VLAN 40 on every port</td></tr>
+        <tr><td>Services</td><td class="mono">10.41.0.0/24</td><td>router .1 · cameras, TAK, sensors</td></tr>
+        <tr><td>Router ⇄ multipath</td><td class="mono">10.39.0.0/30</td><td>br-edge .1 · br-router .2 (internal)</td></tr>
+        <tr><td>Tunnel overlay</td><td class="mono">10.255.1.0/30</td><td>hub .1 · site .2</td></tr>
+        <tr><td>Port VLANs</td><td class="mono">100–103</td><td>port i → br-edge up i (internal to the CWWK)</td></tr>
+        <tr><td>Modem networks</td><td>whatever each modem hands out</td><td>e.g. Starlink 192.168.1.x · Spitz 192.168.9.x · ISP 192.168.8.x</td></tr>
+        <tr><td>Tailnet</td><td class="mono">100.64.0.0/10</td><td>CWWK host 100.64.0.11 (rides the tunnel)</td></tr>
+      </table>
+      <h2>Containers on the CWWK</h2>
+      <table>
+        <tr><th>ID</th><th>Name</th><th>Role</th></tr>
+        <tr><td>101</td><td>br-edge</td><td>modem detection, lanes, bonding, tunnel, leak guard, live dashboard</td></tr>
+        <tr><td>102</td><td>br-router</td><td>OpenWrt: DHCP, DNS, firewall, LuCI</td></tr>
+        <tr><td>103</td><td>br-controller</td><td>single web UI for the whole box</td></tr>
+      </table>
+      <h2>Web interfaces</h2>
+      <table>
+        <tr><th>What</th><th>On site</th><th>Anywhere</th></tr>
+        <tr><td>Controller</td><td class="mono">https://10.40.0.10</td><td class="mono">https://headscale.l8s.dev/cwwk/</td></tr>
+        <tr><td>Status (no login)</td><td class="mono">https://status.lan</td><td>–</td></tr>
+        <tr><td>Router (LuCI)</td><td class="mono">https://10.40.0.1</td><td>–</td></tr>
+        <tr><td>Proxmox</td><td class="mono">https://10.40.0.2:8006</td><td class="mono">https://100.64.0.11:8006 (tailnet)</td></tr>
+        <tr><td>Modem admin pages</td><td>controller → Setup → Quick links</td><td>–</td></tr>
+      </table>
+      <div class="note" style="margin-top:4px">Logins are held by the site operator, never in this document.</div>
+    </div>
+    <div>
+      <h2>Security controls</h2>
+      <ul>
+        <li><b>Fail closed.</b> Site traffic can only leave through the tunnel; if it is down, traffic is dropped, never sent out a raw modem.</li>
+        <li><b>Leak guard.</b> Only the encrypted lanes to the hub (TLS 443, each pinned to its modem), DHCP and modem admin pages may use a modem.</li>
+        <li><b>Hub inside existing ports.</b> No new public ports on BR2026: lanes ride HTTPS 443 behind Caddy; a secret path plus the tunnel's own keys authenticate the site.</li>
+        <li><b>Hub egress is public-only.</b> Site traffic can't reach the hub's internal networks or private ranges.</li>
+        <li><b>Client ports are safe.</b> A modem plugged into a client port can't hand out addresses on the site LAN; it is detected and the port returns to modem mode.</li>
+        <li><b>Remote control needs Pocket ID.</b> The controller's remote listener accepts only the hub, and every person signs in (admin or view-only by group).</li>
+        <li><b>Least privilege.</b> Proxmox token: view + power only; multipath changes through fixed commands; the three core containers can't be stopped from the UI.</li>
+        <li><b>Self-healing.</b> Moved cables, DHCP changes, stuck lanes and a wedged tunnel recover on their own; a full reboot is back in about 1.5 min.</li>
+      </ul>
+      <h2>Tuning (November 2026)</h2>
+      <table>
+        <tr><th>Setting</th><th>Value</th></tr>
+        <tr><td>Mixing</td><td>per-packet random, weighted by each modem's speed caps</td></tr>
+        <tr><td>Speed caps (up/down Mbit)</td><td>ISP 100/150 · Starlink 10/150 · Spitz 5/20 · follow the modem, not the port</td></tr>
+        <tr><td>Lanes</td><td>6 HTTPS connections per modem</td></tr>
+        <tr><td>Reorder hold</td><td>400 ms</td></tr>
+        <tr><td>Round trip to hub</td><td>~110–130 ms</td></tr>
+      </table>
+      <div class="note" style="margin-top:4px">Starlink's upload is ~9 Mbit raw, so uploads lean on the ISP by design. Change caps on the controller's Multipath page.</div>
+    </div>
+  </div>
+</section>
+</body>
+</html>

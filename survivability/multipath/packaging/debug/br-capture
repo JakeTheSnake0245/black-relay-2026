@@ -1,0 +1,119 @@
+#!/bin/sh
+# br-capture — capture every Black Relay interface independently, for
+# br-verify and Wireshark. One tcpdump per interface, so each uplink keeps
+# its own file and its own clock-stamped view of what left through it.
+#
+#   sudo br-capture [--name br0] [--seconds N] [--dir DIR] [--iface IF]... [--full]
+#
+# Without --iface it reads /etc/black-relay/<name>.conf:
+#   site (ROLE=client): every uplink in UPLINKS + the tunnel device
+#   hub/server:         the interface holding the default route + the tunnel
+#                       device(s) (--name site-alpha for one hub site, or
+#                       --name all for every br-* device)
+# Ctrl-C (or --seconds) stops all captures together. Output:
+#   DIR/<iface>.pcap   one per interface
+#   DIR/meta.env       interfaces, addresses, gateways, role, hub, port
+# Uplink captures keep 160 bytes per packet (enough to route-check, match
+# and unmask the header); tunnel-device captures keep 256 bytes of inner
+# plaintext (--full keeps everything; the files then hold your traffic).
+set -eu
+
+ETC=/etc/black-relay
+NAME=br0; SECS=0; DIR=""; IFACES=""; FULL=0
+
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+die() { echo "br-capture: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--name) NAME=$2; shift 2 ;;
+		--seconds) SECS=$2; shift 2 ;;
+		--dir) DIR=$2; shift 2 ;;
+		--iface) IFACES="${IFACES:+$IFACES }$2"; shift 2 ;;
+		--full) FULL=1; shift ;;
+		-h|--help) usage ;;
+		*) usage ;;
+	esac
+done
+[ "$(id -u)" = 0 ] || die "run as root (sudo)"
+command -v tcpdump >/dev/null || die "tcpdump missing (apt install tcpdump)"
+
+ROLE=""; DEV=""; PORT=""; SERVER=""; UPLINKS=""
+if [ "$NAME" = all ]; then
+	ROLE=server
+	DEV=$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | grep '^br-' | tr '\n' ' ')
+	PORT=$(sed -n 's/^PORT=//p' "$ETC"/site-*.conf 2>/dev/null | sort -n | tr '\n' ',' | sed 's/,$//')
+elif [ -r "$ETC/$NAME.conf" ]; then
+	eval "$(grep -E '^(ROLE|DEV|PORT|SERVER|UPLINKS)=' "$ETC/$NAME.conf")"
+	DEV=${DEV:-br-$NAME}
+elif [ -z "$IFACES" ]; then
+	die "no $ETC/$NAME.conf; pass --name or --iface"
+fi
+
+if [ -z "$IFACES" ]; then
+	if [ "$ROLE" = client ]; then
+		for s in $UPLINKS; do IFACES="${IFACES:+$IFACES }${s%%:*}"; done
+	else
+		IFACES=$(ip -4 route show default | awk '{for (n = 1; n < NF; n++) if ($n == "dev") {print $(n + 1); exit}}')
+	fi
+	IFACES="$IFACES $DEV"
+fi
+
+[ -n "$DIR" ] || DIR="./br-capture-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$DIR"
+
+{
+	echo "HOST=$(hostname -s)"
+	echo "STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	echo "ROLE=${ROLE:-unknown}"
+	echo "SERVER=$SERVER"
+	echo "PORTS=$PORT"
+	echo "TUNNELS=\"$DEV\""
+	for i in $IFACES; do
+		v=$(echo "$i" | tr -c 'A-Za-z0-9\n' '_')
+		a=$(ip -4 -o addr show dev "$i" scope global 2>/dev/null | awk '{split($4, x, "/"); print x[1]; exit}')
+		g=$(ip -4 route show default dev "$i" 2>/dev/null | awk '{for (n = 1; n < NF; n++) if ($n == "via") {print $(n + 1); exit}}')
+		echo "IF_$v=\"$i\""
+		echo "ADDR_$v=$a"
+		echo "GW_$v=$g"
+	done
+	echo "IFACES=\"$IFACES\""
+} >"$DIR/meta.env"
+
+pids=""
+for i in $IFACES; do
+	ip link show dev "$i" >/dev/null 2>&1 || { echo "skip $i: no such interface"; continue; }
+	snap=160
+	case " $DEV " in *" $i "*) snap=256 ;; esac
+	[ "$FULL" = 1 ] && snap=0
+	# -U: write each packet as it arrives so Ctrl-C loses nothing
+	tcpdump -i "$i" -n -U -s "$snap" -w "$DIR/$i.pcap" >"$DIR/$i.tcpdump.log" 2>&1 &
+	pids="$pids $!"
+	echo "capturing $i -> $DIR/$i.pcap (snaplen ${snap:-all})"
+done
+[ -n "$pids" ] || die "nothing to capture"
+
+stop() {
+	# shellcheck disable=SC2086
+	kill $pids 2>/dev/null || true
+	wait 2>/dev/null || true
+	echo
+	for i in $IFACES; do
+		[ -f "$DIR/$i.tcpdump.log" ] && printf '%-12s %s\n' "$i" "$(grep -E 'packets (captured|received by filter)' "$DIR/$i.tcpdump.log" | tr '\n' ' ')"
+	done
+	# captured with sudo: hand the directory to the user who ran it
+	[ -n "${SUDO_UID:-}" ] && chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$DIR" 2>/dev/null
+	echo "saved in $DIR"
+	echo "next: br-verify $DIR [--peer <other end's dir>] [--key <tunnel key>]"
+	exit 0
+}
+trap stop INT TERM
+
+if [ "$SECS" -gt 0 ] 2>/dev/null; then
+	echo "running ${SECS}s..."
+	sleep "$SECS" & wait $! || true
+	stop
+fi
+echo "running; Ctrl-C to stop"
+# sleep in the background + wait, so a TERM to this script stops it at once
+while :; do sleep 3600 & wait $! || true; done

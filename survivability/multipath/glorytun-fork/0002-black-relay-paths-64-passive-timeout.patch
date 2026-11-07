@@ -1,0 +1,92 @@
+--- a/mud/mud.h	2026-11-06 21:21:54
++++ b/mud/mud.h	2026-11-06 21:21:55
+@@ -5,7 +5,7 @@
+ #include <sys/socket.h>
+ #include <netinet/in.h>
+ 
+-#define MUD_PATH_MAX    (32U)
++#define MUD_PATH_MAX    (64U)   /* Black Relay: room for N lanes x uplinks + reconnects */
+ #define MUD_PUBKEY_SIZE (32U)
+ 
+ struct mud;
+@@ -130,6 +130,11 @@
+ /* Black Relay: select the scheduler at runtime (enum mud_sched). */
+ int mud_set_sched (struct mud *, int);
+ 
++/* Black Relay: forget a passive (server-learned) path after this many seconds
++ * without packets on it (stock: 300). Lanes that reconnect from a new source
++ * port leave their old path behind; a short timeout frees those slots. */
++int mud_set_passive_timeout (struct mud *, unsigned long);
++
+ /* Black Relay: toggle timestamp header protection (both ends must match). */
+ int mud_set_hp (struct mud *, int);
+ int mud_set_role (struct mud *, int);                 /* Black Relay: 1 client, 2 server */
+--- a/mud/mud.c	2026-11-06 21:21:54
++++ b/mud/mud.c	2026-11-06 21:21:55
+@@ -180,6 +180,7 @@
+     uint64_t last_msg_time; /* Black Relay: last control timestamp sent (odd) */
+     unsigned char role;     /* Black Relay: 1 client, 2 server, 0 unset */
+     uint64_t scatter_budget;/* Black Relay: max owd lag (us) a scatter lane may have */
++    uint64_t passive_timeout;/* Black Relay: drop idle passive paths after this (us) */
+     /* Black Relay: anti-replay sliding window over decrypted seq (RFC 6479
+      * style). rw_max is the highest seq accepted; rw_bits marks the window
+      * below it. Tolerates reordering up to MUD_REPLAY_BITS. */
+@@ -797,6 +798,17 @@
+ }
+ 
+ int
++mud_set_passive_timeout(struct mud *mud, unsigned long seconds)
++{
++    if (seconds < 5 || seconds > 3600) {
++        errno = EINVAL;
++        return -1;
++    }
++    mud->passive_timeout = seconds * MUD_ONE_SEC;
++    return 0;
++}
++
++int
+ mud_set_role(struct mud *mud, int role)
+ {
+     if (role < 0 || role > 2) {
+@@ -1017,6 +1029,7 @@
+         return NULL;
+     }
+     mud->conf.keepalive     = 25 * MUD_ONE_SEC;
++    mud->passive_timeout    = 5 * MUD_ONE_MIN;   /* Black Relay: stock default */
+     mud->conf.timetolerance = 10 * MUD_ONE_MIN;
+     mud->conf.kxtimeout     = 60 * MUD_ONE_MIN;
+ 
+@@ -1602,7 +1615,7 @@
+         case MUD_DOWN:
+             path->status = MUD_DELETING;
+         case MUD_PASSIVE:
+-            if (mud_timeout(now, path->rx.time, 5 * MUD_ONE_MIN)) {
++            if (mud_timeout(now, path->rx.time, mud->passive_timeout)) {
+                 memset(path, 0, sizeof(struct mud_path));
+                 return 0;
+             }
+--- a/src/bind.c	2026-11-06 21:21:54
++++ b/src/bind.c	2026-11-06 21:21:55
+@@ -179,6 +179,21 @@
+         gt_log("scheduler: random (stock)\n");
+     }
+ 
++    /* Black Relay: GT_PASSIVE_TIMEOUT_S=<s> (server side). Lanes carried over
++     * WebSocket reconnect from new source ports; without a short timeout
++     * their stale paths fill the path table (stock keeps them 5 min). Keep it
++     * well above the clients' idle keepalive. */
++    {
++        const char *pt = getenv("GT_PASSIVE_TIMEOUT_S");
++        if (pt) {
++            unsigned long s = strtoul(pt, NULL, 10);
++            if (mud_set_passive_timeout(mud, s))
++                gt_log("GT_PASSIVE_TIMEOUT_S=%s ignored (5-3600)\n", pt);
++            else
++                gt_log("passive path timeout: %lus\n", s);
++        }
++    }
++
+     /* Black Relay: end role (GT_ROLE=client|server). Separates the two ends'
+      * control-message nonces under the shared static key. Either value
+      * interoperates with any other; distinct values give the separation. */

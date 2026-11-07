@@ -1,0 +1,14 @@
+#!/bin/sh
+# glorytun-br — run the Black Relay glorytun fork with the runtime switches
+# from /etc/black-relay/black-relay.env (GT_SCHED, GT_RESEQ, GT_HP, GT_FEC...).
+#
+# black-relay-switch points OMR's glorytun-udp at this wrapper, so OMR's own
+# service/init script keeps working unchanged and picks up the fork + knobs.
+# Only `bind` reads the GT_* variables; every other subcommand ignores them.
+ENV=/etc/black-relay/black-relay.env
+if [ -r "$ENV" ]; then
+	set -a
+	. "$ENV"
+	set +a
+fi
+exec /usr/lib/black-relay/glorytun "$@"

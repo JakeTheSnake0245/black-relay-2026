@@ -1,0 +1,63 @@
+#!/bin/sh
+# black-relay-lab — the three-lane netns lab, run against the INSTALLED fork.
+# For a throwaway test server (DEPLOYMENT.md step B): proves deconstruct ->
+# reconstruct with the real CPU's crypto, no second host, no firewall change.
+#
+#   sudo black-relay-lab up               lanes (isp/starlink/cell, tc netem) + bonded tunnel
+#   sudo black-relay-lab probe [SECS]     CoT-like probe through the tunnel, print the report
+#   sudo black-relay-lab paths            per-path stats on both ends
+#   sudo black-relay-lab spike on|off     emulate a Starlink handoff
+#   sudo black-relay-lab down             tear it all down
+#
+# Both tunnel ends take their GT_* switches from /etc/black-relay/black-relay.env.
+# probe env: RATE (pkt/s, default 500), SIZE (bytes, default 400).
+set -eu
+
+SHARE=/usr/share/black-relay
+LAB=$SHARE/lab/lab.sh
+TUN=$SHARE/lab/tunnel.sh
+PROBE=$SHARE/analysis/relay-probe.py
+export GT=/usr/lib/black-relay/glorytun
+
+[ "$(id -u)" = 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+
+knobs() { grep -E '^GT_[A-Z_]+=' /etc/black-relay/black-relay.env 2>/dev/null | tr '\n' ' '; }
+
+case "${1:-}" in
+up)
+	command -v tc >/dev/null || { echo "needs tc (apt install iproute2)" >&2; exit 1; }
+	bash "$LAB" up
+	SRV_ENV=$(knobs) CLI_ENV=$(knobs) bash "$TUN" up "$GT"
+	echo "next: sudo black-relay-lab probe"
+	;;
+probe)
+	secs=${2:-10}
+	out=$(mktemp)
+	bash "$LAB" exec vps python3 "$PROBE" recv --listen 10.255.0.2:9999 >"$out" 2>&1 &
+	rp=$!
+	sleep 1
+	bash "$LAB" exec site python3 "$PROBE" send --to 10.255.0.2:9999 \
+		--rate "${RATE:-500}" --size "${SIZE:-400}" --duration "$secs"
+	sleep 1
+	kill -TERM "$rp" 2>/dev/null || true
+	wait "$rp" 2>/dev/null || true
+	echo "--- far end (vps) received ---"
+	grep -E 'FINAL' "$out" || tail -5 "$out"
+	rm -f "$out"
+	echo "settings: $(knobs)"
+	;;
+paths)
+	bash "$TUN" paths
+	;;
+spike)
+	bash "$LAB" spike "${2:-}"
+	;;
+down)
+	bash "$TUN" down || true
+	bash "$LAB" down
+	;;
+*)
+	sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+	exit 2
+	;;
+esac

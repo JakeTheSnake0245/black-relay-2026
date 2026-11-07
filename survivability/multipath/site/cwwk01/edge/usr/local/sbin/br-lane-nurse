@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""br-lane-nurse: bring a slow modem's lanes back without touching the others.
+
+After a tunnel (re)start or a lane change, every lane re-dials the hub at
+once. Starlink in particular can leave some of its lanes stuck ("degraded",
+no replies from the hub) for minutes. Every 10 s, for each modem with an
+address: count its lanes glorytun reports running. If some stay down past the
+warm-up window while that modem can still reach the hub (a TCP connect to the
+hub's 443 with the modem's lane mark: the exact path its lanes use), re-dial
+just those lanes (their wstunnel restarts within 2 s). Backoff per modem:
+30 s, 60 s, 120 s, then every 5 min; reset once all its lanes run. It never
+restarts the tunnel itself (br-watchdog handles a wedged tunnel).
+"""
+import os
+import re
+import socket
+import subprocess
+import time
+
+ETC = "/etc/black-relay"
+GT = "/usr/lib/black-relay/glorytun"
+TABLE_BASE = 7100
+SO_MARK = 36
+WARMUP = 30      # s after the tunnel starts before judging any lane
+STUCK = 20       # s a lane must stay down before it is re-dialed
+
+
+def log(msg):
+    subprocess.run(["logger", "-t", "br-lane-nurse", msg])
+
+
+def sh(*a, t=8):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=t).stdout
+    except Exception:
+        return ""
+
+
+def conf():
+    c = {}
+    for f in ("black-relay.env", "br0.conf"):
+        try:
+            for line in open(os.path.join(ETC, f)):
+                line = line.split("#", 1)[0].strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    c[k.strip()] = v.strip().strip('"')
+        except OSError:
+            pass
+    return c
+
+
+def lane_states():
+    st = {}
+    for line in sh(GT, "path", "dev", "br0", "show").splitlines():
+        p = line.split()
+        if len(p) > 3 and p[0] == "path":
+            m = re.match(r"127\.0\.1\.(\d+)\.", p[2])
+            if m:
+                st[int(m.group(1)) - 1] = p[3]
+    return st
+
+
+def tunnel_age():
+    out = sh("systemctl", "show", "black-relay@br0", "-p", "ActiveState", "-p", "ActiveEnterTimestampMonotonic")
+    kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+    if kv.get("ActiveState") != "active":
+        return None
+    up = float(open("/proc/uptime").read().split()[0])
+    return up - int(kv.get("ActiveEnterTimestampMonotonic", "0") or 0) / 1e6
+
+
+def reaches_hub(mark, server):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, SO_MARK, mark)
+        s.settimeout(5)
+        s.connect((server, 443))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def main():
+    state = {}   # ifc -> {"since": t, "next": t, "backoff": s, "noroute": bool}
+    while True:
+        time.sleep(10)
+        age = tunnel_age()
+        if age is None or age < WARMUP:
+            state.clear()
+            continue
+        c = conf()
+        nl = max(1, int(c.get("WSS_LANES", "1") or 1))
+        server = c.get("SERVER", "")
+        if c.get("TRANSPORT") != "wss" or not server:
+            continue
+        st = lane_states()
+        now = time.time()
+        for i, spec in enumerate(c.get("UPLINKS", "").split()):
+            ifc = spec.split(":")[0]
+            if "inet " not in sh("ip", "-4", "-o", "addr", "show", "dev", ifc):
+                state.pop(ifc, None)
+                continue
+            bad = [j for j in range(nl) if st.get(i * nl + j) != "running"]
+            s = state.setdefault(ifc, {"since": now, "next": 0, "backoff": 0, "noroute": False})
+            if not bad:
+                if s["backoff"]:
+                    log(f"{ifc}: all {nl} lanes running again")
+                state[ifc] = {"since": now, "next": 0, "backoff": 0, "noroute": False}
+                continue
+            if now - s["since"] < STUCK or now < s["next"]:
+                continue
+            if not reaches_hub(TABLE_BASE + i, server):
+                if not s["noroute"]:
+                    log(f"{ifc}: {len(bad)}/{nl} lanes down and this modem can't reach the hub (its own internet is down); waiting")
+                s.update(noroute=True, next=now + 60)
+                continue
+            for j in bad:
+                subprocess.run(["systemctl", "kill", "--signal=SIGKILL", f"black-relay-lane-br0-{ifc}-{j}"],
+                               capture_output=True)
+            s["backoff"] = min(300, s["backoff"] * 2 or 30)
+            s.update(since=now, next=now + s["backoff"], noroute=False)
+            log(f"{ifc}: re-dialed {len(bad)}/{nl} stuck lanes (next check in {s['backoff']} s)")
+
+
+if __name__ == "__main__":
+    main()

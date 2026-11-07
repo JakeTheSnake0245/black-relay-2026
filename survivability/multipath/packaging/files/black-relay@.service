@@ -1,0 +1,17 @@
+[Unit]
+Description=Black Relay bonded tunnel (%i)
+Documentation=file:/usr/share/doc/black-relay-glorytun/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/lib/black-relay/tunnel check %i
+ExecStart=/usr/lib/black-relay/tunnel run %i
+ExecStartPost=/usr/lib/black-relay/tunnel post %i
+ExecStopPost=-/usr/lib/black-relay/tunnel down %i
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

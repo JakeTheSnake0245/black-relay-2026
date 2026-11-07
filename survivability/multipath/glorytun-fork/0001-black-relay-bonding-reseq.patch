@@ -1,0 +1,1003 @@
+diff --git a/mud/mud.c b/mud/mud.c
+index 1cc61d1..13d317d 100644
+--- a/mud/mud.c
++++ b/mud/mud.c
+@@ -22,6 +22,7 @@
+ 
+ #include <sodium.h>
+ #include "aegis256/aegis256.h"
++#include "../src/fec.h"   /* Black Relay: XOR forward error correction */
+ 
+ #if !defined MSG_CONFIRM
+ #define MSG_CONFIRM 0
+@@ -75,6 +76,26 @@
+ #define MUD_PKT_MIN_SIZE (MUD_TIME_SIZE + MUD_MAC_SIZE)
+ #define MUD_PKT_MAX_SIZE (1500U)
+ 
++/* Black Relay: per-data-packet sequence number carried inside the AEAD.
++ * Data packets become MUD_SEQ_SIZE bytes larger on the wire; control
++ * messages (MUD_MSG) are unchanged. Both ends must run this build. */
++#define MUD_SEQ_SIZE (8U)
++
++/* Black Relay: top bit of the 8-byte seq field marks a FEC parity packet;
++ * the low 63 bits carry the group base seq. Data seqs stay below this. */
++#define MUD_SEQ_PARITY (UINT64_C(1) << 63)
++
++/* Black Relay: anti-replay window size (packets). Must comfortably exceed
++ * the worst cross-path reorder depth, since bonded delivery is unordered. */
++#define MUD_REPLAY_BITS  (2048U)
++#define MUD_REPLAY_WORDS (MUD_REPLAY_BITS / 64U)
++
++enum mud_sched {
++    MUD_SCHED_RANDOM = 0,   /* stock weighted-random selection */
++    MUD_SCHED_ARRIVAL,      /* earliest-predicted-arrival selection */
++    MUD_SCHED_SCATTER,      /* maximal-dispersion: scramble egress order */
++};
++
+ #define MUD_MTU_MIN ( 576U + MUD_PKT_MIN_SIZE)
+ #define MUD_MTU_MAX (1450U + MUD_PKT_MIN_SIZE)
+ 
+@@ -88,6 +109,7 @@ struct mud_crypto_opt {
+     unsigned char *dst;
+     const unsigned char *src;
+     size_t size;
++    unsigned char role;     /* Black Relay: sender role, implicit nonce byte */
+ };
+ 
+ struct mud_crypto_key {
+@@ -151,6 +173,38 @@ struct mud {
+     uint64_t window;
+     uint64_t window_time;
+     uint64_t base_time;
++    uint64_t tx_seq;        /* Black Relay: next data-packet sequence number */
++    int sched;              /* Black Relay: enum mud_sched */
++    uint64_t scatter_rr;    /* Black Relay: scatter round-robin cursor */
++    uint64_t last_tx_time;  /* Black Relay: last nonce/timestamp sent (even) */
++    uint64_t last_msg_time; /* Black Relay: last control timestamp sent (odd) */
++    unsigned char role;     /* Black Relay: 1 client, 2 server, 0 unset */
++    uint64_t scatter_budget;/* Black Relay: max owd lag (us) a scatter lane may have */
++    /* Black Relay: anti-replay sliding window over decrypted seq (RFC 6479
++     * style). rw_max is the highest seq accepted; rw_bits marks the window
++     * below it. Tolerates reordering up to MUD_REPLAY_BITS. */
++    uint64_t rw_max;
++    int rw_init;
++    uint64_t rw_bits[MUD_REPLAY_WORDS];
++    /* Black Relay: header protection. Masks the cleartext timestamp field so
++     * the wire carries no readable, monotonic ordering signal. Keyed off the
++     * static tunnel key (stable, so unmasking is deterministic and decoupled
++     * from session-key rotation). QUIC-style: mask derived from a ciphertext
++     * sample, so it looks random and varies per packet. */
++    int hp_on;
++    unsigned char hp_key[MUD_KEY_SIZE];
++    /* Black Relay: FEC. Parity packets are marked by the top bit of the seq
++     * field; the low 63 bits carry the group base. One pending recovered
++     * packet is queued back to the caller on the next mud_recv. */
++    int fec_on;
++    int fec_adapt;            /* drive group size N from measured loss */
++    uint64_t fec_adapt_time;  /* last adaptation (rate-limited) */
++    struct fec_enc fec_enc;
++    struct fec_dec fec_dec;
++    int fec_out_pending;
++    uint64_t fec_out_seq;
++    size_t fec_out_len;
++    unsigned char fec_out[FEC_UNIT_MAX];
+ #if defined __APPLE__
+     mach_timebase_info_data_t mtid;
+ #endif
+@@ -163,6 +217,7 @@ mud_encrypt_opt(const struct mud_crypto_key *k,
+     if (k->aes) {
+         unsigned char npub[AEGIS256_NPUBBYTES] = {0};
+         memcpy(npub, c->dst, MUD_TIME_SIZE);
++        npub[MUD_TIME_SIZE] = c->role;
+         return aegis256_encrypt(
+             c->dst + MUD_TIME_SIZE,
+             NULL,
+@@ -176,6 +231,7 @@ mud_encrypt_opt(const struct mud_crypto_key *k,
+     } else {
+         unsigned char npub[crypto_aead_chacha20poly1305_NPUBBYTES] = {0};
+         memcpy(npub, c->dst, MUD_TIME_SIZE);
++        npub[MUD_TIME_SIZE] = c->role;
+         return crypto_aead_chacha20poly1305_encrypt(
+             c->dst + MUD_TIME_SIZE,
+             NULL,
+@@ -197,6 +253,7 @@ mud_decrypt_opt(const struct mud_crypto_key *k,
+     if (k->aes) {
+         unsigned char npub[AEGIS256_NPUBBYTES] = {0};
+         memcpy(npub, c->src, MUD_TIME_SIZE);
++        npub[MUD_TIME_SIZE] = c->role;
+         return aegis256_decrypt(
+             c->dst,
+             NULL,
+@@ -209,6 +266,7 @@ mud_decrypt_opt(const struct mud_crypto_key *k,
+     } else {
+         unsigned char npub[crypto_aead_chacha20poly1305_NPUBBYTES] = {0};
+         memcpy(npub, c->src, MUD_TIME_SIZE);
++        npub[MUD_TIME_SIZE] = c->role;
+         return crypto_aead_chacha20poly1305_decrypt(
+             c->dst,
+             NULL,
+@@ -322,9 +380,165 @@ mud_unmapv4(union mud_sockaddr *addr)
+     addr->sin = sin;
+ }
+ 
++/* Black Relay: anti-replay check over the decrypted sequence number.
++ * Returns 1 if seq is fresh (and records it), 0 if it is a replay or too
++ * old. Tolerates out-of-order arrival within MUD_REPLAY_BITS. */
++static int
++mud_replay_ok(struct mud *mud, uint64_t seq)
++{
++    if (!mud->rw_init) {
++        mud->rw_init = 1;
++        mud->rw_max = seq;
++        memset(mud->rw_bits, 0, sizeof(mud->rw_bits));
++        mud->rw_bits[(seq / 64) % MUD_REPLAY_WORDS] = UINT64_C(1) << (seq % 64);
++        return 1;
++    }
++    if (seq > mud->rw_max) {
++        uint64_t diff = seq - mud->rw_max;
++        if (diff >= MUD_REPLAY_BITS) {
++            memset(mud->rw_bits, 0, sizeof(mud->rw_bits));
++        } else {
++            for (uint64_t s = mud->rw_max + 1; s <= seq; s++)
++                mud->rw_bits[(s / 64) % MUD_REPLAY_WORDS] &=
++                    ~(UINT64_C(1) << (s % 64));
++        }
++        mud->rw_max = seq;
++        mud->rw_bits[(seq / 64) % MUD_REPLAY_WORDS] |= UINT64_C(1) << (seq % 64);
++        return 1;
++    }
++    if (mud->rw_max - seq >= MUD_REPLAY_BITS)
++        return 0;                              /* older than the window */
++
++    uint64_t *w = &mud->rw_bits[(seq / 64) % MUD_REPLAY_WORDS];
++    uint64_t bit = UINT64_C(1) << (seq % 64);
++    if (*w & bit)
++        return 0;                              /* already seen: replay */
++    *w |= bit;
++    return 1;
++}
++
++/* Black Relay: header protection. XOR-masks the 6-byte timestamp field with
++ * a keyed mask derived from a 16-byte ciphertext sample. XOR is its own
++ * inverse, so the same call masks (sender) and unmasks (receiver). Applied
++ * to every packet (data and control) uniformly, before the MSG/nonce fields
++ * are read. No-op if the packet is too small to carry a sample. */
++static void
++mud_hp_apply(struct mud *mud, unsigned char *packet, size_t size)
++{
++    if (!mud->hp_on || size < MUD_TIME_SIZE + 16)
++        return;
++
++    unsigned char mask[crypto_generichash_BYTES_MIN];
++    crypto_generichash(mask, sizeof(mask),
++                       packet + MUD_TIME_SIZE, 16,
++                       mud->hp_key, sizeof(mud->hp_key));
++
++    for (unsigned i = 0; i < MUD_TIME_SIZE; i++)
++        packet[i] ^= mask[i];
++}
++
++/* Black Relay: earliest-predicted-arrival selection.
++ *
++ * For each running path, estimate when a packet of `size` bytes queued now
++ * would arrive at the far end:
++ *
++ *     arrival = owd + (backlog + size) / rate
++ *
++ * owd is taken as rtt/2 (us). backlog is the bytes already queued on the
++ * path, drained at the path's rate since it was last touched. The path with
++ * the smallest arrival wins, and `size` is added to its backlog. When the
++ * network is idle every path's backlog is ~0, so the lowest-owd (fastest)
++ * path is chosen and nothing is reordered; under load the fast path's
++ * backlog grows until a slower path becomes the earlier delivery. No path
++ * is ever excluded. All integer math; time in us, rate in bytes/s. */
++static struct mud_path *
++mud_select_path_arrival(struct mud *mud, uint64_t now, size_t size)
++{
++    struct mud_path *best = NULL;
++    uint64_t best_score = 0;
++
++    for (unsigned i = 0; i < mud->capacity; i++) {
++        struct mud_path *path = &mud->paths[i];
++
++        if (path->status != MUD_RUNNING || !path->tx.rate)
++            continue;
++
++        uint64_t elapsed = MUD_TIME_MASK(now - path->backlog_time);
++        uint64_t drained = path->tx.rate * elapsed / MUD_ONE_SEC;
++
++        path->backlog = (path->backlog > drained) ? path->backlog - drained : 0;
++        path->backlog_time = now;
++
++        uint64_t owd = path->rtt.val ? path->rtt.val / 2 : 0;
++        uint64_t queue_us = (path->backlog + size) * MUD_ONE_SEC / path->tx.rate;
++        uint64_t score = owd + queue_us;
++
++        if (!best || score < best_score) {
++            best = path;
++            best_score = score;
++        }
++    }
++    if (best) {
++        best->backlog += size;
++        best->backlog_time = now;
++    }
++    return best;
++}
++
++/* Black Relay: scatter selection — maximise egress disorder.
++ *
++ * Consecutive sequence numbers are sent round-robin across the running
++ * paths, ignoring rate weighting. With links of distinct latency, adjacent
++ * packets take different-delay paths and overtake each other, so the stream
++ * arrives maximally interleaved. The resequencer restores order at the far
++ * end; on the wire no link carries an ordered subsequence. This is the
++ * "leave completely out of order, reconstruct on arrival" egress mode. */
+ static struct mud_path *
+-mud_select_path(struct mud *mud, uint16_t cursor)
++mud_select_path_scatter(struct mud *mud)
+ {
++    struct mud_path *running[MUD_PATH_MAX];
++    unsigned count = 0;
++
++    uint64_t min_owd = UINT64_MAX;
++
++    for (unsigned i = 0; i < mud->capacity; i++) {
++        struct mud_path *path = &mud->paths[i];
++        if (path->status == MUD_RUNNING && path->tx.rate) {
++            running[count++] = path;
++            uint64_t owd = path->rtt.val / 2;
++            if (path->rtt.val && owd < min_owd)
++                min_owd = owd;
++        }
++    }
++    if (!count)
++        return NULL;
++
++    /* Black Relay: only scatter onto lanes the far end's resequencer can
++     * wait for. A lane whose one-way delay trails the fastest by more than
++     * the budget (a Starlink handoff, a congested cell) would deliver after
++     * the hold expires, so its packets would just be lost. Skip it until it
++     * recovers; the fastest lane always qualifies. */
++    if (mud->scatter_budget && min_owd != UINT64_MAX) {
++        unsigned kept = 0;
++        for (unsigned i = 0; i < count; i++) {
++            uint64_t owd = running[i]->rtt.val / 2;
++            if (!running[i]->rtt.val || owd <= min_owd + mud->scatter_budget)
++                running[kept++] = running[i];
++        }
++        count = kept;
++    }
++    return running[mud->scatter_rr++ % count];
++}
++
++static struct mud_path *
++mud_select_path(struct mud *mud, uint16_t cursor, uint64_t now, size_t size)
++{
++    if (mud->sched == MUD_SCHED_ARRIVAL)
++        return mud_select_path_arrival(mud, now, size);
++
++    if (mud->sched == MUD_SCHED_SCATTER)
++        return mud_select_path_scatter(mud);
++
+     uint64_t k = (cursor * mud->rate) >> 16;
+ 
+     for (unsigned i = 0; i < mud->capacity; i++) {
+@@ -348,6 +562,9 @@ mud_send_path(struct mud *mud, struct mud_path *path, uint64_t now,
+     if (!size || !path)
+         return 0;
+ 
++    /* Black Relay: mask the timestamp field just before it hits the wire. */
++    mud_hp_apply(mud, data, size);
++
+     unsigned char ctrl[MUD_CTRL_SIZE];
+     memset(ctrl, 0, sizeof(ctrl));
+ 
+@@ -563,7 +780,118 @@ mud_get_mtu(struct mud *mud)
+     if (!mud->mtu)
+         return 0;
+ 
+-    return mud->mtu - MUD_PKT_MIN_SIZE;
++    /* Black Relay: data packets also carry MUD_SEQ_SIZE inside the AEAD. */
++    return mud->mtu - MUD_PKT_MIN_SIZE - MUD_SEQ_SIZE;
++}
++
++int
++mud_set_sched(struct mud *mud, int sched)
++{
++    if (sched != MUD_SCHED_RANDOM && sched != MUD_SCHED_ARRIVAL &&
++        sched != MUD_SCHED_SCATTER) {
++        errno = EINVAL;
++        return -1;
++    }
++    mud->sched = sched;
++    return 0;
++}
++
++int
++mud_set_role(struct mud *mud, int role)
++{
++    if (role < 0 || role > 2) {
++        errno = EINVAL;
++        return -1;
++    }
++    mud->role = (unsigned char)role;
++    return 0;
++}
++
++int
++mud_set_scatter_budget(struct mud *mud, uint64_t us)
++{
++    mud->scatter_budget = us;
++    return 0;
++}
++
++int
++mud_set_hp(struct mud *mud, int on)
++{
++    mud->hp_on = on ? 1 : 0;
++    return 0;
++}
++
++int
++mud_set_fec(struct mud *mud, unsigned n)
++{
++    if (n == 0) {
++        mud->fec_on = 0;
++        return 0;
++    }
++    mud->fec_on = 1;
++    fec_enc_init(&mud->fec_enc, n);
++    fec_dec_init(&mud->fec_dec);
++    return 0;
++}
++
++/* Black Relay: runtime adaptive knob — change the FEC group size. A control
++ * loop can call this as measured loss changes (smaller N = more protection,
++ * more overhead). Takes effect at the next group boundary. */
++int
++mud_fec_set_n(struct mud *mud, unsigned n)
++{
++    if (!mud->fec_on)
++        return -1;
++    fec_enc_set_n(&mud->fec_enc, n);
++    return 0;
++}
++
++int
++mud_set_fec_adapt(struct mud *mud, int on)
++{
++    mud->fec_adapt = on ? 1 : 0;
++    return 0;
++}
++
++/* Black Relay: closed-loop adaptive FEC.
++ *
++ * The sender already learns forward loss per path from the stat exchange
++ * (path->tx.loss, 0-255). Aggregate it (rate-weighted over running paths)
++ * and pick the group size N: more loss -> smaller N (more parity, more
++ * recovery); less loss -> larger N (less overhead). XOR recovers one loss
++ * per group, so target roughly one parity per expected loss. Rate-limited
++ * to once a second; takes effect at the next group boundary. */
++static void
++mud_fec_adapt(struct mud *mud, uint64_t now)
++{
++    if (!mud->fec_on || !mud->fec_adapt)
++        return;
++    if (now - mud->fec_adapt_time < MUD_ONE_SEC)
++        return;
++    mud->fec_adapt_time = now;
++
++    uint64_t num = 0, den = 0;
++    for (unsigned i = 0; i < mud->capacity; i++) {
++        struct mud_path *path = &mud->paths[i];
++        if (path->status != MUD_RUNNING || !path->tx.rate)
++            continue;
++        num += (uint64_t)path->tx.loss * path->tx.rate;
++        den += path->tx.rate;
++    }
++    if (!den)
++        return;
++
++    unsigned loss255 = (unsigned)(num / den);        /* 0-255 */
++    unsigned pct_x10 = loss255 * 1000U / 255U;        /* tenths of a percent */
++
++    unsigned n;
++    if      (pct_x10 <  5) n = 32;   /* < 0.5% */
++    else if (pct_x10 < 10) n = 16;   /* < 1%   */
++    else if (pct_x10 < 30) n = 8;    /* < 3%   */
++    else if (pct_x10 < 60) n = 4;    /* < 6%   */
++    else                    n = 2;   /* >= 6%  */
++
++    fec_enc_set_n(&mud->fec_enc, n);
+ }
+ 
+ static int
+@@ -692,6 +1020,19 @@ mud_create(union mud_sockaddr *addr, unsigned char *key, int *aes)
+     mud->conf.timetolerance = 10 * MUD_ONE_MIN;
+     mud->conf.kxtimeout     = 60 * MUD_ONE_MIN;
+ 
++    /* Black Relay: start the data sequence at wall-clock microseconds, not 0.
++     * A restarted process (reboot, service restart, Node 01 -> Node 02
++     * failover with the same key) then always continues ABOVE everything the
++     * previous process sent, as long as it averaged < 1 packet/us, so the far
++     * end's anti-replay window and resequencer accept it as new while replays
++     * of the old traffic stay behind the window. ~2^51 today: clear of the
++     * parity bit (63). */
++    {
++        struct timespec rt;
++        clock_gettime(CLOCK_REALTIME, &rt);
++        mud->tx_seq = (uint64_t)rt.tv_sec * MUD_ONE_SEC + (uint64_t)rt.tv_nsec / 1000;
++    }
++
+ #if defined __APPLE__
+     mach_timebase_info(&mud->mtid);
+ #endif
+@@ -710,6 +1051,18 @@ mud_create(union mud_sockaddr *addr, unsigned char *key, int *aes)
+     mud->keyx.next = mud->keyx.private;
+     mud->keyx.last = mud->keyx.private;
+ 
++    /* Black Relay: derive a stable header-protection key from the static
++     * tunnel key, domain-separated. Not for payload confidentiality (the
++     * payload is AEAD-sealed); only to mask the non-secret timestamp field. */
++    {
++        static const unsigned char hp_label[] = "black-relay-hp-v1";
++        crypto_generichash_state st;
++        crypto_generichash_init(&st, mud->keyx.private.encrypt.key,
++                                MUD_KEY_SIZE, MUD_KEY_SIZE);
++        crypto_generichash_update(&st, hp_label, sizeof(hp_label));
++        crypto_generichash_final(&st, mud->hp_key, MUD_KEY_SIZE);
++    }
++
+     if (*aes && !aegis256_is_available())
+         *aes = 0;
+ 
+@@ -742,19 +1095,26 @@ mud_delete(struct mud *mud)
+ }
+ 
+ static size_t
+-mud_encrypt(struct mud *mud, uint64_t now,
++mud_encrypt(struct mud *mud, uint64_t now, uint64_t seq,
+             unsigned char *dst, size_t dst_size,
+             const unsigned char *src, size_t src_size)
+ {
+-    const size_t size = src_size + MUD_PKT_MIN_SIZE;
++    /* Black Relay: plaintext is [seq (MUD_SEQ_SIZE)][inner packet], so the
++     * sequence number is authenticated and encrypted along with the data. */
++    const size_t plain_size = src_size + MUD_SEQ_SIZE;
++    const size_t size = plain_size + MUD_PKT_MIN_SIZE;
+ 
+-    if (size > dst_size)
++    if (size > dst_size || plain_size > MUD_PKT_MAX_SIZE)
+         return 0;
+ 
++    unsigned char plain[MUD_PKT_MAX_SIZE];
++    mud_store(plain, seq, MUD_SEQ_SIZE);
++    memcpy(plain + MUD_SEQ_SIZE, src, src_size);
++
+     const struct mud_crypto_opt opt = {
+         .dst = dst,
+-        .src = src,
+-        .size = src_size,
++        .src = plain,
++        .size = plain_size,
+     };
+     mud_store(dst, now, MUD_TIME_SIZE);
+ 
+@@ -767,17 +1127,25 @@ mud_encrypt(struct mud *mud, uint64_t now,
+ }
+ 
+ static size_t
+-mud_decrypt(struct mud *mud,
++mud_decrypt(struct mud *mud, uint64_t *seq,
+             unsigned char *dst, size_t dst_size,
+             const unsigned char *src, size_t src_size)
+ {
+-    const size_t size = src_size - MUD_PKT_MIN_SIZE;
++    /* Black Relay: plaintext is [seq (MUD_SEQ_SIZE)][inner packet]. Decrypt
++     * into a scratch buffer, hand the seq to the caller, return the inner. */
++    const size_t plain_size = src_size - MUD_PKT_MIN_SIZE;
+ 
+-    if (size > dst_size)
++    if (plain_size < MUD_SEQ_SIZE)
+         return 0;
+ 
++    const size_t size = plain_size - MUD_SEQ_SIZE;
++
++    if (size > dst_size || plain_size > MUD_PKT_MAX_SIZE)
++        return 0;
++
++    unsigned char plain[MUD_PKT_MAX_SIZE];
+     const struct mud_crypto_opt opt = {
+-        .dst = dst,
++        .dst = plain,
+         .src = src,
+         .size = src_size,
+     };
+@@ -792,6 +1160,10 @@ mud_decrypt(struct mud *mud,
+                 return 0;
+         }
+     }
++    if (seq)
++        *seq = mud_load(plain, MUD_SEQ_SIZE);
++
++    memcpy(dst, plain + MUD_SEQ_SIZE, size);
+     return size;
+ }
+ 
+@@ -876,7 +1248,15 @@ mud_send_msg(struct mud *mud, struct mud_path *path, uint64_t now,
+     if (size < MUD_PKT_MIN_SIZE + sizeof(struct mud_msg))
+         size = MUD_PKT_MIN_SIZE + sizeof(struct mud_msg);
+ 
+-    mud_store(dst, MUD_MSG_MARK(now), MUD_TIME_SIZE);
++    /* Black Relay (F2): control messages are sealed with the static key and
++     * the timestamp is their nonce. Two paths served in the same microsecond
++     * used to share it. Force it strictly increasing (odd: MSG flag), and
++     * separate the two ends with an implicit role byte in the nonce. */
++    uint64_t mt = MUD_MSG_MARK(now);
++    if (mt <= mud->last_msg_time)
++        mt = mud->last_msg_time + 2;
++    mud->last_msg_time = mt;
++    mud_store(dst, mt, MUD_TIME_SIZE);
+     MUD_STORE_MSG(msg->sent_time, sent_time);
+ 
+     if (mud_addr_from_sock(&msg->addr, &path->conf.remote))
+@@ -906,6 +1286,7 @@ mud_send_msg(struct mud *mud, struct mud_path *path, uint64_t now,
+         .dst = dst,
+         .src = src,
+         .size = size - MUD_PKT_MIN_SIZE,
++        .role = mud->role,
+     };
+     mud_encrypt_opt(&mud->keyx.private, &opt);
+ 
+@@ -923,15 +1304,23 @@ mud_decrypt_msg(struct mud *mud,
+     if (size < sizeof(struct mud_msg) || size > dst_size)
+         return 0;
+ 
+-    const struct mud_crypto_opt opt = {
+-        .dst = dst,
+-        .src = src,
+-        .size = src_size,
+-    };
+-    if (mud_decrypt_opt(&mud->keyx.private, &opt))
+-        return 0;
+-
+-    return size;
++    /* Black Relay (F2): the peer's role byte is implicit. Try the expected
++     * one first (the opposite of ours), then the others, so a mismatched or
++     * unset GT_ROLE on either end still interoperates. */
++    static const unsigned char order[3][3] = {{0, 1, 2}, {2, 0, 1}, {1, 0, 2}};
++    const unsigned char *try = order[mud->role < 3 ? mud->role : 0];
++
++    for (int i = 0; i < 3; i++) {
++        const struct mud_crypto_opt opt = {
++            .dst = dst,
++            .src = src,
++            .size = src_size,
++            .role = try[i],
++        };
++        if (!mud_decrypt_opt(&mud->keyx.private, &opt))
++            return size;
++    }
++    return 0;
+ }
+ 
+ static void
+@@ -1090,8 +1479,19 @@ mud_recv_msg(struct mud *mud, struct mud_path *path,
+ }
+ 
+ int
+-mud_recv(struct mud *mud, void *data, size_t size)
++mud_recv(struct mud *mud, void *data, size_t size, uint64_t *seq)
+ {
++    /* Black Relay: hand back a FEC-recovered packet before reading the wire
++     * again, so the drain loop picks it up like any received data packet. */
++    if (mud->fec_out_pending) {
++        mud->fec_out_pending = 0;
++        size_t n = mud->fec_out_len > size ? size : mud->fec_out_len;
++        memcpy(data, mud->fec_out, n);
++        if (seq)
++            *seq = mud->fec_out_seq;
++        return (int)n;
++    }
++
+     union mud_sockaddr remote;
+     unsigned char ctrl[MUD_CTRL_SIZE];
+     unsigned char packet[MUD_PKT_MAX_SIZE];
+@@ -1115,6 +1515,9 @@ mud_recv(struct mud *mud, void *data, size_t size)
+         (packet_size <= (ssize_t)MUD_PKT_MIN_SIZE))
+         return 0;
+ 
++    /* Black Relay: unmask the timestamp field before anything reads it. */
++    mud_hp_apply(mud, packet, (size_t)packet_size);
++
+     const uint64_t now = mud_now(mud);
+     const uint64_t sent_time = mud_load(packet, MUD_TIME_SIZE);
+ 
+@@ -1129,7 +1532,7 @@ mud_recv(struct mud *mud, void *data, size_t size)
+     }
+     const size_t ret = MUD_MSG(sent_time)
+                      ? mud_decrypt_msg(mud, data, size, packet, (size_t)packet_size)
+-                     : mud_decrypt(mud, data, size, packet, (size_t)packet_size);
++                     : mud_decrypt(mud, seq, data, size, packet, (size_t)packet_size);
+     if (!ret) {
+         mud->err.decrypt.addr = remote;
+         mud->err.decrypt.time = now;
+@@ -1148,7 +1551,39 @@ mud_recv(struct mud *mud, void *data, size_t size)
+ 
+     if (MUD_MSG(sent_time)) {
+         mud_recv_msg(mud, path, now, sent_time, data, (size_t)packet_size);
++    } else if (seq && (*seq & MUD_SEQ_PARITY)) {
++        /* Black Relay: FEC parity packet. Not delivered to tun; it may let
++         * one missing data packet be rebuilt, queued for the next mud_recv. */
++        path->idle = now;
++        path->rx.total++;
++        path->rx.time = now;
++        path->rx.bytes += (size_t)packet_size;
++        mud->last_recv_time = now;
++        if (mud->fec_on && ret >= 3) {
++            unsigned char *p = (unsigned char *)data;
++            unsigned n = p[0];
++            uint16_t maxlen = (uint16_t)(p[1] | (p[2] << 8));
++            uint64_t base = *seq & ~MUD_SEQ_PARITY;
++            if (!mud->fec_out_pending &&
++                fec_dec_parity(&mud->fec_dec, base, n, maxlen, p + 3, ret - 3,
++                               &mud->fec_out_seq, mud->fec_out,
++                               &mud->fec_out_len)) {
++                /* recovered packet is fresh unless replayed */
++                if (mud_replay_ok(mud, mud->fec_out_seq))
++                    mud->fec_out_pending = 1;
++            }
++        }
++        return 0;
+     } else {
++        /* Black Relay: drop replays/stale duplicates before delivery. */
++        if (seq && !mud_replay_ok(mud, *seq)) {
++            mud->err.decrypt.addr = remote;
++            mud->err.decrypt.time = now;
++            return 0;
++        }
++        /* Feed the data packet to the FEC decoder (for later recovery). */
++        if (mud->fec_on && seq)
++            fec_dec_data(&mud->fec_dec, *seq, data, ret);
+         path->idle = now;
+     }
+     path->rx.total++;
+@@ -1304,6 +1739,7 @@ mud_update(struct mud *mud)
+     mud->rate = rate;
+     mud->mtu = mtu;
+ 
++    mud_fec_adapt(mud, now);
+     mud_update_window(mud, now);
+ 
+     if (!count)
+@@ -1356,8 +1792,15 @@ mud_send(struct mud *mud, const void *data, size_t size)
+         return -1;
+     }
+     unsigned char packet[MUD_PKT_MAX_SIZE];
+-    const uint64_t now = mud_now(mud);
+-    const size_t packet_size = mud_encrypt(mud, now,
++    uint64_t now = mud_now(mud);
++    /* Black Relay: the timestamp doubles as the AEAD nonce. Force it strictly
++     * increasing so two data packets can never share a nonce (data timestamps
++     * are even; the low bit is the control-message flag, so step by 2). */
++    if (now <= mud->last_tx_time)
++        now = mud->last_tx_time + 2;
++    mud->last_tx_time = now;
++    const uint64_t seq = mud->tx_seq++;
++    const size_t packet_size = mud_encrypt(mud, now, seq,
+                                            packet, sizeof(packet),
+                                            data, size);
+     if (!packet_size) {
+@@ -1367,7 +1810,7 @@ mud_send(struct mud *mud, const void *data, size_t size)
+     uint16_t k;
+     memcpy(&k, &packet[packet_size - sizeof(k)], sizeof(k));
+ 
+-    struct mud_path *path = mud_select_path(mud, k);
++    struct mud_path *path = mud_select_path(mud, k, now, packet_size);
+ 
+     if (!path) {
+         errno = EAGAIN;
+@@ -1375,5 +1818,33 @@ mud_send(struct mud *mud, const void *data, size_t size)
+     }
+     path->idle = now;
+ 
+-    return mud_send_path(mud, path, now, packet, packet_size, 0);
++    int sent = mud_send_path(mud, path, now, packet, packet_size, 0);
++
++    /* Black Relay: feed the data packet to the FEC encoder; when a group
++     * completes, encrypt and send the parity packet (marked by the seq top
++     * bit) on a scheduler-chosen path. */
++    if (mud->fec_on) {
++        uint64_t gbase;
++        unsigned char pbuf[FEC_UNIT_MAX];
++        size_t plen = 0;
++
++        if (fec_enc_add(&mud->fec_enc, seq, data, size, &gbase, pbuf, &plen)) {
++            uint64_t pnow = mud_now(mud);
++            if (pnow <= mud->last_tx_time)
++                pnow = mud->last_tx_time + 2;
++            mud->last_tx_time = pnow;
++
++            unsigned char ppkt[MUD_PKT_MAX_SIZE];
++            size_t psize = mud_encrypt(mud, pnow, MUD_SEQ_PARITY | gbase,
++                                       ppkt, sizeof(ppkt), pbuf, plen);
++            if (psize) {
++                uint16_t pk;
++                memcpy(&pk, &ppkt[psize - sizeof(pk)], sizeof(pk));
++                struct mud_path *pp = mud_select_path(mud, pk, pnow, psize);
++                if (pp)
++                    mud_send_path(mud, pp, pnow, ppkt, psize, 0);
++            }
++        }
++    }
++    return sent;
+ }
+diff --git a/mud/mud.h b/mud/mud.h
+index 739d671..43e3bbf 100644
+--- a/mud/mud.h
++++ b/mud/mud.h
+@@ -90,6 +90,9 @@ struct mud_path {
+         size_t ok;
+     } mtu;
+     uint64_t idle;
++    /* Black Relay: arrival-aware scheduler state (bytes, and us timestamp) */
++    uint64_t backlog;
++    uint64_t backlog_time;
+ };
+ 
+ struct mud_error {
+@@ -118,9 +121,27 @@ int mud_set_path (struct mud *, struct mud_path_conf *);
+ int mud_update    (struct mud *);
+ int mud_send_wait (struct mud *);
+ 
+-int mud_recv (struct mud *, void *, size_t);
++/* Black Relay: mud_recv fills *seq with the data packet's sequence number
++ * (for the receive-side resequencer). seq may be NULL. For control messages
++ * it is left untouched and mud_recv returns 0 as before. */
++int mud_recv (struct mud *, void *, size_t, uint64_t *);
+ int mud_send (struct mud *, const void *, size_t);
+ 
++/* Black Relay: select the scheduler at runtime (enum mud_sched). */
++int mud_set_sched (struct mud *, int);
++
++/* Black Relay: toggle timestamp header protection (both ends must match). */
++int mud_set_hp (struct mud *, int);
++int mud_set_role (struct mud *, int);                 /* Black Relay: 1 client, 2 server */
++int mud_set_scatter_budget (struct mud *, uint64_t);  /* Black Relay: us, 0 = off */
++
++/* Black Relay: enable FEC with group size n (0 disables); adjust n at runtime
++ * (the adaptive knob). Sender and receiver may differ; recovery works for
++ * whatever groups the sender emits. */
++int mud_set_fec       (struct mud *, unsigned n);
++int mud_fec_set_n     (struct mud *, unsigned n);
++int mud_set_fec_adapt (struct mud *, int on);
++
+ int    mud_get_errors (struct mud *, struct mud_errors *);
+ int    mud_get_fd     (struct mud *);
+ size_t mud_get_mtu    (struct mud *);
+diff --git a/src/bind.c b/src/bind.c
+index 08242c0..923bafd 100644
+--- a/src/bind.c
++++ b/src/bind.c
+@@ -4,10 +4,31 @@
+ #include "ip.h"
+ #include "tun.h"
+ #include "argz.h"
++#include "reseq.h"
+ 
+ #include <fcntl.h>
+ #include <sys/select.h>
+ #include <sodium.h>
++#include <time.h>
++
++/* Black Relay: monotonic microseconds for the resequencer (independent of
++ * the mud timestamp clock; only relative values are used). */
++static uint64_t
++gt_now_us(void)
++{
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return (uint64_t)t.tv_sec * 1000000ULL + (uint64_t)t.tv_nsec / 1000ULL;
++}
++
++/* Black Relay: resequencer emit callback — write an in-order packet to tun. */
++static void
++gt_emit_to_tun(void *ctx, const void *buf, size_t len)
++{
++    int tun_fd = *(const int *)ctx;
++    if (ip_is_valid((const unsigned char *)buf, (int)len))
++        tun_write(tun_fd, (unsigned char *)buf, len);
++}
+ 
+ #ifndef O_CLOEXEC
+ #define O_CLOEXEC 0
+@@ -141,6 +162,85 @@ gt_bind(int argc, char **argv, void *data)
+     if (!chacha && !aes)
+         gt_log("AES is not available, enjoy ChaCha20!\n");
+ 
++    /* Black Relay: scheduler + resequencer, configured via environment.
++     *   GT_SCHED=arrival|random   (default random = stock behaviour)
++     *   GT_RESEQ=1|0              enable the receive-side resequencer
++     *   GT_RESEQ_MS=<ms>          max hold on a gap (default 50)
++     *   GT_RESEQ_WIN=<packets>    reorder window (default 1024)
++     * These will move to the ctl/`set` path once the lab A/B settles. */
++    const char *env_sched = getenv("GT_SCHED");
++    if (env_sched && !strcmp(env_sched, "arrival")) {
++        mud_set_sched(mud, 1 /* MUD_SCHED_ARRIVAL */);
++        gt_log("scheduler: arrival-aware\n");
++    } else if (env_sched && !strcmp(env_sched, "scatter")) {
++        mud_set_sched(mud, 2 /* MUD_SCHED_SCATTER */);
++        gt_log("scheduler: scatter (maximal dispersion)\n");
++    } else {
++        gt_log("scheduler: random (stock)\n");
++    }
++
++    /* Black Relay: end role (GT_ROLE=client|server). Separates the two ends'
++     * control-message nonces under the shared static key. Either value
++     * interoperates with any other; distinct values give the separation. */
++    const char *env_role = getenv("GT_ROLE");
++    if (env_role && !strcmp(env_role, "client"))
++        mud_set_role(mud, 1);
++    else if (env_role && !strcmp(env_role, "server"))
++        mud_set_role(mud, 2);
++
++    /* Black Relay: scatter budget. Lanes trailing the fastest by more than
++     * this (one-way, ms) are skipped. Default: 60 % of the resequencer hold
++     * (GT_RESEQ_MS, default 50), since both ends share the same settings. */
++    {
++        const char *b = getenv("GT_SCATTER_BUDGET_MS");
++        const char *h = getenv("GT_RESEQ_MS");
++        uint64_t ms = b ? strtoull(b, NULL, 10)
++                        : (h ? strtoull(h, NULL, 10) : 50) * 6 / 10;
++        mud_set_scatter_budget(mud, ms * 1000ULL);
++        if (env_sched && !strcmp(env_sched, "scatter"))
++            gt_log("scatter budget: %llums\n", (unsigned long long)ms);
++    }
++
++    /* Black Relay: header protection (GT_HP=1). Both ends must match. */
++    if (getenv("GT_HP") && !strcmp(getenv("GT_HP"), "1")) {
++        mud_set_hp(mud, 1);
++        gt_log("header protection: on\n");
++    }
++
++    /* Black Relay: FEC (GT_FEC=<group size N>, 0/unset = off). The sender
++     * emits parity; the receiver rebuilds single losses per group. */
++    const char *env_fec = getenv("GT_FEC");
++    if (env_fec && !strcmp(env_fec, "auto")) {
++        mud_set_fec(mud, 8);            /* start point; adapts from loss */
++        mud_set_fec_adapt(mud, 1);
++        gt_log("fec: on (adaptive group size)\n");
++    } else if (env_fec) {
++        unsigned fn = (unsigned)strtoul(env_fec, NULL, 10);
++        if (fn >= 2) {
++            mud_set_fec(mud, fn);
++            gt_log("fec: on (group size %u, ~%.1f%% overhead)\n",
++                   fn, 100.0 / fn);
++        }
++    }
++
++    struct reseq *reseq = NULL;
++    const char *env_reseq = getenv("GT_RESEQ");
++    if (env_reseq && !strcmp(env_reseq, "1")) {
++        const char *ms = getenv("GT_RESEQ_MS");
++        const char *win = getenv("GT_RESEQ_WIN");
++        uint64_t deadline = (ms ? (uint64_t)strtoull(ms, NULL, 10) : 50) * 1000ULL;
++        unsigned window = win ? (unsigned)strtoul(win, NULL, 10) : 0;
++        reseq = reseq_new(deadline, window);
++        if (!reseq) {
++            gt_log("couldn't create resequencer\n");
++            return -1;
++        }
++        gt_log("resequencer: on (deadline %llums)\n",
++               (unsigned long long)(deadline / 1000));
++    } else {
++        gt_log("resequencer: off\n");
++    }
++
+     char tun_name[64];
+     const int tun_fd = tun_create(tun_name, sizeof(tun_name), dev);
+ 
+@@ -166,8 +266,12 @@ gt_bind(int argc, char **argv, void *data)
+         }
+         return -1;
+     }
++    /* Black Relay: mud_fd non-blocking so the receive path can drain the
++     * bonded ingress (packets from all links) in one wakeup and feed the
++     * resequencer, instead of one packet per select(). tun_fd stays blocking
++     * so resequencer emit writes never drop. */
+     if (//fd_set_nonblock(tun_fd) ||
+-        //fd_set_nonblock(mud_fd) ||
++        fd_set_nonblock(mud_fd) ||
+         fd_set_nonblock(ctl_fd)) {
+         gt_log("couldn't setup non-blocking fds\n");
+         return -1;
+@@ -210,6 +314,10 @@ gt_bind(int argc, char **argv, void *data)
+             } else {
+                 tv.tv_usec = 100000;
+             }
++            /* Black Relay: keep wakeups frequent enough to flush gap
++             * deadlines promptly when the link goes quiet. */
++            if (reseq && tv.tv_usec > 5000)
++                tv.tv_usec = 5000;
+         }
+         const int ret = select(last_fd, &rfds, &wfds, NULL, update < 0 ? NULL : &tv);
+ 
+@@ -235,14 +343,33 @@ gt_bind(int argc, char **argv, void *data)
+             }
+             tun_can_read = 0;
+         }
+-        if (mud_can_read && tun_can_write) {
+-            int r = mud_recv(mud, buf, sizeof(buf));
+-            if (r > 0 && ip_is_valid(buf, r)) {
+-                tun_write(tun_fd, buf, (size_t)r);
+-                tun_can_write = 0;
++        /* With the resequencer on, emission is a blocking tun_write from the
++         * callback, so it does not depend on tun writability from select. */
++        if (mud_can_read && (reseq || tun_can_write)) {
++            /* Drain the bonded ingress: mud_fd is non-blocking, so read until
++             * EAGAIN (bounded) rather than one packet per select wakeup. */
++            for (int n = 0; n < 1024; n++) {
++                uint64_t seq = 0;
++                int r = mud_recv(mud, buf, sizeof(buf), &seq);
++                if (r < 0) {            /* EAGAIN: socket drained */
++                    mud_can_read = 0;
++                    break;
++                }
++                if (r == 0)             /* control message or dropped */
++                    continue;
++                if (reseq) {
++                    reseq_push(reseq, seq, buf, (size_t)r, gt_now_us(),
++                               gt_emit_to_tun, (void *)&tun_fd);
++                } else if (ip_is_valid(buf, r)) {
++                    tun_write(tun_fd, buf, (size_t)r);
++                    tun_can_write = 0;
++                    if (!reseq) break;  /* one tun write per wakeup w/o reseq */
++                }
+             }
+-            mud_can_read = 0;
+         }
++        /* Release any packets whose gap deadline has passed while idle. */
++        if (reseq)
++            reseq_tick(reseq, gt_now_us(), gt_emit_to_tun, (void *)&tun_fd);
+         if (FD_ISSET(ctl_fd, &rfds)) {
+             struct ctl_msg req, res = {.reply = 1};
+             struct mud_paths paths;
+diff --git a/src/ctl.c b/src/ctl.c
+index 7abb879..97048bc 100644
+--- a/src/ctl.c
++++ b/src/ctl.c
+@@ -2,6 +2,7 @@
+ #include "ctl.h"
+ 
+ #include <dirent.h>
++#include <stdlib.h>
+ #include <libgen.h>
+ #include <sys/stat.h>
+ 
+@@ -11,13 +12,24 @@ ctl_rundir(char *dst, size_t size)
+     if (dst && size)
+         dst[0] = 0;
+ 
++    /* Black Relay: an explicit control directory wins. */
++    const char *env = getenv("GT_RUNDIR");
++    if (env && env[0]) {
++        int ret = snprintf(dst, size, "%s", env);
++        if (ret > 0 && (size_t)ret < size)
++            return dst;
++    }
+     const char *fmt[] = {
+         "/run/user/%u/" PACKAGE_NAME,
+         "/run/"         PACKAGE_NAME ".%u",
+         "/var/run/"     PACKAGE_NAME ".%u",
+         "/tmp/"         PACKAGE_NAME ".%u",
+     };
+-    for (unsigned i = 0; i < COUNT(fmt); i++) {
++    /* Black Relay: root skips /run/user/0. logind creates it per login
++     * session (sudo, ssh) and deletes it when the last one ends, taking the
++     * running tunnel's control socket with it; the choice also flips with
++     * whether a session happens to exist. /run/glorytun.0 is stable. */
++    for (unsigned i = geteuid() == 0 ? 1 : 0; i < COUNT(fmt); i++) {
+         char path[128];
+         int ret = snprintf(dst, size, fmt[i], geteuid());
+ 

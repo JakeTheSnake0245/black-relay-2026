@@ -1,0 +1,63 @@
+#!/bin/sh
+# br-ctl — the only commands the CWWK controller may run on the multipath box
+# (forced command for its SSH key). Every argument is validated.
+set -eu
+CONF=/etc/black-relay/br0.conf
+CARRIERS=/etc/black-relay/carriers.conf
+ENV=/etc/black-relay/black-relay.env
+set -- ${SSH_ORIGINAL_COMMAND:-${*:-help}}
+verb=${1:-help}; shift || true
+setkv() {  # file key value
+	if grep -q "^$2=" "$1"; then sed -i "s|^$2=.*|$2=$3|" "$1"; else printf '%s=%s\n' "$2" "$3" >>"$1"; fi
+}
+log() { logger -t br-ctl "$*"; }
+case "$verb" in
+	status)
+		printf '{"sched":"%s","hold":"%s","lanes":"%s","uplinks":"%s","transport":"%s","fec":"%s","service":"%s"}\n' \
+			"$(sed -n 's/^GT_SCHED=//p' $ENV)" "$(sed -n 's/^GT_RESEQ_MS=//p' $ENV)" \
+			"$(sed -n 's/^WSS_LANES=//p' $CONF)" "$(sed -n 's/^UPLINKS=//p' $CONF | tr -d '"')" \
+			"$(sed -n 's/^TRANSPORT=//p' $CONF)" "$(sed -n 's/^GT_FEC=//p' $ENV)" \
+			"$(systemctl is-active black-relay@br0)" | sed "s|}$|,\"caps\":\"$(awk '!/^#/ && NF>=3 && !seen[$1]++ {printf "%s%s:%s", (n++?" ":""), $1, $3}' $CARRIERS)\"}|" ;;
+	set-sched)
+		case "${1:-}" in random|arrival|scatter) ;; *) echo "sched: random|arrival|scatter" >&2; exit 2 ;; esac
+		setkv $ENV GT_SCHED "$1"; log "sched=$1"; echo "ok (applies on restart-tunnel)" ;;
+	set-hold)
+		case "${1:-}" in ''|*[!0-9]*) echo "hold: 50-2000 ms" >&2; exit 2 ;; esac
+		[ "$1" -ge 50 ] && [ "$1" -le 2000 ] || { echo "hold: 50-2000 ms" >&2; exit 2; }
+		setkv $ENV GT_RESEQ_MS "$1"; log "hold=$1"; echo "ok (applies on restart-tunnel)" ;;
+	set-lanes)
+		case "${1:-}" in [1-6]) ;; *) echo "lanes: 1-6" >&2; exit 2 ;; esac
+		setkv $CONF WSS_LANES "$1"; log "lanes=$1"; echo "ok (applies on restart-tunnel)" ;;
+	set-caps)
+		# per device, not per port: KIND:TX/RX ... (kinds from carriers.conf)
+		[ $# -ge 1 ] || { echo "caps: KIND:TX/RX ... (kinds in carriers.conf, e.g. isp starlink spitz)" >&2; exit 2; }
+		for kv in "$@"; do
+			echo "$kv" | grep -qE '^[a-z][a-z0-9_-]{0,15}:[0-9]{1,4}/[0-9]{1,4}$' ||
+				{ echo "caps: KIND:TX/RX ... (Mbit)" >&2; exit 2; }
+			k=${kv%%:*}; c=${kv#*:}
+			grep -qE "^$k[[:space:]]" $CARRIERS || { echo "caps: unknown kind $k" >&2; exit 2; }
+		done
+		for kv in "$@"; do
+			k=${kv%%:*}; c=${kv#*:}
+			sed -i -E "s|^($k[[:space:]]+[^[:space:]]+[[:space:]]+)[0-9]+/[0-9]+|\1$c|" $CARRIERS
+		done
+		/usr/local/sbin/br-uplinks apply >/dev/null
+		log "caps=$*"; echo "ok (applies on restart-tunnel)" ;;
+	uplinks)
+		# what is plugged into each port (written before every tunnel start)
+		cat /run/black-relay/uplinks.json 2>/dev/null || /usr/local/sbin/br-uplinks ;;
+	restart-tunnel)
+		log "restart-tunnel"; systemctl restart --no-block black-relay@br0; echo "restarting" ;;
+	selftest)
+		exec python3 /usr/local/sbin/br-selftest ;;
+	spitz)
+		# local management reachability of the Spitz (never the internet)
+		gw=$(python3 -c 'import json; print(next((u["gw"] for u in json.load(open("/run/black-relay/uplinks.json"))["uplinks"] if u["kind"] == "spitz" and u["gw"]), "192.168.9.1"))' 2>/dev/null || echo 192.168.9.1)
+		port=$(python3 -c 'import json; print(next((u["port"] for u in json.load(open("/run/black-relay/uplinks.json"))["uplinks"] if u["kind"] == "spitz"), ""))' 2>/dev/null || true)
+		if python3 -c "import socket; socket.create_connection(('$gw', 443), 3).close()" 2>/dev/null; then
+			echo "{\"reachable\":true,\"port\":\"$port\"}"
+		else
+			echo "{\"reachable\":false,\"port\":\"$port\"}"
+		fi ;;
+	*) echo "verbs: status set-sched set-hold set-lanes set-caps restart-tunnel spitz uplinks selftest" >&2; exit 2 ;;
+esac

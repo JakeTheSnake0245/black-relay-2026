@@ -1,0 +1,17 @@
+[Unit]
+Description=Black Relay CWWK controller (web UI, https://10.40.0.10)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/br-controller/app.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/br-controller
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

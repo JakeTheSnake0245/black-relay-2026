@@ -1,0 +1,11 @@
+#!/bin/sh
+# Installs files only. OMR keeps running stock glorytun-udp until you run
+# `black-relay-switch fork` (and the same on the server end).
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+cat <<'EOF'
+black-relay-glorytun installed. OMR is still on stock glorytun-udp.
+  black-relay-switch status
+  black-relay-switch fork      (then /etc/init.d/glorytun-udp restart)
+Knobs: /etc/black-relay/black-relay.env
+EOF
+exit 0

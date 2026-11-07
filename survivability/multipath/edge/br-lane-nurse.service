@@ -1,0 +1,11 @@
+[Unit]
+Description=Black Relay lane nurse: re-dial a modem's stuck lanes (Starlink warm-up)
+After=black-relay@br0.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/sbin/br-lane-nurse
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

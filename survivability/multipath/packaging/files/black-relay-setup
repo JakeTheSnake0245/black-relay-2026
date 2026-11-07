@@ -1,0 +1,277 @@
+#!/bin/sh
+# black-relay-setup — one-command setup of a standalone Black Relay tunnel.
+#
+# Hetzner (server) end:
+#   sudo black-relay-setup server [--port 5000] [--name br0] [--no-start]
+#
+# Local (client) end, one --uplink per interface, rate in Mbit/s:
+#   sudo black-relay-setup client --server <hetzner-ipv4> --key <copied br0.key> \
+#        --uplink eth1:300 --uplink eth2:150 --uplink wwan0:40 \
+#        [--port 5000] [--name br0] [--no-start]
+#   An uplink without a DHCP default route needs its gateway: --uplink eth3:100:192.168.8.1
+#
+# Field site joining a multi-site hub (token from `black-relay-hub add <site>`):
+#   sudo black-relay-setup join <token|token-file> [--uplink IF:MBIT|IF:auto]... [--no-start]
+#   Without --uplink, every interface holding a default route becomes an
+#   uplink with rate auto.
+#
+#   sudo black-relay-setup status [--name br0]
+#   sudo black-relay-setup doctor [--name br0]   check this end, say what to fix
+#
+# Overlay addresses: server 10.255.0.2/30, client 10.255.0.1/30 (--tun to change).
+# Changes no firewall rules. The server's UDP port must be opened by you.
+set -eu
+
+ETC=/etc/black-relay
+NAME=br0; PORT=5000; SERVER=""; KEYSRC=""; UPLINKS=""; TUN=""; START=1; FORCE=0
+
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+die() { echo "black-relay-setup: $*" >&2; exit 1; }
+
+role=${1:-}; [ -n "$role" ] || usage; shift
+TOKEN=""
+if [ "$role" = join ]; then TOKEN=${1:-}; [ -n "$TOKEN" ] || usage; shift; fi
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--name) NAME=$2; shift 2 ;;
+		--port) PORT=$2; shift 2 ;;
+		--server) SERVER=$2; shift 2 ;;
+		--key) KEYSRC=$2; shift 2 ;;
+		--uplink) UPLINKS="${UPLINKS:+$UPLINKS }$2"; shift 2 ;;
+		--tun) TUN=$2; shift 2 ;;
+		--no-start) START=0; shift ;;
+		--force) FORCE=1; shift ;;
+		*) usage ;;
+	esac
+done
+
+CONF=$ETC/$NAME.conf
+KEY=$ETC/$NAME.key
+UNIT=black-relay@$NAME
+
+if [ "$role" = status ]; then
+	systemctl --no-pager status "$UNIT" | head -n 12 || true
+	echo
+	/usr/lib/black-relay/tunnel paths "$NAME" || true
+	exit 0
+fi
+
+if [ "$role" = doctor ]; then
+	GT=/usr/lib/black-relay/glorytun
+	fails=0; warns=0
+	ok()   { printf '  ok    %s\n' "$*"; }
+	warn() { printf '  WARN  %s\n' "$*"; warns=$((warns + 1)); }
+	bad()  { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+	echo "black-relay doctor: $NAME on $(hostname -s)"
+	[ "$(id -u)" = 0 ] || warn "not root: key and some checks skipped (sudo black-relay-setup doctor)"
+	if v=$("$GT" version 2>/dev/null); then ok "fork binary $v"; else bad "fork binary missing or broken"; fi
+	[ -r "$CONF" ] || { bad "no $CONF: run black-relay-setup server|client|join"; exit 1; }
+	ROLE=""; DEV=$NAME; PORT=5000; KEYFILE=$KEY; TUN_ADDR=""; SERVER=""; UPLINKS=""; PATHS=""
+	eval "$(grep -E '^(ROLE|DEV|PORT|KEYFILE|TUN_ADDR|SERVER|UPLINKS|PEER)=' "$CONF")"
+	ok "config $CONF (role $ROLE, port $PORT, overlay $TUN_ADDR)"
+	if [ "$(id -u)" = 0 ]; then
+		if [ ! -s "$KEYFILE" ]; then bad "no key at $KEYFILE"
+		elif [ "$(stat -c %a "$KEYFILE")" != 600 ]; then warn "$KEYFILE should be mode 600 (chmod 600)"
+		else ok "key $KEYFILE"; fi
+	fi
+	if systemctl is-active -q "black-relay@$NAME"; then ok "service black-relay@$NAME running"
+	else bad "service black-relay@$NAME not running (journalctl -u black-relay@$NAME -n 30)"; fi
+	if command -v timedatectl >/dev/null; then
+		if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; then ok "clock NTP-synchronised"
+		else warn "clock not NTP-synchronised: glorytun rejects peers more than 10 min apart"; fi
+	fi
+	if ip -4 -o addr show dev "$DEV" 2>/dev/null | grep -q "${TUN_ADDR%/*}"; then ok "tunnel device $DEV has ${TUN_ADDR%/*}"
+	else bad "tunnel device $DEV missing or unaddressed"; fi
+
+	if [ "$ROLE" = client ]; then
+		systemctl is-active -q "black-relay-watch@$NAME" && ok "uplink watcher running" ||
+			warn "uplink watcher not running (systemctl enable --now black-relay-watch@$NAME)"
+		rtts=$("$GT" path dev "$DEV" show rtt 2>/dev/null | awk '$1 == "path" {print $2, $4}')
+		lo=""; hi=""
+		for spec in $UPLINKS; do
+			ifc=${spec%%:*}
+			a=$(ip -4 -o addr show dev "$ifc" scope global 2>/dev/null | awk '{split($4, x, "/"); print x[1]; exit}')
+			if [ -z "$a" ]; then warn "uplink $ifc: no IPv4 (cable/SIM/DHCP?); the watcher re-ups when it gets one"; continue; fi
+			ip rule show | grep -q "from $a lookup" || { bad "uplink $ifc: no routing rule for $a (systemctl restart black-relay@$NAME)"; continue; }
+			r=$(echo "$rtts" | awk -v a="$a" '$1 == a {print $2; exit}')
+			if [ -z "$r" ]; then bad "uplink $ifc ($a): no tunnel path (systemctl restart black-relay@$NAME)"
+			elif [ "$r" = 0 ] || [ "$r" = 0.000 ] || [ "$r" = 0.0 ]; then
+				bad "uplink $ifc ($a): no reply from $SERVER:$PORT. Hub firewall must allow UDP $PORT; some networks block UDP"
+			else
+				ok "uplink $ifc ($a): hub answers, RTT ${r} ms"
+				ms=${r%.*}
+				[ -z "$lo" ] || [ "$ms" -lt "$lo" ] && lo=$ms
+				[ -z "$hi" ] || [ "$ms" -gt "$hi" ] && hi=$ms
+			fi
+		done
+		peer=${TUN_ADDR%/*}; peer=${peer%.*}.$(( ${peer##*.} == 1 ? 2 : ${peer##*.} == 2 ? 1 : ${peer##*.} - 1 ))
+		if ping -c 2 -W 2 -q "$peer" >/dev/null 2>&1; then ok "hub answers through the tunnel ($peer)"
+		else bad "no answer from $peer through the tunnel"; fi
+		if [ -n "$lo" ] && [ -n "$hi" ]; then
+			hold=$(sed -n 's/^GT_RESEQ_MS=//p' "$CONF" /etc/black-relay/black-relay.env | head -n 1)
+			need=$(( (hi - lo) / 2 + 40 ))
+			if [ -n "$hold" ] && [ "$hold" -lt "$need" ]; then
+				warn "lane spread ~$(( (hi - lo) / 2 )) ms one-way: raise GT_RESEQ_MS from $hold to >= $need on BOTH ends"
+			else
+				ok "lane spread ~$(( (hi - lo) / 2 )) ms one-way, within GT_RESEQ_MS=${hold:-default}"
+			fi
+		fi
+	else
+		if command -v ss >/dev/null && ss -uln | grep -q ":$PORT "; then ok "listening on UDP $PORT"
+		else bad "not listening on UDP $PORT"; fi
+		n=$("$GT" path dev "$DEV" show stat 2>/dev/null | grep -c '^path' || true)
+		if [ "$n" -gt 0 ]; then ok "$n path(s) learned from the site"
+		else warn "no site paths yet: is the site joined, and is UDP $PORT open inbound (Hetzner Cloud firewall / ufw)?"; fi
+		command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active" &&
+			{ ufw status | grep -qE "^$PORT(/udp)?|5001:5250" && ok "ufw allows UDP $PORT" || warn "ufw active and UDP $PORT not listed: ufw allow $PORT/udp"; }
+	fi
+	echo "result: $fails fail, $warns warning(s)"
+	[ "$fails" = 0 ]
+	exit
+fi
+
+[ "$(id -u)" = 0 ] || die "run as root (sudo)"
+[ -x /usr/lib/black-relay/glorytun ] || die "package not installed"
+if [ -e "$CONF" ] && [ "$FORCE" = 0 ]; then
+	die "$CONF exists. Edit it directly, or rerun with --force to rewrite it"
+fi
+install -d -m 0755 "$ETC"
+
+start_unit() {
+	if [ "$START" = 1 ]; then
+		systemctl enable "black-relay-watch@$NAME" >/dev/null 2>&1 || true
+		systemctl enable --now "$UNIT"
+		sleep 2
+		systemctl --no-pager --lines=12 status "$UNIT" || true
+	else
+		echo "not started (--no-start). Start with: systemctl enable --now $UNIT"
+	fi
+}
+
+# interfaces holding a default route, minus tunnels/bridges/containers
+detect_uplinks() {
+	ip -4 route show default | awk '{for (n = 1; n < NF; n++) if ($n == "dev") print $(n + 1)}' |
+		grep -vE '^(lo|br|tun|wg|tailscale|docker|virbr|veth|zt)' | sort -u
+}
+
+case "$role" in
+join)
+	[ -f "$TOKEN" ] && TOKEN=$(tr -d ' \n\r' <"$TOKEN")
+	case "$TOKEN" in brj1.*) ;; *) die "not a join token (expected brj1....)" ;; esac
+	bundle=$(printf '%s' "${TOKEN#brj1.}" | base64 -d 2>/dev/null) || die "join token is damaged (base64)"
+	J_SITE=""; J_HUB=""; J_PORT=""; J_TUN=""; J_KEY=""
+	while IFS='=' read -r k v; do
+		case "$k" in
+			BR_SITE) J_SITE=$v ;; BR_HUB) J_HUB=$v ;; BR_PORT) J_PORT=$v ;;
+			BR_TUN) J_TUN=$v ;; BR_KEY) J_KEY=$v ;;
+		esac
+	done <<EOF
+$bundle
+EOF
+	echo "$J_KEY" | grep -qE '^[0-9a-fA-F]{64}$' || die "join token has no valid key"
+	echo "$J_HUB" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || die "join token has no valid hub address"
+	echo "$J_PORT" | grep -qE '^[0-9]{1,5}$' || die "join token has no valid port"
+	echo "$J_TUN" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}/30$' || die "join token has no valid overlay address"
+	if [ -z "$UPLINKS" ]; then
+		for ifc in $(detect_uplinks); do UPLINKS="${UPLINKS:+$UPLINKS }$ifc:auto"; done
+		[ -n "$UPLINKS" ] || die "no interface has a default route; pass --uplink IF:MBIT"
+	fi
+	for spec in $UPLINKS; do
+		ifc=${spec%%:*}
+		ip link show dev "$ifc" >/dev/null 2>&1 || die "no interface '$ifc' (see: ip -br link)"
+		echo "uplink $spec: $(ip -4 -o addr show dev "$ifc" scope global | awk '{print $4; exit}')"
+	done
+	(umask 077 && printf '%s\n' "$J_KEY" >"$KEY")
+	cat >"$CONF" <<EOF
+# written by black-relay-setup join (site $J_SITE)
+ROLE=client
+DEV=$NAME
+BIND=0.0.0.0
+PORT=$J_PORT
+KEYFILE=$KEY
+TUN_ADDR=$J_TUN
+SERVER=$J_HUB
+# IF:MBIT[:GATEWAY] or IF:auto, one per uplink
+UPLINKS="$UPLINKS"
+EOF
+	echo "site $J_SITE -> hub $J_HUB:$J_PORT, overlay $J_TUN"
+	start_unit
+	hubaddr=${J_TUN%/*}; hubaddr=${hubaddr%.*}.$(( ${hubaddr##*.} - 1 ))
+	echo
+	echo "check: ping -c 5 $hubaddr   ·   sudo black-relay-setup status"
+	;;
+server)
+	[ -n "$TUN" ] || TUN=10.255.0.2/30
+	if [ ! -s "$KEY" ]; then
+		black-relay-keygen "$KEY" >/dev/null
+		echo "new tunnel key: $KEY"
+	else
+		echo "keeping existing key: $KEY"
+	fi
+	cat >"$CONF" <<EOF
+# written by black-relay-setup server
+ROLE=server
+DEV=$NAME
+BIND=0.0.0.0
+PORT=$PORT
+KEYFILE=$KEY
+TUN_ADDR=$TUN
+EOF
+	echo "wrote $CONF"
+	start_unit
+	pub=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (n = 1; n < NF; n++) if ($n == "src") {print $(n + 1); exit}}')
+	cat <<EOF
+
+== next ==
+1. Open UDP $PORT inbound on this server (Hetzner Cloud firewall and/or ufw):
+     ufw allow $PORT/udp
+2. Copy the key to the local box (same file on both ends):
+     scp root@${pub:-<this-server>}:$KEY ./$NAME.key
+3. On the local box:
+     sudo black-relay-setup client --server ${pub:-<this-server-ipv4>} --key ./$NAME.key \\
+          --uplink <if1>:<mbit> --uplink <if2>:<mbit> --uplink <if3>:<mbit>
+EOF
+	;;
+client)
+	[ -n "$TUN" ] || TUN=10.255.0.1/30
+	[ -n "$SERVER" ] || die "--server <hetzner public IPv4> is required"
+	[ -n "$UPLINKS" ] || die "at least one --uplink IF:MBIT is required"
+	if [ -n "$KEYSRC" ]; then
+		[ -s "$KEYSRC" ] || die "key file $KEYSRC is empty or missing"
+		install -m 0600 "$KEYSRC" "$KEY"
+	fi
+	[ -s "$KEY" ] || die "no key: pass --key <file copied from the server>"
+	for spec in $UPLINKS; do
+		ifc=${spec%%:*}
+		ip link show dev "$ifc" >/dev/null 2>&1 || die "no interface '$ifc' (see: ip -br link)"
+		addr=$(ip -4 -o addr show dev "$ifc" scope global | awk '{print $4; exit}')
+		echo "uplink $ifc: ${addr:-NO IPv4 YET}"
+	done
+	cat >"$CONF" <<EOF
+# written by black-relay-setup client
+ROLE=client
+DEV=$NAME
+BIND=0.0.0.0
+PORT=$PORT
+KEYFILE=$KEY
+TUN_ADDR=$TUN
+SERVER=$SERVER
+# IF:MBIT[:GATEWAY], one per uplink. Each gets its own routing table
+# (7100, 7101, ...) so its path really leaves through that interface.
+UPLINKS="$UPLINKS"
+EOF
+	echo "wrote $CONF"
+	start_unit
+	peer=${TUN%/*}; peer=${peer%.*}.$(( ${peer##*.} + 1 ))
+	cat <<EOF
+
+== check ==
+  ping -c 5 $peer                          # the Hetzner end, through the tunnel
+  sudo black-relay-setup status            # paths, rates, loss, RTT per uplink
+  python3 /usr/share/black-relay/analysis/lane-stats.py $(for s in $UPLINKS; do printf '%s ' "${s%%:*}"; done)=$NAME
+EOF
+	;;
+*)
+	usage
+	;;
+esac

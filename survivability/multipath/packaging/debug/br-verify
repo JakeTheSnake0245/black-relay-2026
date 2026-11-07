@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+"""
+br-verify — check Black Relay captures (from br-capture) and turn them into
+an annotated Wireshark file.
+
+  br-verify SITE_DIR [--peer HUB_DIR] [--key KEYFILE] [--out FILE] [--json]
+
+What it checks, per uplink, from the uplink captures alone:
+  * every outer tunnel packet left through the uplink that owns its source
+    address (MISROUTE otherwise), and went to the hub's address/port
+  * nothing else left an uplink with an overlay or foreign source (LEAK)
+  * lane share and dispersion: how often consecutive packets change lane
+With --peer (the other end's capture dir, e.g. the hub):
+  * per-lane delivery: each outer packet matched across the Internet by its
+    ciphertext; loss per lane, lane transit differential (relative ms), the
+    hold time GT_RESEQ_MS needs to cover it, and the NAT'd address each lane
+    arrives from
+  * inner delivery: every packet on the site tun device matched on the hub
+    tun device; lost, duplicated, and out-of-order counts per direction
+With --key (the tunnel key file; needs read access):
+  * header protection removed: each packet's sender timestamp and data/control
+    flag, and disorder on the wire at the receiver (what the resequencer fixes)
+
+Output: a report on stdout, and FILE (default SITE_DIR/black-relay-annotated.pcapng):
+every capture merged, one Wireshark interface per captured interface, and a
+comment on every tunnel packet. Filters:  frame.comment contains "MISROUTE"
+  frame.comment contains "lane=" ·  frame.comment contains "LOST"
+Standard library only, Python 3.8+. Works on Linux or macOS.
+"""
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import struct
+import sys
+from collections import Counter, defaultdict
+
+OVERLAY = ipaddress.ip_network("10.255.0.0/16")
+HP_LABEL = b"black-relay-hp-v1\x00"
+
+
+# ------------------------------------------------------------------ inputs
+def read_meta(d):
+    meta = {}
+    p = os.path.join(d, "meta.env")
+    if not os.path.exists(p):
+        sys.exit(f"br-verify: {p} missing (not a br-capture directory?)")
+    for line in open(p):
+        line = line.strip()
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            meta[k] = v.strip('"')
+    ifs = []
+    for name in meta.get("IFACES", "").split():
+        v = "".join(c if c.isalnum() else "_" for c in name)
+        ifs.append({"name": name, "addr": meta.get(f"ADDR_{v}", ""),
+                    "gw": meta.get(f"GW_{v}", "")})
+    meta["ifs"] = ifs
+    meta["tunnels"] = meta.get("TUNNELS", "").split()
+    ports = set()
+    for part in meta.get("PORTS", "").split(","):
+        if part.strip().isdigit():
+            ports.add(int(part))
+    meta["ports"] = ports
+    return meta
+
+
+def read_pcap(path):
+    """Classic pcap -> (linktype, snaplen, [(ts_us, caplen_bytes, origlen)])."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 24:
+        return None, 0, []
+    magic = data[:4]
+    if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"):
+        e = "<"
+    elif magic in (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+        e = ">"
+    else:
+        sys.exit(f"br-verify: {path} is not a classic pcap file")
+    nano = magic in (b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d")
+    _, _, _, _, snaplen, linktype = struct.unpack(e + "HHiIII", data[4:24])
+    pkts, off = [], 24
+    while off + 16 <= len(data):
+        sec, frac, incl, orig = struct.unpack(e + "IIII", data[off:off + 16])
+        off += 16
+        ts = sec * 1_000_000 + (frac // 1000 if nano else frac)
+        pkts.append((ts, data[off:off + incl], orig))
+        off += incl
+    return linktype, snaplen, pkts
+
+
+def l3(linktype, frame):
+    """Strip the link layer; return the IP packet bytes or None."""
+    if linktype == 1:                          # Ethernet (+ 802.1Q/ad tags)
+        off, et = 14, frame[12:14]
+        while et in (b"\x81\x00", b"\x88\xa8") and len(frame) >= off + 4:
+            et, off = frame[off + 2:off + 4], off + 4
+        return frame[off:] if et in (b"\x08\x00", b"\x86\xdd") else None
+    if linktype in (12, 101, 228, 229):        # raw IP (tun)
+        return frame
+    if linktype == 113:                        # Linux cooked v1
+        return frame[16:] if frame[14:16] in (b"\x08\x00", b"\x86\xdd") else None
+    if linktype == 276:                        # Linux cooked v2
+        return frame[20:] if frame[0:2] in (b"\x08\x00", b"\x86\xdd") else None
+    if linktype == 0:                          # BSD loopback / utun
+        return frame[4:]
+    return None
+
+
+def parse_ip(p):
+    """-> dict(src, dst, proto, sport, dport, payload, plen) or None."""
+    if not p:
+        return None
+    v = p[0] >> 4
+    if v == 4 and len(p) >= 20:
+        ihl = (p[0] & 15) * 4
+        total = struct.unpack("!H", p[2:4])[0]
+        r = {"src": str(ipaddress.IPv4Address(p[12:16])),
+             "dst": str(ipaddress.IPv4Address(p[16:20])),
+             "proto": p[9], "sport": None, "dport": None, "payload": b"", "plen": 0}
+        body, blen = p[ihl:], total - ihl
+    elif v == 6 and len(p) >= 40:
+        r = {"src": str(ipaddress.IPv6Address(p[8:24])),
+             "dst": str(ipaddress.IPv6Address(p[24:40])),
+             "proto": p[6], "sport": None, "dport": None, "payload": b"", "plen": 0}
+        body, blen = p[40:], struct.unpack("!H", p[4:6])[0]
+    else:
+        return None
+    if r["proto"] in (6, 17) and len(body) >= 4:
+        r["sport"], r["dport"] = struct.unpack("!HH", body[:4])
+    if r["proto"] == 17 and len(body) >= 8:
+        r["payload"] = body[8:]
+        r["plen"] = struct.unpack("!H", body[4:6])[0] - 8
+    else:
+        r["plen"] = blen
+    return r
+
+
+# ------------------------------------------------------------------ header
+class Header:
+    """Decode the 6-byte mud timestamp/nonce field, unmasking it if needed."""
+
+    def __init__(self, key):
+        self.hp_key = None
+        if key:
+            self.hp_key = hashlib.blake2b(HP_LABEL, key=key, digest_size=32).digest()
+
+    @staticmethod
+    def le48(b):
+        return int.from_bytes(b[:6], "little")
+
+    def raw(self, payload):
+        return self.le48(payload) if len(payload) >= 6 else None
+
+    def unmasked(self, payload):
+        if not self.hp_key or len(payload) < 22:
+            return None
+        mask = hashlib.blake2b(payload[6:22], key=self.hp_key, digest_size=16).digest()
+        return self.le48(bytes(a ^ b for a, b in zip(payload[:6], mask)))
+
+
+def clustered_share(values, span_us):
+    """Share of timestamps within (capture span + 2 min) of their median:
+    ~1.0 for a real sender clock, ~0 for masked (random) bytes. Order-free,
+    so it holds even when capture order differs from send order."""
+    vals = sorted(v for v in values if v is not None)
+    if len(vals) < 8:
+        return 0.0
+    med = vals[len(vals) // 2]
+    win = span_us + 120_000_000
+    return sum(1 for v in vals if abs(v - med) <= win) / len(vals)
+
+
+def wrap48(d):
+    """Signed difference of two 48-bit microsecond clocks."""
+    d %= 1 << 48
+    return d - (1 << 48) if d >= 1 << 47 else d
+
+
+def pct(xs, q):
+    if not xs:
+        return 0.0
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(q * (len(xs) - 1) + 0.5))]
+
+
+# ------------------------------------------------------------------ end model
+class End:
+    """One br-capture directory: its interfaces and classified packets."""
+
+    def __init__(self, d, label):
+        self.dir, self.label = d, label
+        self.meta = read_meta(d)
+        self.role = self.meta.get("ROLE", "unknown")
+        self.server = self.meta.get("SERVER", "")
+        self.ports = set(self.meta["ports"])
+        self.addr_of = {i["name"]: i["addr"] for i in self.meta["ifs"] if i["addr"]}
+        self.if_of_addr = {a: n for n, a in self.addr_of.items()}
+        self.ifaces = []        # [{name, kind, linktype, snaplen, pkts:[rec]}]
+        for i in self.meta["ifs"]:
+            path = os.path.join(d, i["name"] + ".pcap")
+            if not os.path.exists(path):
+                continue
+            lt, snap, raw = read_pcap(path)
+            kind = "tunnel" if i["name"] in self.meta["tunnels"] else (
+                "uplink" if self.role == "client" else "public")
+            recs = []
+            for n, (ts, frame, orig) in enumerate(raw):
+                pkt = l3(lt, frame)
+                recs.append({"n": n, "ts": ts, "frame": frame, "orig": orig,
+                             "l3": pkt, "ip": parse_ip(pkt), "notes": []})
+            self.ifaces.append({"name": i["name"], "kind": kind, "addr": i["addr"],
+                                "linktype": lt, "snaplen": snap or 65535, "pkts": recs})
+
+    def is_tunnel_udp(self, ip, outbound):
+        if not ip or ip["proto"] != 17:
+            return False
+        if self.role == "client":
+            if outbound:
+                return ip["dst"] == self.server and ip["dport"] in self.ports
+            return ip["src"] == self.server and ip["sport"] in self.ports
+        port = ip["dport"] if outbound is False else ip["sport"]
+        return port in self.ports
+
+
+def fp_outer(ip):
+    p = ip["payload"]
+    return (ip["plen"], hashlib.blake2b(p, digest_size=16).digest()) if len(p) >= 22 else None
+
+
+def nonce_check(groups, hdr, report, key):
+    """AEAD nonce uniqueness. groups: {direction: [rec]} of outer packets
+    from one sender. Two different packets must never carry the same nonce
+    under the same key: the nonce is the 6-byte timestamp field (unmasked
+    with --key, or readable with GT_HP off). Without either, packets sharing
+    their first 22 bytes (masked field + 16 ciphertext bytes) can only come
+    from a repeated nonce, so that is checked instead."""
+    out = {}
+    for d, recs in groups.items():
+        by = defaultdict(list)
+        for r in recs:
+            ip = r["ip"]
+            if len(ip["payload"]) < 22:
+                continue
+            ts = r.get("ts_send")
+            k = ("ts", ts) if ts is not None else ("prefix", ip["payload"][:22])
+            by[k].append(r)
+        reuse = {"ctrl": 0, "data": 0}
+        for (kind, val), rs in by.items():
+            if len({x["ip"]["payload"] for x in rs}) < 2:
+                continue                       # an exact resend, not a reuse
+            cls = "ctrl" if kind == "ts" and val & 1 else ("data" if kind == "ts" else "ctrl")
+            reuse[cls] += 1
+            lanes = sorted({x.get("lane", "?") for x in rs})
+            for x in rs:
+                x["notes"].append(f"NONCE REUSE ({cls}, {len(rs)} packets, lanes {'/'.join(lanes)})")
+        out[d] = reuse
+    report["nonce_reuse"] = out
+
+
+def fp_inner(frame_ip):
+    return hashlib.blake2b(frame_ip, digest_size=12).digest() if frame_ip else None
+
+
+# ------------------------------------------------------------------ checks
+def check_uplinks(site, hdr, report):
+    """Route check + lane accounting on the site's uplink captures."""
+    lanes = {}
+    sent = []               # (ts, lane, rec) for egress data across all uplinks
+    received = []           # hub -> site packets on the uplinks
+    for itf in site.ifaces:
+        if itf["kind"] != "uplink":
+            continue
+        name, addr = itf["name"], itf["addr"]
+        st = Counter()
+        other = Counter()
+        for r in itf["pkts"]:
+            ip = r["ip"]
+            if ip is None:
+                st["non-ip"] += 1
+                continue
+            if site.is_tunnel_udp(ip, True):
+                r["lane"] = name
+                if ip["src"] == addr:
+                    st["out_ok"] += 1
+                    r["notes"].append(f"BR up lane={name} route=OK")
+                    sent.append((r["ts"], name, r))
+                else:
+                    owner = site.if_of_addr.get(ip["src"], "no uplink")
+                    st["misroute"] += 1
+                    r["notes"].append(f"BR MISROUTE lane={name}: src {ip['src']} belongs to {owner}, "
+                                      f"expected {addr}")
+                st["out_bytes"] += ip["plen"]
+            elif site.is_tunnel_udp(ip, False):
+                r["lane"] = name
+                received.append(r)
+                if ip["dst"] == addr:
+                    st["in_ok"] += 1
+                    r["notes"].append(f"BR down lane={name} route=OK")
+                else:
+                    st["misdelivered"] += 1
+                    r["notes"].append(f"BR MISDELIVERED lane={name}: dst {ip['dst']}, expected {addr}")
+            else:
+                src = ip["src"]
+                try:
+                    in_overlay = ipaddress.ip_address(src) in OVERLAY
+                except ValueError:
+                    in_overlay = False
+                outbound_foreign = (src != addr and src not in ("0.0.0.0",)
+                                    and ip["dst"] != addr and not src.startswith("fe80"))
+                if in_overlay or (outbound_foreign and src in site.if_of_addr):
+                    st["leak"] += 1
+                    r["notes"].append(f"BR LEAK lane={name}: non-tunnel packet {src} -> {ip['dst']}")
+                else:
+                    proto = {6: "tcp", 17: "udp", 1: "icmp", 58: "icmp6"}.get(ip["proto"], str(ip["proto"]))
+                    port = ip["dport"] if ip["src"] == addr else ip["sport"]
+                    other[f"{proto}/{port}" if port else proto] += 1
+        lanes[name] = {"addr": addr, **st, "other": dict(other.most_common(6))}
+
+    # header: readable, masked-and-unmaskable, or masked
+    span = (max(t for t, _, _ in sent) - min(t for t, _, _ in sent)) if sent else 0
+    raws = [hdr.raw(r["ip"]["payload"]) for _, _, r in sent]
+    if clustered_share(raws, span) > 0.95:
+        report["header"] = "readable (GT_HP off): anyone on the wire can read send order"
+        for (_, _, r), ts in zip(sent, raws):
+            r["ts_send"] = ts
+    else:
+        un = [hdr.unmasked(r["ip"]["payload"]) for _, _, r in sent]
+        if hdr.hp_key and clustered_share(un, span) > 0.95:
+            report["header"] = "masked on the wire (GT_HP on); unmasked here with the key"
+            for (_, _, r), ts in zip(sent, un):
+                r["ts_send"] = ts
+        elif hdr.hp_key:
+            report["header"] = "masked; the key given does not unmask it (wrong key?)"
+        else:
+            report["header"] = "masked on the wire (GT_HP on); pass --key to unmask"
+    for _, _, r in sent:
+        ts = r.get("ts_send")
+        if ts is not None:
+            r["notes"].append("ctrl" if ts & 1 else "data")
+
+    # send order: the sender's own clock when readable, else capture time
+    # (a capture point after a shaper or qdisc delay shifts capture time)
+    if sent and all(r.get("ts_send") is not None for _, _, r in sent):
+        sent.sort(key=lambda x: x[2]["ts_send"])
+        report["send_order_from"] = "sender timestamps"
+    else:
+        sent.sort(key=lambda x: x[0])
+        report["send_order_from"] = "capture time"
+    for idx, (_, _, r) in enumerate(sent, 1):
+        r["notes"].append(f"send#={idx}")
+    data = [x for x in sent if not (x[2].get("ts_send") or 0) & 1]
+    switches = sum(1 for a, b in zip(data, data[1:]) if a[1] != b[1])
+    total_out = sum(v.get("out_ok", 0) for v in lanes.values())
+    for name, v in lanes.items():
+        v["share_pct"] = round(100 * v.get("out_ok", 0) / total_out, 1) if total_out else 0.0
+    report["lanes"] = lanes
+    report["dispersion_pct"] = round(100 * switches / (len(data) - 1), 1) if len(data) > 1 else 0.0
+    report["routing_ok"] = all(v.get("misroute", 0) == 0 and v.get("leak", 0) == 0
+                               and v.get("misdelivered", 0) == 0 for v in lanes.values())
+    for r in received:                     # hub -> site: unmask too, if we can
+        p = r["ip"]["payload"]
+        if report["header"].startswith("readable"):
+            r["ts_send"] = hdr.raw(p)
+        elif "unmasked here" in report["header"]:
+            r["ts_send"] = hdr.unmasked(p)
+    nonce_check({"site->hub": [x[2] for x in sent], "hub->site": received}, hdr, report, hdr.hp_key)
+    return sent
+
+
+def check_peer(site, hub, sent, report):
+    """Match outer packets across the Internet, then inner packets tun to tun."""
+    # ---- outer: site uplink egress -> hub public ingress
+    arrivals = {}
+    for itf in hub.ifaces:
+        if itf["kind"] != "public":
+            continue
+        for r in itf["pkts"]:
+            ip = r["ip"]
+            if ip and ip["proto"] == 17 and ip["dport"] in (hub.ports or site.ports):
+                f = fp_outer(ip)
+                if f:
+                    arrivals.setdefault(f, (r, ip))
+    per_lane = defaultdict(lambda: {"sent": 0, "arrived": 0, "transit": [], "nat": Counter()})
+    matched = []
+    # the two captures start and stop at different moments: only judge site
+    # packets sent while the hub was capturing (clock offset from the matches)
+    hub_ts = [r["ts"] for r, _ in arrivals.values()]
+    offs = sorted(arrivals[fp_outer(r["ip"])][0]["ts"] - ts
+                  for ts, _, r in sent if fp_outer(r["ip"]) in arrivals)
+    off = offs[0] if offs else 0
+    lo, hi = (min(hub_ts), max(hub_ts) - 2_000_000) if hub_ts else (0, 0)
+    for ts, lane, r in sent:
+        f = fp_outer(r["ip"])
+        hit = arrivals.get(f) if f else None
+        if not hit and not (lo <= ts + off <= hi):
+            r["notes"].append("outside the hub capture window")
+            continue
+        L = per_lane[lane]
+        L["sent"] += 1
+        if hit:
+            hr, hip = hit
+            L["arrived"] += 1
+            if r.get("ts_send") is not None:
+                L["transit"].append(wrap48(hr["ts"] - r["ts_send"]) / 1000.0)
+            else:
+                L["transit"].append((hr["ts"] - ts) / 1000.0)
+            L["nat"][f"{hip['src']}:{hip['sport']}"] += 1
+            hr["notes"].append(f"BR up lane={lane} from {hip['src']}:{hip['sport']} (site pkt {lane}#{r['n'] + 1})")
+            if r.get("ts_send") is not None:
+                hr["ts_send"] = r["ts_send"]
+            matched.append((hr["ts"], r.get("ts_send"), hr))
+        else:
+            r["notes"].append("LOST before the hub")
+    base = min((min(v["transit"]) for v in per_lane.values() if v["transit"]), default=0.0)
+    lanes = {}
+    for lane, v in per_lane.items():
+        rel = [t - base for t in v["transit"]]
+        lanes[lane] = {
+            "sent": v["sent"], "arrived": v["arrived"],
+            "loss_pct": round(100 * (v["sent"] - v["arrived"]) / v["sent"], 2) if v["sent"] else 0.0,
+            "transit_rel_ms": {"p50": round(pct(rel, .5), 1), "p99": round(pct(rel, .99), 1)},
+            "arrives_as": [k for k, _ in v["nat"].most_common(2)],
+        }
+    report["lanes_e2e"] = lanes
+    if lanes:
+        p50s = [v["transit_rel_ms"]["p50"] for v in lanes.values() if v["arrived"]]
+        p99s = [v["transit_rel_ms"]["p99"] for v in lanes.values() if v["arrived"]]
+        if p50s and p99s:
+            need = max(p99s) - min(p50s)
+            report["reseq_hint_ms"] = int(need * 1.2 + 10)
+
+    # wire disorder at the hub, by sender timestamp in arrival order
+    seq = [t for _, t, _ in sorted(matched, key=lambda x: x[0]) if t is not None and not t & 1]
+    if seq:
+        hi, ooo = -1, 0
+        for t in seq:
+            if t < hi:
+                ooo += 1
+            hi = max(hi, t)
+        report["wire_disorder_pct"] = round(100 * ooo / len(seq), 1)
+
+    # ---- inner: site tun <-> hub tun
+    def tun_pkts(end):
+        out = []
+        for itf in end.ifaces:
+            if itf["kind"] == "tunnel":
+                out.extend(itf["pkts"])
+        return out
+
+    s_tun, h_tun = tun_pkts(site), tun_pkts(hub)
+    if not s_tun or not h_tun:
+        return
+    h_index = defaultdict(list)
+    for r in h_tun:
+        fp = fp_inner(r["l3"])
+        if fp:
+            h_index[fp].append(r)
+    h_lo, h_hi = min(r["ts"] for r in h_tun), max(r["ts"] for r in h_tun)
+    in_offs = sorted(h_index[fp_inner(r["l3"])][0]["ts"] - r["ts"]
+                     for r in s_tun if fp_inner(r["l3"]) in h_index)
+    in_off = in_offs[len(in_offs) // 2] if in_offs else 0
+    site_tun_addrs = {i["addr"] for i in site.ifaces if i["kind"] == "tunnel" and i["addr"]}
+    hub_tun_addrs = {i["addr"] for i in hub.ifaces if i["kind"] == "tunnel" and i["addr"]}
+
+    def noise(ip):                         # router solicitations, mDNS, ...
+        return ip["dst"].startswith("ff") or ip["src"].startswith("fe80") or \
+            ip["dst"].startswith("224.") or ip["dst"].startswith("239.")
+    dirs = {"up": {"n": 0, "delivered": 0, "dup": 0, "order": []},
+            "down": {"n": 0, "delivered": 0, "dup": 0, "order": []}}
+    seen = Counter()
+    s_count = Counter(fp_inner(r["l3"]) for r in s_tun if r["ip"])
+    for r in s_tun:
+        ip = r["ip"]
+        if not ip or noise(ip):
+            continue
+        d = "down" if ip["dst"] in site_tun_addrs or ip["src"] in hub_tun_addrs else "up"
+        fp = fp_inner(r["l3"])
+        k = seen[fp]
+        seen[fp] += 1
+        hits = h_index.get(fp, [])
+        hit = hits[k] if k < len(hits) else None
+        if not hit and not (h_lo + 1_000_000 <= r["ts"] + in_off <= h_hi - 1_000_000):
+            continue
+        D = dirs[d]
+        D["n"] += 1
+        if hit:
+            D["delivered"] += 1
+            if k == s_count[fp] - 1:          # last copy: extra hub copies are duplicates
+                D["dup"] += max(0, len(hits) - s_count[fp])
+            D["order"].append((r["ts"], hit["ts"]))
+            r["notes"].append(f"BR inner {d} delivered")
+            hit["notes"].append(f"BR inner {d} delivered")
+        else:
+            r["notes"].append(f"BR inner {d} LOST (not on the hub tun)")
+    inner = {}
+    for d, D in dirs.items():
+        if not D["n"]:
+            continue
+        # order as seen by the receiver vs order as sent
+        by_send = sorted(D["order"], key=lambda x: x[0] if d == "up" else x[1])
+        recv_t = [x[1] if d == "up" else x[0] for x in by_send]
+        inv = sum(1 for a, b in zip(recv_t, recv_t[1:]) if b < a)
+        inner[d] = {"packets": D["n"], "delivered": D["delivered"],
+                    "lost_pct": round(100 * (D["n"] - D["delivered"]) / D["n"], 2),
+                    "dup": D["dup"], "out_of_order": inv}
+    report["inner"] = inner
+
+
+# ------------------------------------------------------------------ pcapng
+def _opt(code, val):
+    pad = (4 - len(val) % 4) % 4
+    return struct.pack("<HH", code, len(val)) + val + b"\x00" * pad
+
+
+def _block(btype, body):
+    total = 12 + len(body)
+    return struct.pack("<II", btype, total) + body + struct.pack("<I", total)
+
+
+def write_pcapng(path, ends):
+    out = [_block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1)
+                  + _opt(4, b"br-verify (Black Relay)") + _opt(0, b""))]
+    allp = []
+    ifid = 0
+    for end in ends:
+        for itf in end.ifaces:
+            desc = f"{end.label}:{itf['name']} {itf['kind']} {itf['addr']}".strip()
+            out.append(_block(1, struct.pack("<HHI", itf["linktype"] or 1, 0, itf["snaplen"])
+                              + _opt(2, desc.encode()) + _opt(3, desc.encode()) + _opt(0, b"")))
+            for r in itf["pkts"]:
+                allp.append((r["ts"], ifid, r))
+            ifid += 1
+    allp.sort(key=lambda x: x[0])
+    for ts, i, r in allp:
+        fr = r["frame"]
+        opts = b""
+        if r["notes"]:
+            opts = _opt(1, " ".join(r["notes"]).encode()) + _opt(0, b"")
+        pad = (4 - len(fr) % 4) % 4
+        body = struct.pack("<IIIII", i, ts >> 32, ts & 0xFFFFFFFF, len(fr), r["orig"]) + fr + b"\x00" * pad + opts
+        out.append(_block(6, body))
+    with open(path, "wb") as f:
+        f.write(b"".join(out))
+    return len(allp)
+
+
+# ------------------------------------------------------------------ report
+def print_report(rep):
+    w = sys.stdout.write
+    w(f"\nBlack Relay capture check: {rep['site']}" + (f" vs {rep['peer']}" if rep.get("peer") else "") + "\n")
+    w(f"header: {rep.get('header', 'n/a')}\n\n")
+    w("UPLINK ROUTING (site captures)\n")
+    w(f"  {'lane':<12} {'address':<16} {'out ok':>7} {'share':>6} {'in ok':>7} {'misroute':>8} {'leak':>5}  other traffic\n")
+    for n, v in rep.get("lanes", {}).items():
+        other = ", ".join(f"{k}:{c}" for k, c in v.get("other", {}).items()) or "-"
+        w(f"  {n:<12} {v['addr']:<16} {v.get('out_ok', 0):>7} {v.get('share_pct', 0):>5}% "
+          f"{v.get('in_ok', 0):>7} {v.get('misroute', 0):>8} {v.get('leak', 0):>5}  {other}\n")
+    verdict = "PASS: every tunnel packet left through its own uplink, no leaks" if rep.get("routing_ok") \
+        else "FAIL: see MISROUTE / LEAK / MISDELIVERED rows (frame.comment in Wireshark)"
+    w(f"  {verdict}\n")
+    w(f"  dispersion: {rep.get('dispersion_pct', 0)} % of consecutive data packets changed lane "
+      f"(send order from {rep.get('send_order_from', 'capture time')})\n")
+    nr = rep.get("nonce_reuse", {})
+    if nr:
+        bad = {d: v for d, v in nr.items() if v["ctrl"] or v["data"]}
+        if bad:
+            w("  NONCE REUSE: " + "; ".join(f"{d}: {v['ctrl']} control, {v['data']} data nonce(s) "
+                                           f"carried by more than one different packet" for d, v in bad.items())
+              + "  (frame.comment contains \"NONCE REUSE\")\n")
+        else:
+            w("  nonces: every packet's nonce unique in both directions\n")
+    if rep.get("lanes_e2e"):
+        w("\nLANES END TO END (site uplink -> hub)\n")
+        w(f"  {'lane':<12} {'sent':>7} {'arrived':>8} {'loss':>7} {'transit p50/p99 (rel ms)':>26}  arrives at hub as\n")
+        for n, v in rep["lanes_e2e"].items():
+            t = v["transit_rel_ms"]
+            w(f"  {n:<12} {v['sent']:>7} {v['arrived']:>8} {v['loss_pct']:>6}% "
+              f"{t['p50']:>12} / {t['p99']:<11} {', '.join(v['arrives_as']) or '-'}\n")
+        if "reseq_hint_ms" in rep:
+            w(f"  lane spread suggests GT_RESEQ_MS >= {rep['reseq_hint_ms']}\n")
+        if "wire_disorder_pct" in rep:
+            w(f"  disorder on the wire at the hub: {rep['wire_disorder_pct']} % of data packets "
+              f"arrived after a later-sent one\n")
+    if rep.get("inner"):
+        w("\nINNER PACKETS (site tun <-> hub tun)\n")
+        for d, v in rep["inner"].items():
+            w(f"  {d:<5} {v['packets']:>7} sent  {v['delivered']:>7} delivered  {v['lost_pct']:>5}% lost  "
+              f"dup {v['dup']}  out-of-order {v['out_of_order']}\n")
+    if rep.get("pcapng"):
+        w(f"\nWireshark: {rep['pcapng']} ({rep['pcapng_packets']} packets, comments on tunnel packets)\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("site", help="br-capture directory (normally the site end)")
+    ap.add_argument("--peer", help="the other end's br-capture directory (normally the hub)")
+    ap.add_argument("--key", help="tunnel key file (hex) to unmask headers")
+    ap.add_argument("--out", help="annotated pcapng path")
+    ap.add_argument("--json", action="store_true", help="print the report as JSON")
+    a = ap.parse_args()
+
+    key = None
+    if a.key:
+        hx = open(a.key).read().strip()
+        key = bytes.fromhex(hx)
+        if len(key) != 32:
+            sys.exit("br-verify: key must be 64 hex characters")
+
+    site = End(a.site, "site")
+    hub = End(a.peer, "hub") if a.peer else None
+    if site.role != "client" and hub and hub.role == "client":
+        site, hub = hub, site               # accept the dirs in either order
+    if hub and not hub.ports:
+        hub.ports = site.ports
+    hdr = Header(key)
+    rep = {"site": a.site, "peer": a.peer}
+    sent = check_uplinks(site, hdr, rep)
+    if hub:
+        check_peer(site, hub, sent, rep)
+    out = a.out or os.path.join(a.site, "black-relay-annotated.pcapng")
+    rep["pcapng"] = out
+    try:
+        rep["pcapng_packets"] = write_pcapng(out, [site] + ([hub] if hub else []))
+        with open(os.path.join(os.path.dirname(os.path.abspath(out)), "report.json"), "w") as f:
+            json.dump(rep, f, indent=2)
+    except PermissionError as e:
+        sys.exit(f"br-verify: cannot write {e.filename}: pass --out to a writable path "
+                 f"(or chown the capture directory)")
+    if a.json:
+        print(json.dumps(rep, indent=2))
+    else:
+        print_report(rep)
+    sys.exit(0 if rep.get("routing_ok") else 1)
+
+
+if __name__ == "__main__":
+    main()

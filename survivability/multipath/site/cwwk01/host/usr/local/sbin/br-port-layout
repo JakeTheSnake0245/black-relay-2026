@@ -1,0 +1,178 @@
+#!/bin/bash
+# br-port-layout: every CWWK port takes anything (modem, Spitz/AP, laptop, switch).
+#
+#   unify     put all physical ports on one VLAN-aware bridge (vmbr10, spanning tree on):
+#             port i keeps its own untagged VLAN 100+i -> br-edge up<i> (a modem there
+#             is its own uplink), and the Wi-Fi VLAN 40 is allowed tagged on every port
+#             -> br-router (an AP that tags its Wi-Fi, like the Spitz, works anywhere).
+#             br-port-roles then switches a port to the site LAN when a client device
+#             is plugged in. Ports are discovered, not listed. Arms a 15-minute rollback.
+#   confirm   keep the layout (cancels the automatic rollback).
+#   rollback  restore the layout from before `unify`.
+#   status    show what is where.
+#
+# Spanning tree guards the one real failure: the same device cabled into two ports.
+set -euo pipefail
+B=/root/black-relay/port-layout-backup-unify
+IF=/etc/network/interfaces
+EDGE=101 ROUTER=102 BR=vmbr10 WIFI=40 BASE=100
+log() { echo "br-port-layout: $*"; logger -t br-port-layout "$*"; }
+
+phys() { for d in /sys/class/net/*/device; do n=${d%/device}; n=${n##*/}; [ -e /sys/class/net/$n/wireless ] || echo $n; done | sort -V; }
+
+disarm() {
+	systemctl stop 'br-port-layout-rollback*.timer' 2>/dev/null || true
+	systemctl reset-failed 'br-port-layout-rollback*' 2>/dev/null || true
+}
+
+arm() {
+	disarm
+	systemd-run --quiet --unit "br-port-layout-rollback-$(date +%s)" --on-active=15min /usr/local/sbin/br-port-layout rollback
+	log "automatic rollback armed: 15 minutes (br-port-layout confirm to keep)"
+}
+
+unify() {
+	if [ ! -d $B ]; then
+		mkdir -p $B && chmod 700 $B
+		cp -p $IF /etc/hosts $B/
+		pct config $EDGE >$B/$EDGE.conf; pct config $ROUTER >$B/$ROUTER.conf
+		pct exec $ROUTER -- uci export network >$B/router-network.uci
+	fi
+	mapfile -t P < <(phys)
+	# 0. the config this ends in (validated shape: boots straight into the same state)
+	cp -p $B/interfaces $B/interfaces.new
+	python3 - "$B/interfaces.new" "$BR" "$WIFI" "$BASE" "${P[@]}" <<'PY'
+import re, sys
+p, br, wifi, base, ports = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5:]
+s = open(p).read()
+blocks, cur = [], []
+for line in s.splitlines():
+    starts = re.match(r"(auto|iface|source|allow-\S+)\s", line)
+    joins_auto = cur and len(cur) == 1 and cur[0].startswith("auto ") and line.startswith("iface ") \
+        and line.split()[1] == cur[0].split()[1]
+    if starts and cur and not joins_auto:
+        blocks.append(cur); cur = []
+    cur.append(line)
+if cur:
+    blocks.append(cur)
+keep = []
+for b in blocks:
+    head = next((l for l in b if l.startswith("iface ")), b[0])
+    name = head.split()[1] if len(head.split()) > 1 else None
+    bp = next((l.split()[1:] for l in b if l.strip().startswith("bridge-ports")), [])
+    if name in ports or name == br or (any(x in ports for x in bp) and name != "vmbr1"):
+        continue
+    b = [l for l in b if not (l.lstrip().startswith("#") and re.search(
+        r"\bnic\d|\bvmbr(0|1[1-9])\b|Spitz|[Uu]plink|LAN NIC|Wi-Fi", l))]
+    if name == "vmbr1":
+        b.insert(0, "# Site LAN 10.40.0.0/24 (internal): br-router 10.40.0.1, br-controller, this host.\n"
+                    "# Wi-Fi and client devices join it through br-router (Wi-Fi VLAN on the port bridge).")
+    if name == "vmbr2":
+        b.insert(0, "# br-edge (10.39.0.1) <-> br-router (10.39.0.2) transit. Internal, no host IP.")
+    keep.append("\n".join(b).rstrip("\n"))
+out = "\n".join(keep).rstrip("\n")
+out = re.sub(r"(iface vmbr1 inet static\n(?:\t.*\n)*?\tbridge-ports )\S+", r"\1none", out + "\n")
+add = ["", "# Every physical port: its own untagged VLAN (a modem -> br-edge up<i>) and the",
+       "# Wi-Fi VLAN tagged (an access point -> br-router). br-port-roles moves a port's",
+       "# untagged VLAN to the site LAN when a client device is plugged in."]
+for i, n in enumerate(ports):
+    add += [f"iface {n} inet manual", f"\tbridge-pvid {base + i}", f"\tbridge-vids {wifi}", ""]
+add += [f"auto {br}", f"iface {br} inet manual",
+        "\tpost-up echo 1 > /proc/sys/net/ipv6/conf/$IFACE/disable_ipv6",
+        f"\tbridge-ports {' '.join(ports)}", "\tbridge-stp on", "\tbridge-bridgeprio 0", "\tbridge-maxage 6", "\tbridge-fd 4",
+        "\tbridge-vlan-aware yes", f"\tbridge-vids {wifi} {base}-{base + len(ports) - 1}", ""]
+open(p, "w").write(out.rstrip("\n") + "\n" + "\n".join(add))
+PY
+	old=$(for n in "${P[@]}"; do m=$(readlink /sys/class/net/$n/master 2>/dev/null) && basename "$m"; done | sort -u | grep -vx vmbr1 || true)
+	arm
+	# 1. the node name must resolve to an address that stays
+	sed -i -E "s/^[0-9.]+([[:space:]]+pve\.lan[[:space:]]+pve)\$/10.40.0.2\1/" /etc/hosts
+	# 2. the new bridge (VLAN-aware, spanning tree on, 4 s forward delay)
+	ip link show $BR >/dev/null 2>&1 || ip link add $BR type bridge vlan_filtering 1 stp_state 1 forward_delay 400
+	echo 1 >/proc/sys/net/ipv6/conf/$BR/disable_ipv6
+	ip link set $BR up
+	# 3. containers' legs onto it: br-edge up<i> untagged VLAN BASE+i, br-router Wi-Fi leg tagged
+	i=0
+	for n in "${P[@]}"; do
+		line=$(pct config $EDGE | grep -E "^net[0-9]+: name=up$i," || true)
+		if [ -n "$line" ]; then
+			key=${line%%:*}; val=$(echo "${line#*: }" | sed -E "s/bridge=[^,]+/bridge=$BR/; s/,tag=[0-9]+//")
+			pct set $EDGE -"$key" "$val,tag=$((BASE + i))"
+		else
+			free=$(for k in $(seq 0 15); do pct config $EDGE | grep -q "^net$k:" || { echo $k; break; }; done)
+			pct set $EDGE -net"$free" "name=up$i,bridge=$BR,tag=$((BASE + i)),ip=manual,type=veth"
+		fi
+		i=$((i + 1))
+	done
+	line=$(pct config $ROUTER | grep -E "^net[0-9]+: .*tag=$WIFI" | head -1)
+	pct set $ROUTER -"${line%%:*}" "$(echo "${line#*: }" | sed -E "s/bridge=[^,]+/bridge=$BR/")"
+	# 4. physical ports: own untagged VLAN, Wi-Fi VLAN tagged
+	i=0
+	for n in "${P[@]}"; do
+		ip link set $n nomaster
+		ip link set $n master $BR
+		bridge vlan del dev $n vid 1 2>/dev/null || true
+		bridge vlan add dev $n vid $((BASE + i)) pvid untagged
+		bridge vlan add dev $n vid $WIFI
+		i=$((i + 1))
+	done
+	# 5. the old per-port bridges are empty now
+	for b in $old; do
+		[ -z "$(ls /sys/class/net/$b/brif 2>/dev/null)" ] && ip link del $b && log "removed empty bridge $b"
+	done
+	# 6. the config file that boots into this state
+	install -m 0644 $B/interfaces.new $IF
+	ifquery -a -c 2>&1 | grep -q "\[fail\]" && log "note: ifquery reports differences (see ifquery -a -c)" || true
+	pct exec $EDGE -- networkctl reconfigure $(for k in $(seq 0 $((${#P[@]} - 1))); do printf "up%s " $k; done) || true
+	systemctl enable --now br-port-roles >/dev/null 2>&1 || true
+	log "unify done: any port takes anything"
+}
+
+rollback() {
+	[ -d $B ] || { log "no backup: nothing to roll back"; exit 1; }
+	set +e
+	log "rolling back to the layout from before unify"
+	systemctl disable --now br-port-roles >/dev/null 2>&1
+	nft delete table bridge br_port_roles 2>/dev/null
+	cp -p $B/interfaces $IF; cp -p $B/hosts /etc/hosts
+	# old bridges first (with their ports), then the containers' legs, then drop the new bridge
+	for b in $(grep -oE "^auto vmbr[0-9]+" $IF | awk '{print $2}'); do ip link show $b >/dev/null 2>&1 || ifup $b; done
+	for b in $(grep -oE "^auto vmbr[0-9]+" $IF | awk '{print $2}'); do ifup $b >/dev/null 2>&1; done
+	for id in $EDGE $ROUTER; do
+		want=$(grep -E '^net[0-9]+:' $B/$id.conf | cut -d: -f1 | sort)
+		for n in $(pct config $id | grep -E '^net[0-9]+:' | cut -d: -f1); do
+			echo "$want" | grep -qx "$n" || pct set $id -delete "$n"
+		done
+		grep -E '^net[0-9]+:' $B/$id.conf | while IFS= read -r line; do
+			pct config $id | grep -qxF "$line" || pct set $id -"${line%%:*}" "${line#*: }"
+		done
+	done
+	grep -q "iface $BR " $IF || ip link del $BR 2>/dev/null
+	ifreload -a
+	pct exec $ROUTER -- uci import network <$B/router-network.uci
+	pct exec $ROUTER -- uci commit network
+	pct exec $ROUTER -- /etc/init.d/network reload
+	pct exec $EDGE -- networkctl reconfigure up0 up1 up2 up3
+	disarm
+	log "rolled back"
+}
+
+status() {
+	echo "== ports"
+	for n in $(phys); do
+		printf '%-6s link=%s bridge=%-7s vlans=%s\n' $n "$(cat /sys/class/net/$n/carrier 2>/dev/null)" \
+			"$(basename "$(readlink /sys/class/net/$n/master 2>/dev/null)")" \
+			"$(bridge vlan show dev $n 2>/dev/null | awk 'NR>1{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) printf "%s%s ", $i, ($0 ~ /PVID/ ? "(untagged)" : "")}')"
+	done
+	echo "== roles: $(cat /run/br-port-roles.json 2>/dev/null || echo 'br-port-roles not running')"
+	echo "== rollback timer: $(systemctl list-timers --all --no-legend 'br-port-layout-rollback*' 2>/dev/null | grep -c . || true) armed"
+	pct exec $EDGE -- /usr/local/sbin/br-uplinks | python3 -c 'import json,sys; [print(u["port"], u["if"], u["kind"], u["ip"]) for u in json.load(sys.stdin)["uplinks"]]'
+}
+
+case "${1:-status}" in
+	unify) unify ;;
+	confirm) disarm; log "kept the new layout" ;;
+	rollback) rollback ;;
+	status) status ;;
+	*) echo "usage: br-port-layout unify|confirm|rollback|status" >&2; exit 2 ;;
+esac

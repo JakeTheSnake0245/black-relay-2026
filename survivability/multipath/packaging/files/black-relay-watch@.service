@@ -1,0 +1,14 @@
+[Unit]
+Description=Black Relay uplink watcher (%i)
+Documentation=file:/usr/share/doc/black-relay-glorytun/README.md
+After=black-relay@%i.service
+PartOf=black-relay@%i.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/black-relay/tunnel watch %i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=black-relay@%i.service

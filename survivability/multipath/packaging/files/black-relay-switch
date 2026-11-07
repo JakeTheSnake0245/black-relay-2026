@@ -1,0 +1,113 @@
+#!/bin/sh
+# black-relay-switch — swap an existing glorytun binary (e.g. OMR's
+# glorytun-udp) for the Black Relay fork, and back. Rollback is one command.
+#
+#   black-relay-switch status [--target PATH]
+#   black-relay-switch fork   [--target PATH] [-y]   stock -> PATH.stock, PATH -> glorytun-br
+#   black-relay-switch stock  [--target PATH] [-y]   PATH.stock -> PATH
+#   black-relay-switch stock  --all -y               restore every switched binary
+#
+# Without --target it looks for glorytun-udp, then glorytun, in the usual
+# places. Nothing is restarted: after switching, restart the tunnel yourself
+# (OMR router: /etc/init.d/glorytun-udp restart; OMR server: check
+# `systemctl list-units 'glorytun*'`). Switch BOTH ends in the same window —
+# the fork and stock glorytun cannot talk to each other.
+#
+# Works under busybox ash (OpenWrt/OMR) and dash/bash (Debian).
+set -eu
+
+WRAPPER=/usr/sbin/glorytun-br
+CANDIDATES="/usr/sbin/glorytun-udp /usr/local/bin/glorytun-udp /usr/bin/glorytun-udp
+/usr/local/sbin/glorytun-udp /usr/sbin/glorytun /usr/local/bin/glorytun /usr/bin/glorytun"
+
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+die() { echo "black-relay-switch: $*" >&2; exit 1; }
+
+is_switched() { [ -L "$1" ] && [ "$(readlink "$1")" = "$WRAPPER" ]; }
+
+find_target() {
+	for c in $CANDIDATES; do
+		if is_switched "$c" || [ -e "$c.stock" ]; then echo "$c"; return; fi
+	done
+	for c in $CANDIDATES; do
+		if [ -f "$c" ] && [ ! -L "$c" ]; then echo "$c"; return; fi
+	done
+}
+
+confirm() {
+	[ "$YES" = 1 ] && return 0
+	printf '%s [y/N] ' "$1"
+	read -r ans
+	case "$ans" in y|Y|yes) return 0 ;; esac
+	echo "aborted."; exit 1
+}
+
+show() {
+	t=$1
+	if is_switched "$t"; then
+		echo "$t -> FORK  ($WRAPPER, stock saved as $t.stock)"
+	elif [ -e "$t" ]; then
+		echo "$t -> STOCK"
+	else
+		echo "$t -> (missing)"
+	fi
+	if [ -x /usr/lib/black-relay/glorytun ]; then
+		echo "fork binary: $(/usr/lib/black-relay/glorytun version 2>/dev/null || echo '?')"
+	fi
+}
+
+cmd=${1:-}; [ -n "$cmd" ] || usage; shift
+TARGET=""; YES=0; ALL=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--target) TARGET=${2:-}; shift 2 ;;
+		-y|--yes) YES=1; shift ;;
+		--all) ALL=1; shift ;;
+		*) usage ;;
+	esac
+done
+
+if [ "$ALL" = 1 ]; then
+	[ "$cmd" = stock ] || usage
+	[ "$(id -u)" = 0 ] || die "run as root"
+	for c in $CANDIDATES; do
+		if is_switched "$c" && [ -e "$c.stock" ]; then
+			mv -f "$c.stock" "$c"
+			echo "restored stock: $c"
+		fi
+	done
+	exit 0
+fi
+
+[ -n "$TARGET" ] || TARGET=$(find_target)
+[ -n "$TARGET" ] || die "no glorytun binary found; pass --target /path/to/glorytun-udp"
+
+case "$cmd" in
+status)
+	show "$TARGET"
+	;;
+fork)
+	[ "$(id -u)" = 0 ] || die "run as root"
+	[ -x "$WRAPPER" ] || die "$WRAPPER missing; is the package installed?"
+	if is_switched "$TARGET"; then show "$TARGET"; exit 0; fi
+	[ -f "$TARGET" ] || die "$TARGET is not a regular file"
+	[ -e "$TARGET.stock" ] && die "$TARGET.stock already exists; refusing to overwrite it"
+	confirm "Replace $TARGET with the Black Relay fork (stock kept as $TARGET.stock)?"
+	mv "$TARGET" "$TARGET.stock"
+	ln -s "$WRAPPER" "$TARGET"
+	show "$TARGET"
+	echo "now restart the tunnel on this end, and switch the other end too."
+	;;
+stock)
+	[ "$(id -u)" = 0 ] || die "run as root"
+	if ! is_switched "$TARGET"; then show "$TARGET"; exit 0; fi
+	[ -e "$TARGET.stock" ] || die "$TARGET.stock missing; cannot restore"
+	confirm "Restore stock $TARGET from $TARGET.stock?"
+	mv -f "$TARGET.stock" "$TARGET"
+	show "$TARGET"
+	echo "now restart the tunnel on this end, and switch the other end too."
+	;;
+*)
+	usage
+	;;
+esac

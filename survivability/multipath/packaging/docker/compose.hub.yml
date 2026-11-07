@@ -1,0 +1,53 @@
+---
+# Black Relay multipath hub on BR2026 (proposed: /srv/black-relay/compose.yml).
+#
+# Userspace only. Tunnel devices, forwarding and NAT stay inside this
+# container's network namespace; the host kernel, sysctls and nftables are not
+# changed by the container. One host firewall change is needed to admit the
+# published UDP ports (forward_guard drops DNAT'd traffic except TCP 80/443):
+#   nft insert rule inet survivability_filter forward_guard \
+#     ct status dnat meta l4proto udp ct original proto-dst 5001-5010 accept
+#
+# Sites:  docker exec survivability-black-relay black-relay-hub add <site> [--lan CIDR]
+#         docker exec survivability-black-relay black-relay-hub list
+name: black-relay
+services:
+  hub:
+    image: "black-relay:0.3.4-br4"
+    pull_policy: never        # local image (docker load), never from a registry
+    container_name: survivability-black-relay
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN            # tun device, addresses/routes, nft inside the container netns
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    sysctls:
+      net.ipv4.ip_forward: "1"   # container netns only
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /run:size=16m,mode=0755
+      - /tmp:size=16m,mode=1777
+    environment:
+      BR_PUBLIC_IP: "89.167.30.202"
+      BR_PORT_BASE: "5000"
+      BR_FORWARD: "egress"   # site -> internet only; never site <-> site
+      BR_NAT: "1"
+    volumes:
+      - "/srv/black-relay/etc:/etc/black-relay"
+    ports:
+      - "0.0.0.0:5001-5010:5001-5010/udp"   # sites 1-10
+    networks:
+      black_relay: {}
+    deploy:
+      resources:
+        limits:
+          memory: "256M"
+          cpus: "2.00"
+
+networks:
+  black_relay:
+    name: "black_relay"

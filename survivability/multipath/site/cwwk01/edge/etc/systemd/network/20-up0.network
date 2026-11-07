@@ -1,0 +1,15 @@
+# Uplink up0 (CWWK nic0). DHCP; each uplink gets its own default route metric.
+# black-relay builds per-uplink tables from these; LAN traffic never uses them.
+[Match]
+Name=up0
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+
+[DHCPv4]
+RouteMetric=100
+UseDNS=no
+UseHostname=no
+SendHostname=no

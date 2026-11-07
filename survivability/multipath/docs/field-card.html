@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Black Relay Field Card</title>
+<style>
+@page { size: 8.5in 11in; margin: 0.4in; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 9.2pt/1.32 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #0b0b0b; }
+h1 { font-size: 17pt; margin: 0; letter-spacing: -.01em; }
+.top { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 2.5px solid #0b0b0b; padding-bottom: 5px; margin-bottom: 8px; }
+.top .sub { color: #52514e; font-size: 9.5pt; }
+h2 { font-size: 10pt; margin: 7px 0 3px; text-transform: uppercase; letter-spacing: .05em; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; }
+.rules { display: grid; grid-template-columns: 1.35fr 1fr; gap: 10px; }
+.rule { border: 3px solid #0b0b0b; border-radius: 10px; padding: 7px 11px; }
+.rule.yes { border-color: #0c7a0c; }
+.rule.no { border-color: #b02a2a; }
+.rule .head { font-size: 17pt; font-weight: 800; letter-spacing: -.01em; line-height: 1.1; }
+.rule.yes .head { color: #0c7a0c; }
+.rule.no .head { color: #b02a2a; }
+.rule .what { font-size: 10pt; margin-top: 4px; }
+.rule .note { margin-top: 3px; }
+ol, ul { margin: 2px 0; padding-left: 17px; }
+li { margin: 1px 0; }
+table { width: 100%; border-collapse: collapse; font-size: 9pt; }
+th { text-align: left; border-bottom: 1.5px solid #0b0b0b; padding: 3px 4px; }
+td { border-bottom: 1px solid #c3c2b7; padding: 2.5px 4px; vertical-align: top; }
+.mono { font-family: "SF Mono", Menlo, monospace; font-size: 8.8pt; }
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: -1px; margin-right: 5px; }
+.write { border-bottom: 1px solid #0b0b0b; display: inline-block; width: 160px; height: 13px; }
+.note { color: #52514e; font-size: 8.6pt; }
+</style>
+</head>
+<body>
+<div class="top"><h1>Black Relay site kit · field card</h1><span class="sub">CWWK site box · keep with the kit</span></div>
+
+<div class="rules">
+  <div class="rule yes">
+    <div class="head">✓ ANY CABLE, ANY PORT</div>
+    <div class="what">Modems (ISP router, Starlink router, the Spitz's <b>LAN</b> port), a laptop or a switch: plug each into <b>any free port</b> on the CWWK.</div>
+    <div class="note">Within about a minute the CWWK works out what each one is: modems join the secure link, the Spitz brings the Wi-Fi, laptops and switches join the site network.</div>
+  </div>
+  <div class="rule no">
+    <div class="head">✗ ONE CABLE PER DEVICE</div>
+    <div class="what">Never plug the <b>same box into two ports</b>.</div>
+    <div class="note">Moved a cable? Fine. Wait one minute and it carries on by itself.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <div>
+    <h2>Power up</h2>
+    <ol>
+      <li><b>Modems first:</b> ISP router; Starlink (open sky, up to 5 min); Spitz (needs a SIM for its own cellular).</li>
+      <li><b>Then the CWWK.</b> Ready in about 1.5 min; starts everything itself.</li>
+      <li><b>Wait for green</b> on the controller's Health page.</li>
+      <li><b>Get on the network:</b> Wi-Fi <span class="mono">GL-X3000-0fd</span> (or <span class="mono">-5G</span>), or plug a laptop into a free port.</li>
+      <li><b>Controller → Setup → Run self-test.</b> Fix the first red line first.</li>
+    </ol>
+    <h2>Where to look</h2>
+    <table>
+      <tr><td>Anyone: is it working?</td><td class="mono">https://status.lan</td></tr>
+      <tr><td>Controller (on site)</td><td class="mono">https://controller.lan<br>or https://10.40.0.10</td></tr>
+      <tr><td>Controller (anywhere)</td><td class="mono">https://headscale.l8s.dev/cwwk/<br>sign in with Pocket ID</td></tr>
+      <tr><td>Modem admin pages</td><td>Controller → Setup → <b>Quick links</b></td></tr>
+      <tr><td>Router admin</td><td class="mono">https://router.lan · 10.40.0.1</td></tr>
+    </table>
+    <div class="note">On site the browser warns about the certificate: expected. On a device running Tailscale, type the numbers, not the names.</div>
+    <h2>Passwords (write by hand)</h2>
+    <div>Controller (on site): <span class="write"></span></div>
+    <div style="margin-top:6px">Router (user root): <span class="write"></span></div>
+    <div style="margin-top:6px">Wi-Fi: <span class="write"></span></div>
+  </div>
+  <div>
+    <h2>What the colours mean</h2>
+    <ul style="list-style:none;padding-left:0">
+      <li><span class="dot" style="background:#0ca30c"></span><b>Green:</b> working.</li>
+      <li><span class="dot" style="background:#fab219"></span><b>Amber:</b> working, but look at it (e.g. one modem down: slower).</li>
+      <li><span class="dot" style="background:#d03b3b"></span><b>Red:</b> down. Follow the "Fix it" box on Health.</li>
+      <li><span class="dot" style="background:#898781"></span><b>Grey port:</b> nothing plugged in there (fine).</li>
+    </ul>
+    <h2>Golden rules</h2>
+    <ul>
+      <li><b>Wait 60 s</b> after any fix; it heals itself.</li>
+      <li><b>Nothing leaks:</b> if the secure link is down, nothing is sent at all.</li>
+      <li><b>Last resort:</b> reboot the CWWK (power button). Back in ~1.5 min.</li>
+      <li><b>Shade and airflow:</b> the CWWK has no fan.</li>
+      <li><b>Safe to press:</b> self-test, blink port, restart tunnel, start a container.</li>
+    </ul>
+    <h2>Which jack is which?</h2>
+    <div>Controller → Setup → <b>Blink port</b> flashes that jack's light for 15 s. The Setup page shows what is detected on every port.</div>
+  </div>
+</div>
+
+<h2>Top fixes</h2>
+<table>
+  <tr><th style="width:30%">You see</th><th>Do this</th></tr>
+  <tr><td><b>No internet at all</b></td><td>Is at least one modem plugged in with its power on? Setup shows each modem found. Modems found but no lanes: the modems have no internet, or the hub is down: call the hub admin.</td></tr>
+  <tr><td><b>One modem red / slow</b></td><td>The others carry the traffic. Power-cycle that modem (unplug 10 s). Starlink: clear sky, wait 5 min, check it via its quick link or the Starlink app.</td></tr>
+  <tr><td><b>No Wi-Fi</b></td><td>The Spitz must be on, with its <b>LAN</b> port cabled to the CWWK (any port). Give it 2 min after power-on.</td></tr>
+  <tr><td><b>Laptop on a cable gets no address</b></td><td>Wait one minute. Still nothing after 2 min: unplug it for 5 s and plug it back in.</td></tr>
+  <tr><td><b>Can't open the controller</b></td><td>Be on the site Wi-Fi or a laptop port, and try https://10.40.0.10. Off site: https://headscale.l8s.dev/cwwk/ (needs the tunnel up). Still nothing: reboot the CWWK.</td></tr>
+  <tr><td><b>"Leak guard NOT armed" or "CWWK is hot"</b></td><td>Leak guard: stop sensitive traffic, reboot the CWWK, call the kit owner if it stays red. Hot: shade it, clear its vents, nothing stacked on top.</td></tr>
+</table>
+<div class="note" style="margin-top:6px">How it all connects: Black-Relay-Site-Architecture.pdf · More help: controller → Field guide.</div>
+</body>
+</html>

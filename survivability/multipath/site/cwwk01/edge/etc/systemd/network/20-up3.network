@@ -1,0 +1,16 @@
+# Uplink up3 (CWWK nic3, untagged) = the Spitz's own network: its cellular
+# uplink. nic3 is the Wi-Fi AP port; the Spitz Wi-Fi arrives there as VLAN 40,
+# which the host bridges to the router, not to this container.
+[Match]
+Name=up3
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+
+[DHCPv4]
+RouteMetric=103
+UseDNS=no
+UseHostname=no
+SendHostname=no

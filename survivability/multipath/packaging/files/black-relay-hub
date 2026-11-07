@@ -1,0 +1,200 @@
+#!/bin/sh
+# black-relay-hub — run many field sites into one Hetzner hub.
+#
+# One glorytun instance per site (a glorytun process serves exactly one
+# peer): own key, own UDP port, own tun device, own /30 overlay.
+#
+#   black-relay-hub add <site> [--lan CIDR]...   create + start a site, print its join token
+#   black-relay-hub token <site>                 print the join token again
+#   black-relay-hub list                         all sites: port, overlay, state, live paths
+#   black-relay-hub remove <site> [-y]           stop the site and delete its key + config
+#   black-relay-hub doctor [<site>]              health check of one or every site
+#   black-relay-hub init [--public-ip IP] [--port-base N]   (optional; add runs it)
+#
+# Site N (1..250): UDP port PORT_BASE+N, hub 10.255.N.1/30, site 10.255.N.2/30,
+# tun device br-<site>. --lan routes that site's LAN subnet through its tunnel
+# on the hub (route only: forwarding/NAT stay your decision).
+# Open the port range once: ufw allow 5001:5250/udp (and the Hetzner Cloud firewall).
+set -eu
+
+ETC=/etc/black-relay
+HUB=$ETC/hub.conf
+GT=/usr/lib/black-relay/glorytun
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+die() { echo "black-relay-hub: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "run as root (sudo)"; }
+
+detect_ip() {
+	ip -4 route get 1.1.1.1 2>/dev/null |
+		awk '{for (n = 1; n < NF; n++) if ($n == "src") {print $(n + 1); exit}}'
+}
+
+load_hub() {
+	PUBLIC_IP=""; PORT_BASE=5000
+	[ -r "$HUB" ] && . "$HUB"
+	[ -n "$PUBLIC_IP" ] || PUBLIC_IP=$(detect_ip)
+	[ -n "$PUBLIC_IP" ] || die "cannot detect the public IPv4; run: black-relay-hub init --public-ip <ip>"
+}
+
+check_site() {
+	case "$1" in
+		''|*[!a-z0-9-]*|-*) die "site name '$1': use a-z, 0-9 and '-', starting with a letter or digit" ;;
+	esac
+	[ ${#1} -le 12 ] || die "site name '$1' is longer than 12 characters"
+}
+
+conf_of() { echo "$ETC/site-$1.conf"; }
+
+# Under systemd each site is a black-relay@site-<name> unit. In the container
+# image there is no systemd: br-supervise starts/stops a site when its config
+# appears/disappears, so here we only wait for (or report) its tun device.
+have_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null; }
+svc_start() {   # <site>
+	if have_systemd; then
+		systemctl enable --now "black-relay@site-$1" >/dev/null 2>&1
+		return
+	fi
+	i=0
+	while [ $i -lt 30 ]; do
+		ip link show dev "br-$1" >/dev/null 2>&1 && return 0
+		i=$((i + 1)); sleep 0.5
+	done
+	return 1
+}
+svc_stop() {    # <site>
+	have_systemd && systemctl disable --now "black-relay@site-$1" >/dev/null 2>&1 || true
+}
+svc_state() {   # <site>
+	if have_systemd; then
+		systemctl is-active "black-relay@site-$1" 2>/dev/null || true
+	elif ip link show dev "br-$1" >/dev/null 2>&1; then
+		echo active
+	else
+		echo inactive
+	fi
+}
+
+field() { sed -n "s/^$2=//p" "$1" | head -n 1 | tr -d '"'; }
+
+token_of() {
+	s=$1; c=$(conf_of "$s")
+	[ -r "$c" ] || die "no site '$s'"
+	load_hub
+	idx=$(field "$c" SITE_INDEX)
+	key=$(tr -d '\n' <"$ETC/site-$s.key")
+	printf 'BR_SITE=%s\nBR_HUB=%s\nBR_PORT=%s\nBR_TUN=10.255.%s.2/30\nBR_KEY=%s\n' \
+		"$s" "$PUBLIC_IP" "$(field "$c" PORT)" "$idx" "$key" |
+		base64 | tr -d '\n' | sed 's/^/brj1./'
+	echo
+}
+
+cmd=${1:-}; [ -n "$cmd" ] || usage; shift
+
+case "$cmd" in
+init)
+	need_root
+	ip=""; base=5000
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--public-ip) ip=$2; shift 2 ;;
+			--port-base) base=$2; shift 2 ;;
+			*) usage ;;
+		esac
+	done
+	[ -n "$ip" ] || ip=$(detect_ip)
+	install -d -m 0755 "$ETC"
+	printf '# black-relay-hub settings\nPUBLIC_IP=%s\nPORT_BASE=%s\n' "$ip" "$base" >"$HUB"
+	echo "hub: public IP $ip, site ports $((base + 1))-$((base + 250))/udp"
+	;;
+add)
+	need_root
+	site=${1:-}; [ -n "$site" ] || usage; shift
+	check_site "$site"
+	lans=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--lan) lans="${lans:+$lans }$2"; shift 2 ;;
+			*) usage ;;
+		esac
+	done
+	c=$(conf_of "$site")
+	[ -e "$c" ] && die "site '$site' exists (black-relay-hub token $site)"
+	[ -r "$HUB" ] || "$0" init >/dev/null
+	load_hub
+
+	used=$(cat "$ETC"/site-*.conf 2>/dev/null | sed -n 's/^SITE_INDEX=//p')
+	idx=1
+	while echo "$used" | grep -qx "$idx"; do idx=$((idx + 1)); done
+	[ $idx -le 250 ] || die "hub is full (250 sites)"
+
+	black-relay-keygen "$ETC/site-$site.key" >/dev/null
+	cat >"$c" <<EOF
+# written by black-relay-hub add $site
+ROLE=server
+SITE_INDEX=$idx
+DEV=br-$site
+BIND=0.0.0.0
+PORT=$((PORT_BASE + idx))
+KEYFILE=$ETC/site-$site.key
+TUN_ADDR=10.255.$idx.1/30
+PEER=10.255.$idx.2
+# site LAN subnets routed through this tunnel on the hub
+LAN_ROUTES="$lans"
+EOF
+	svc_start "$site" ||
+		die "site $site did not start (systemd: journalctl -u black-relay@site-$site; container: docker logs)"
+	echo "site $site: index $idx, UDP $((PORT_BASE + idx)), hub 10.255.$idx.1 <-> site 10.255.$idx.2${lans:+, LAN $lans}"
+	echo
+	echo "join token (contains the site key: treat it as a secret):"
+	token_of "$site"
+	echo
+	echo "on the site:  sudo black-relay-setup join <token>"
+	;;
+token)
+	need_root
+	token_of "${1:-}"
+	;;
+list)
+	load_hub
+	printf '%-12s %5s %6s  %-15s %-9s %s\n' SITE IDX PORT SITE-ADDR STATE PATHS
+	for c in "$ETC"/site-*.conf; do
+		[ -e "$c" ] || { echo "(no sites; black-relay-hub add <site>)"; break; }
+		s=${c##*/site-}; s=${s%.conf}
+		st=$(svc_state "$s")
+		np=$("$GT" path dev "br-$s" show stat 2>/dev/null | grep -c '^path' || true)
+		printf '%-12s %5s %6s  %-15s %-9s %s\n' "$s" "$(field "$c" SITE_INDEX)" \
+			"$(field "$c" PORT)" "$(field "$c" PEER)" "$st" "$np"
+	done
+	echo "hub $PUBLIC_IP"
+	;;
+doctor)
+	rc=0
+	for c in "$ETC"/site-*.conf; do
+		[ -e "$c" ] || { echo "no sites"; break; }
+		s=${c##*/site-}; s=${s%.conf}
+		[ -n "${1:-}" ] && [ "$1" != "$s" ] && continue
+		black-relay-setup doctor --name "site-$s" || rc=1
+		echo
+	done
+	exit $rc
+	;;
+remove)
+	need_root
+	site=${1:-}; [ -n "$site" ] || usage
+	check_site "$site"
+	c=$(conf_of "$site")
+	[ -e "$c" ] || die "no site '$site'"
+	if [ "${2:-}" != -y ]; then
+		printf 'Stop site %s and delete its key and config? [y/N] ' "$site"
+		read -r ans
+		case "$ans" in y|Y|yes) ;; *) echo "aborted."; exit 1 ;; esac
+	fi
+	svc_stop "$site"
+	rm -f "$c" "$ETC/site-$site.key"
+	echo "removed site $site"
+	;;
+*)
+	usage
+	;;
+esac

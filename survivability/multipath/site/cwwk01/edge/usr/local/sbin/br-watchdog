@@ -1,0 +1,25 @@
+#!/bin/sh
+# br-watchdog — data-plane watchdog for the Multithread tunnel (site end).
+# Lanes can show "running" (control messages flow) while data is wedged, e.g.
+# after a key rotation or a burst of lane reconnects. Every 10 s ping the hub's
+# overlay address THROUGH the tunnel; after 3 straight failures while the
+# tunnel service is up and has running paths, restart it (fresh keys and a new
+# sequence epoch, which also unwedges the hub side). Back off 60 s afterwards.
+HUB=${HUB:-10.255.1.1}
+fails=0
+while sleep 10; do
+	systemctl is-active -q black-relay@br0 || { fails=0; continue; }
+	if ping -n -q -c 2 -W 2 -I br0 "$HUB" >/dev/null 2>&1; then
+		fails=0; continue
+	fi
+	running=$(/usr/lib/black-relay/glorytun path dev br0 show 2>/dev/null | grep -c " running ")
+	[ "$running" -gt 0 ] || { fails=0; continue; }   # uplinks down: not a wedge
+	fails=$((fails + 1))
+	logger -t br-watchdog "hub $HUB not answering through the tunnel ($fails/3, $running paths running)"
+	if [ $fails -ge 3 ]; then
+		logger -t br-watchdog "data plane wedged: restarting black-relay@br0"
+		systemctl restart black-relay@br0
+		fails=0
+		sleep 60
+	fi
+done

@@ -1,0 +1,18 @@
+[Unit]
+Description=Black Relay dashboard on the tailnet (100.64.0.11:8088 -> br-edge 10.39.0.1:8088)
+After=tailscaled.service network-online.target
+Wants=network-online.target
+
+[Service]
+# binds the tailnet address only; restarts until tailscale has it
+ExecStart=/usr/bin/socat TCP-LISTEN:8088,bind=100.64.0.11,reuseaddr,fork TCP:10.39.0.1:8088
+Restart=always
+RestartSec=3
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

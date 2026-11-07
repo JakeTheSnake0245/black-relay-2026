@@ -1,0 +1,82 @@
+{
+  "listen": "0.0.0.0",
+  "port": 443,
+  "tls_cert": "/etc/br-controller/tls.crt",
+  "tls_key": "/etc/br-controller/tls.key",
+  "admin_hash": "<REDACTED>",
+  "proxmox": {
+    "host": "10.40.0.2",
+    "port": 8006,
+    "node": "pve",
+    "token_id": "<REDACTED>",
+    "token_secret": "<REDACTED>",
+    "cafile": "/etc/br-controller/pve-ca.pem"
+  },
+  "router": {
+    "host": "10.40.0.1",
+    "user": "root",
+    "password": "<REDACTED>",
+    "cafile": "/etc/br-controller/router.pem"
+  },
+  "edge": {
+    "host": "10.39.0.1",
+    "dash_port": 8088,
+    "key": "/root/.ssh/id_edge_ctl"
+  },
+  "required_guests": [
+    101,
+    102,
+    103
+  ],
+  "protected_guests": [
+    101,
+    102,
+    103
+  ],
+  "services": [
+    {
+      "id": "frigate",
+      "name": "Cameras",
+      "kind": "frigate",
+      "url": "",
+      "health_url": "",
+      "deployed": false,
+      "description": "Frigate NVR: camera feeds, object detection, recordings, plus additional sensors."
+    },
+    {
+      "id": "tak",
+      "name": "TAK Server",
+      "kind": "tak",
+      "url": "",
+      "health_url": "",
+      "deployed": false,
+      "description": "TAK Server admin: users, certificates, data packages, federation."
+    },
+    {
+      "id": "sensors",
+      "name": "Sensors",
+      "kind": "sensors",
+      "url": "",
+      "health_url": "",
+      "deployed": false,
+      "description": "Environmental / RF / perimeter sensors feeding the site picture."
+    }
+  ],
+  "admin_groups": [
+    "survivability"
+  ],
+  "viewer_groups": [
+    "headscale-users"
+  ],
+  "sso_proxy": "10.40.0.2",
+  "gateway_listen": "10.40.0.10",
+  "gateway_port": 8444,
+  "gateway_peer": "10.255.1.1",
+  "public_url": "https://headscale.l8s.dev/cwwk",
+  "oidc": {
+    "issuer": "https://id.l8s.dev",
+    "client_id": "a4bc6874-1bc9-41c8-b65e-206c0e836a79",
+    "client_secret": "<REDACTED>"
+  },
+  "gateway_base": "/cwwk"
+}

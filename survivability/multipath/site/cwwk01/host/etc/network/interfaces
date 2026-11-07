@@ -1,0 +1,58 @@
+auto lo
+iface lo inet loopback
+source /etc/network/interfaces.d/*
+# Site LAN 10.40.0.0/24 (internal): br-router 10.40.0.1, br-controller, this host.
+# Wi-Fi and client devices join it through br-router (Wi-Fi VLAN on the port bridge).
+auto vmbr1
+iface vmbr1 inet static
+	hwaddress 02:c3:94:33:f3:5e
+	address 10.40.0.2/24
+	gateway 10.40.0.1
+	bridge-ports none
+	bridge-stp off
+	bridge-fd 0
+# br-edge (10.39.0.1) <-> br-router (10.39.0.2) transit. Internal, no host IP.
+auto vmbr2
+iface vmbr2 inet manual
+	post-up echo 1 > /proc/sys/net/ipv6/conf/$IFACE/disable_ipv6
+	bridge-ports none
+	bridge-stp off
+	bridge-fd 0
+
+# Services network 10.41.0.0/24 behind br-router (10.41.0.1). Internal, no host IP.
+auto vmbr3
+iface vmbr3 inet manual
+	post-up echo 1 > /proc/sys/net/ipv6/conf/$IFACE/disable_ipv6
+	bridge-ports none
+	bridge-stp off
+	bridge-fd 0
+
+# Every physical port: its own untagged VLAN (a modem -> br-edge up<i>) and the
+# Wi-Fi VLAN tagged (an access point -> br-router). br-port-roles moves a port's
+# untagged VLAN to the site LAN when a client device is plugged in.
+iface nic0 inet manual
+	bridge-pvid 100
+	bridge-vids 40
+
+iface nic1 inet manual
+	bridge-pvid 101
+	bridge-vids 40
+
+iface nic2 inet manual
+	bridge-pvid 102
+	bridge-vids 40
+
+iface nic3 inet manual
+	bridge-pvid 103
+	bridge-vids 40
+
+auto vmbr10
+iface vmbr10 inet manual
+	post-up echo 1 > /proc/sys/net/ipv6/conf/$IFACE/disable_ipv6
+	bridge-ports nic0 nic1 nic2 nic3
+	bridge-stp on
+	bridge-bridgeprio 0
+	bridge-maxage 6
+	bridge-fd 4
+	bridge-vlan-aware yes
+	bridge-vids 40 100-103

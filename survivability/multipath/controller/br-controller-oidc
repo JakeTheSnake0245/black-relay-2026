@@ -1,0 +1,21 @@
+#!/bin/bash
+# Store the controller's Pocket ID OIDC client (run on the CWWK host as root, interactively:
+#   ssh -t root@100.64.0.11 br-controller-oidc). Prompts silently; never prints the secret.
+# Pocket ID client: callback https://headscale.l8s.dev/cwwk/oidc/callback, PKCE on, not public,
+# allowed groups survivability + headscale-users.
+set -euo pipefail
+[ -t 0 ] || { echo "run this in an interactive terminal (ssh -t)"; exit 1; }
+read -rp  "Pocket ID client ID: " CID
+read -rsp "Pocket ID client secret (input hidden): " CSEC; echo
+[[ "$CID" =~ ^[A-Za-z0-9._-]{8,128}$ ]] || { echo "client ID looks wrong"; exit 1; }
+[ ${#CSEC} -ge 16 ] || { echo "client secret looks too short"; exit 1; }
+printf '%s\n%s\n' "$CID" "$CSEC" | pct exec 103 -- python3 -c '
+import json, os, sys
+cid, sec = sys.stdin.read().split("\n")[:2]
+p = "/etc/br-controller/config.json"; c = json.load(open(p))
+c["oidc"] = {"issuer": "https://id.l8s.dev", "client_id": cid.strip(), "client_secret": sec.strip()}
+t = p + ".tmp"; fd = os.open(t, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, json.dumps(c, indent=2).encode()); os.close(fd); os.replace(t, p)'
+unset CSEC
+pct exec 103 -- systemctl restart br-controller
+echo "saved; controller restarted. Sign in at https://headscale.l8s.dev/cwwk/"

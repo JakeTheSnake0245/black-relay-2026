@@ -1,0 +1,12 @@
+[Unit]
+Description=Black Relay edge: LAN egress via tunnel only (fail closed)
+After=network-pre.target
+Before=network.target black-relay@br0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/br-edge-routes
+
+[Install]
+WantedBy=multi-user.target

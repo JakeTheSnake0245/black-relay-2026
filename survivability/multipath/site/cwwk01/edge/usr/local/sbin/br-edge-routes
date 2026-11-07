@@ -1,0 +1,23 @@
+#!/bin/sh
+# br-edge-routes — egress policy for the Black Relay multipath box.
+# All site ranges sit in 10.32.0.0/11: router transit 10.39.0.0/30, LAN
+# 10.40.0.0/24, services 10.41.0.0/24. Site-to-site stays local (main); every
+# other packet from the site leaves ONLY through the bonded tunnel br0 (table
+# 200). With br0 down, table 200 holds only an unreachable default: fail
+# closed, never a raw uplink. LAN/services routes point at br-router.
+SITE=10.32.0.0/11
+T=200
+for p in 900 901 902 903 904 905; do while ip rule del pref $p 2>/dev/null; do :; done; done
+ip rule add pref 900 from $SITE to $SITE lookup main
+ip rule add pref 901 from $SITE lookup $T
+ip route replace unreachable default metric 4096 table $T
+if ip link show dev tr0 >/dev/null 2>&1; then
+	ip route replace 10.41.0.0/24 via 10.39.0.2 dev tr0
+	# while the old LAN leg (lan0) still holds 10.40.0.1, LAN stays connected
+	ip -4 addr show dev lan0 2>/dev/null | grep -q "10.40.0.1/" || ip route replace 10.40.0.0/24 via 10.39.0.2 dev tr0
+fi
+if ip link show dev br0 2>/dev/null | grep -q ",UP"; then
+	ip route replace default dev br0 table $T
+	ip route replace default dev br0 metric 10
+fi
+exit 0

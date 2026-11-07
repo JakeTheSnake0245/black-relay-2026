@@ -1,0 +1,234 @@
+#!/bin/sh
+# br-supervise — runs Black Relay tunnels inside the container (no systemd).
+#
+#   br-supervise          (entrypoint, under tini) run every /etc/black-relay/*.conf
+#   br-supervise health   exit 0 if every configured tunnel's device is up
+#
+# Each <name>.conf is one tunnel, handled by the same helper the .deb uses
+# (/usr/lib/black-relay/tunnel check|run|post|down). Configs that appear later
+# (`black-relay-hub add <site>` via docker exec) start within ~2 s; a removed
+# config stops its tunnel. A tunnel that dies restarts after a short backoff.
+#
+# Environment:
+#   BR_PUBLIC_IP   hub only: public IPv4 written into join tokens (first run)
+#   BR_PORT_BASE   hub only: site N listens on BR_PORT_BASE+N/udp (default 5000)
+#   BR_NAT=1       masquerade tunnel traffic leaving the egress interface
+#   BR_FORWARD     which forwarding the container allows (inside its own netns):
+#                    egress (default)  tunnels -> public internet via the default
+#                                      route only: never tunnel <-> tunnel, and
+#                                      never to private/CGNAT/link-local ranges
+#                                      (the container's own Docker networks)
+#                    none              no forwarding at all (overlay links only)
+#   BR_WS_LISTEN   hub only, e.g. 0.0.0.0:8080: also run a wstunnel server so
+#                  sites reach their UDP site ports through HTTPS (a reverse
+#                  proxy terminates TLS and forwards the WebSocket upgrade here)
+#   BR_WS_PREFIX   the secret upgrade-path prefix the server accepts (required
+#                  with BR_WS_LISTEN); clients use the same value
+set -eu
+
+ETC=/etc/black-relay
+T=/usr/lib/black-relay/tunnel
+RUN=/run/br-supervise
+DEFAULTS=/usr/share/black-relay/defaults
+
+log() { echo "br-supervise: $*" >&2; }
+
+tunnels() {
+	for c in "$ETC"/*.conf; do
+		[ -e "$c" ] || continue
+		n=${c##*/}; n=${n%.conf}
+		[ "$n" = hub ] && continue
+		echo "$n"
+	done
+}
+
+dev_of() { sed -n 's/^DEV=//p' "$ETC/$1.conf" | head -n 1 | tr -d '"' | awk '{print $1}'; }
+
+if [ "${1:-}" = health ]; then
+	rc=0
+	for n in $(tunnels); do
+		d=$(dev_of "$n"); [ -n "$d" ] || d=br-$n
+		ip link show dev "$d" >/dev/null 2>&1 || { echo "down: $n ($d)"; rc=1; }
+	done
+	exit $rc
+fi
+
+mkdir -p "$ETC" "$RUN"
+chmod 700 "$ETC"
+[ -e "$ETC/black-relay.env" ] || cp "$DEFAULTS/black-relay.env" "$ETC/black-relay.env"
+if [ -n "${BR_PUBLIC_IP:-}" ] && [ ! -e "$ETC/hub.conf" ]; then
+	black-relay-hub init --public-ip "$BR_PUBLIC_IP" --port-base "${BR_PORT_BASE:-5000}"
+fi
+
+# Forwarding + NAT live in the container's own network namespace; the host's
+# kernel and firewall are not touched. Deny by default. The egress interface
+# is the one holding the default route (with several Docker networks attached,
+# eth0 is not necessarily it).
+EGRESS=$(ip -4 route show default | awk '{for (n = 1; n < NF; n++) if ($n == "dev") {print $(n + 1); exit}}')
+[ -n "$EGRESS" ] || EGRESS=eth0
+PRIVATE='{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8 }'
+case "${BR_FORWARD:-egress}" in
+	egress) fwd="iifname \"br*\" oifname \"$EGRESS\" ip daddr != $PRIVATE accept" ;;
+	none) fwd='' ;;
+	*) log "BR_FORWARD must be egress or none"; exit 1 ;;
+esac
+nat=''
+[ "${BR_NAT:-1}" = 1 ] && nat="chain br_postrouting { type nat hook postrouting priority srcnat; policy accept; oifname \"$EGRESS\" masquerade; }"
+nft delete table inet br 2>/dev/null || true
+nft -f - <<EOF
+table inet br {
+	chain br_input {
+		type filter hook input priority filter; policy accept;
+		# identity snapshot: sites only, through their tunnels
+		tcp dport 8099 iifname != "br*" drop
+	}
+	chain br_forward {
+		type filter hook forward priority filter; policy drop;
+		ct state invalid drop
+		ct state { established, related } accept
+		$fwd
+	}
+	$nat
+}
+EOF
+log "forwarding: ${BR_FORWARD:-egress} via $EGRESS, nat: ${BR_NAT:-1}"
+
+# wstunnel server (HTTPS transport for sites). It may only forward to this
+# hub's own site ports on loopback, and only for the secret path prefix.
+ws_start() {
+	[ -n "${BR_WS_LISTEN:-}" ] || return 0
+	[ -n "${BR_WS_PREFIX:-}" ] || { log "BR_WS_LISTEN needs BR_WS_PREFIX"; return 0; }
+	pid=$(cat "$RUN/wstunnel.ws" 2>/dev/null || true)
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+	. "$ETC/hub.conf" 2>/dev/null || true
+	base=${PORT_BASE:-${BR_PORT_BASE:-5000}}
+	# the prefix is a secret: environment, not argv (argv shows up in ps/top)
+	export WSTUNNEL_RESTRICT_HTTP_UPGRADE_PATH_PREFIX="$BR_WS_PREFIX"
+	set --
+	i=1
+	while [ $i -le "${BR_WS_SITES:-10}" ]; do
+		set -- "$@" --restrict-to "127.0.0.1:$((base + i))"
+		i=$((i + 1))
+	done
+	wstunnel server --log-lvl "${BR_WS_LOG:-INFO}" "$@" "ws://$BR_WS_LISTEN" &
+	echo $! >"$RUN/wstunnel.ws"   # not *.pid: those are tunnels
+	log "wstunnel server on $BR_WS_LISTEN -> 127.0.0.1:$((base + 1))-$((base + ${BR_WS_SITES:-10}))/udp (pid $!)"
+}
+
+start() {
+	n=$1
+	if ! "$T" check "$n" 2>"$RUN/$n.err"; then
+		# log a bad config once, not every loop
+		cmp -s "$RUN/$n.err" "$RUN/$n.lasterr" 2>/dev/null || { cat "$RUN/$n.err" >&2; cp "$RUN/$n.err" "$RUN/$n.lasterr"; }
+		return 0
+	fi
+	rm -f "$RUN/$n.lasterr"
+	"$T" run "$n" &
+	pid=$!
+	echo "$pid" >"$RUN/$n.pid"
+	date +%s >"$RUN/$n.started"
+	( "$T" post "$n" >&2 || { log "$n: post failed, restarting"; kill "$pid" 2>/dev/null; } ) &
+	log "$n: started (pid $pid)"
+}
+
+stop() {
+	n=$1
+	pid=$(cat "$RUN/$n.pid" 2>/dev/null || true)
+	[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+	[ -e "$ETC/$n.conf" ] && "$T" down "$n" 2>/dev/null || true
+	rm -f "$RUN/$n.pid" "$RUN/$n.started"
+	log "$n: stopped"
+}
+
+# Data-plane watchdog (per site): lanes can be "running" while data is wedged.
+# Every ~10 s ping the site's overlay address through its tunnel; after 3
+# straight failures while that site has running paths, restart its glorytun
+# (fresh keys, new receive state). Sites with no running paths are skipped:
+# that is an outage, not a wedge.
+wd_check() {
+	n=$1
+	peer=$(sed -n 's/^PEER=//p' "$ETC/$n.conf" | head -n 1 | tr -d '"')
+	[ -n "$peer" ] || return 0
+	d=$(dev_of "$n"); [ -n "$d" ] || d=br-$n
+	if ping -c 1 -W 2 -I "$d" "$peer" >/dev/null 2>&1; then
+		echo 0 >"$RUN/$n.wd"; return 0
+	fi
+	running=$(/usr/lib/black-relay/glorytun path dev "$d" show 2>/dev/null | grep -c " running ")
+	[ "$running" -gt 0 ] || { echo 0 >"$RUN/$n.wd"; return 0; }
+	f=$(( $(cat "$RUN/$n.wd" 2>/dev/null || echo 0) + 1 ))
+	echo "$f" >"$RUN/$n.wd"
+	log "$n: site $peer not answering through the tunnel ($f/3, $running paths running)"
+	if [ "$f" -ge 3 ]; then
+		log "$n: data plane wedged: restarting its glorytun"
+		kill "$(cat "$RUN/$n.pid" 2>/dev/null)" 2>/dev/null || true
+		echo -6 >"$RUN/$n.wd"   # ~60 s grace before counting again
+	fi
+}
+
+shutdown() {
+	kill "$(cat "$RUN/wstunnel.ws" 2>/dev/null)" 2>/dev/null || true
+	kill "$(cat "$RUN/identity.ws" 2>/dev/null)" 2>/dev/null || true
+	for p in "$RUN"/*.pid; do
+		[ -e "$p" ] || continue
+		n=${p##*/}; stop "${n%.pid}"
+	done
+	exit 0
+}
+trap shutdown TERM INT
+
+# Identity/policy snapshot for sites (written by br-identity-export on the
+# host), served read-only on :8099, reachable only through site tunnels.
+id_start() {
+	[ -e "$ETC/identity-snapshot.json" ] || return 0
+	pid=$(cat "$RUN/identity.ws" 2>/dev/null || true)
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+	python3 - "$ETC/identity-snapshot.json" <<'PY' &
+import http.server, sys
+F = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path != "/identity.json":
+            self.send_response(404); self.end_headers(); return
+        try: b = open(F, "rb").read()
+        except OSError: self.send_response(503); self.end_headers(); return
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+http.server.ThreadingHTTPServer(("0.0.0.0", 8099), H).serve_forever()
+PY
+	echo $! >"$RUN/identity.ws"
+	log "identity snapshot served on :8099 (site tunnels only)"
+}
+
+wd_tick=0
+while :; do
+	id_start
+	now=$(date +%s)
+	ws_start
+	wd_tick=$((wd_tick + 1))
+	if [ "$wd_tick" -ge 5 ]; then
+		wd_tick=0
+		for n in $(tunnels); do
+			[ -e "$RUN/$n.pid" ] && wd_check "$n"
+		done
+	fi
+	for n in $(tunnels); do
+		pid=$(cat "$RUN/$n.pid" 2>/dev/null || true)
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then continue; fi
+		if [ -n "$pid" ]; then
+			wait "$pid" 2>/dev/null || true
+			log "$n: exited"
+			"$T" down "$n" 2>/dev/null || true
+			rm -f "$RUN/$n.pid"
+		fi
+		last=$(cat "$RUN/$n.started" 2>/dev/null || echo 0)
+		[ $((now - last)) -ge 3 ] && start "$n"
+	done
+	for p in "$RUN"/*.pid; do
+		[ -e "$p" ] || continue
+		n=${p##*/}; n=${n%.pid}
+		[ -e "$ETC/$n.conf" ] || stop "$n"
+	done
+	sleep 2 &
+	wait $! || true
+done

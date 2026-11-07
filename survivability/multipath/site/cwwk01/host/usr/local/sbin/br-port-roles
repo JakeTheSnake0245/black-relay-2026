@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""br-port-roles: what is on each CWWK port? Decide by watching DHCP.
+
+Every physical port sits on one VLAN-aware bridge (see /etc/network/interfaces):
+its own untagged VLAN (bridge-pvid, e.g. 100-103) carries a modem to its own
+br-edge uplink, and the Wi-Fi VLAN (bridge-vids, e.g. 40) is allowed tagged on
+every port, so an access point that tags its Wi-Fi (the Spitz) works anywhere.
+Nothing about ports is fixed here; it is all read from the bridge config.
+
+Per port:
+  modem   something answers DHCP from the wire: the port's untagged VLAN stays
+          its own uplink VLAN (br-edge picks the modem up and recognises it).
+  client  only as a fallback: 45 s after the cable went in, br-edge still has
+          no address from this port, no DHCP server has answered on it, and a
+          device keeps asking for an address (DHCP discover/request, untagged).
+          Then the port's untagged VLAN becomes the site LAN (the Wi-Fi VLAN)
+          and the device gets a 10.40.0.x lease from the site router.
+          A port where br-edge holds an address is a modem, full stop (a
+          modem's own Wi-Fi clients also ask for addresses on its LAN).
+  wifi    tagged Wi-Fi-VLAN frames from the wire: an access point is here.
+
+In client mode, DHCP server packets arriving on that port are dropped (nft
+bridge table br_port_roles), so a modem plugged in there can never hand out
+its addresses on the site LAN; seeing one returns the port to modem mode at
+once, as does unplugging the cable. Modem mode is the default and what the
+host boots with, so the box works even if this service never starts.
+State: /run/br-port-roles.json (br-hostinfo -> controller).
+"""
+import json
+import os
+import re
+import select
+import socket
+import struct
+import subprocess
+import time
+
+INTERFACES = "/etc/network/interfaces"
+STATE = "/run/br-port-roles.json"
+LOCAL_OUI = "bc:24:11"     # Proxmox-generated MACs: our own containers, never "a device"
+DECIDE = 8                 # s of unanswered untagged client DHCP before switching
+SETTLE = 45                # s after the cable goes in before a port may become a client port
+EDGE_CT = os.environ.get("BR_EDGE_CT", "101")
+WIFI_FRESH = 120           # s a tagged Wi-Fi frame keeps the port marked "wifi"
+ETH_P_ALL = 0x0003
+SOL_PACKET, PACKET_AUXDATA = 263, 8
+TP_STATUS_VLAN_VALID = 1 << 4
+PACKET_OUTGOING = 4
+
+
+def log(msg):
+    subprocess.run(["logger", "-t", "br-port-roles", msg])
+
+
+def run(*a):
+    return subprocess.run(a, capture_output=True, text=True)
+
+
+def layout():
+    """{port: modem_pvid} and the Wi-Fi VLAN, from the bridge config."""
+    txt = open(INTERFACES).read()
+    ports, wifi = {}, None
+    for m in re.finditer(r"^iface (\S+) inet manual\n((?:[ \t]+.*\n?)*)", txt, re.M):
+        name, body = m.group(1), m.group(2)
+        pv = re.search(r"bridge-pvid\s+(\d+)", body)
+        vids = re.search(r"bridge-vids\s+([\d ]+)", body)
+        if pv and os.path.exists(f"/sys/class/net/{name}/device"):
+            ports[name] = int(pv.group(1))
+            if vids and wifi is None:
+                wifi = int(vids.group(1).split()[0])
+    return ports, wifi
+
+
+def edge_leases():
+    """Ports where br-edge currently holds an address (a modem answered there)."""
+    try:
+        out = subprocess.run(["pct", "exec", EDGE_CT, "--", "cat", "/run/black-relay/uplinks.json"],
+                             capture_output=True, text=True, timeout=8).stdout
+        return {u["port"] for u in json.loads(out)["uplinks"] if u.get("ip")}
+    except Exception:
+        return None          # unknown: never switch anything while unsure
+
+
+def carrier(nic):
+    try:
+        return open(f"/sys/class/net/{nic}/carrier").read().strip() == "1"
+    except OSError:
+        return False
+
+
+def set_mode(nic, mode, pvid, wifi):
+    if mode == "client":
+        run("bridge", "vlan", "add", "dev", nic, "vid", str(wifi), "pvid", "untagged")
+        run("bridge", "vlan", "del", "dev", nic, "vid", str(pvid))
+    else:
+        run("bridge", "vlan", "add", "dev", nic, "vid", str(pvid), "pvid", "untagged")
+        run("bridge", "vlan", "del", "dev", nic, "vid", str(wifi))
+        run("bridge", "vlan", "add", "dev", nic, "vid", str(wifi))   # Wi-Fi stays allowed, tagged
+
+
+def guard(clients):
+    """Drop DHCP server packets arriving on client-mode ports."""
+    run("nft", "delete", "table", "bridge", "br_port_roles")
+    if not clients:
+        return
+    rules = "".join(f'\t\tiifname "{n}" udp sport 67 drop\n' for n in sorted(clients))
+    p = subprocess.run(["nft", "-f", "-"], text=True, capture_output=True, input=(
+        "table bridge br_port_roles {\n\tchain forward {\n"
+        "\t\ttype filter hook forward priority filter; policy accept;\n"
+        f"{rules}\t}}\n}}\n"))
+    if p.returncode:
+        log(f"guard failed: {p.stderr.strip()[:120]}")
+
+
+def classify(frame, tagged):
+    """(kind, src_mac, tagged) for one frame: kind 'server', 'client' or None."""
+    if len(frame) < 14:
+        return None, None, tagged
+    src = ":".join(f"{b:02x}" for b in frame[6:12])
+    et, off = struct.unpack("!H", frame[12:14])[0], 14
+    if et == 0x8100 and len(frame) >= 18:           # tag left in the frame (no offload)
+        tagged, (et,), off = True, struct.unpack("!H", frame[16:18]), 18
+    if et != 0x0800 or len(frame) < off + 28 or frame[off + 9] != 17:
+        return None, src, tagged
+    ihl = (frame[off] & 0x0F) * 4
+    sport, dport = struct.unpack("!HH", frame[off + ihl:off + ihl + 4])
+    if (sport, dport) == (67, 68):
+        return "server", src, tagged
+    if (sport, dport) == (68, 67):
+        return "client", src, tagged
+    return None, src, tagged
+
+
+def main():
+    ports, wifi = layout()
+    if not ports or wifi is None:
+        log("no ports with bridge-pvid / bridge-vids in /etc/network/interfaces: nothing to do")
+        while True:
+            time.sleep(3600)
+    socks = {}
+    for nic in ports:
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+        s.setsockopt(SOL_PACKET, PACKET_AUXDATA, 1)
+        s.bind((nic, 0))
+        socks[s.fileno()] = (s, nic)
+    st = {n: {"mode": "modem", "server": 0.0, "since": None, "client_mac": None, "wifi": 0.0,
+              "link_since": time.time()} for n in ports}
+    leased, leased_at = None, 0.0
+    for n, pv in ports.items():          # start clean: every port in modem mode
+        set_mode(n, "modem", pv, wifi)
+    guard(set())
+    log(f"watching {', '.join(sorted(ports))} (Wi-Fi VLAN {wifi})")
+    last_write = 0.0
+    while True:
+        r, _, _ = select.select(list(socks), [], [], 1.0)
+        now = time.time()
+        if now - leased_at > 10:
+            leased, leased_at = edge_leases(), now
+        for fd in r:
+            s, nic = socks[fd]
+            frame, anc, _, addr = s.recvmsg(2048, socket.CMSG_SPACE(20))
+            if addr[2] == PACKET_OUTGOING:
+                continue
+            tagged = False
+            for lvl, typ, data in anc:
+                if lvl == SOL_PACKET and typ == PACKET_AUXDATA and len(data) >= 20:
+                    status = struct.unpack("I", data[:4])[0]
+                    tagged = bool(status & TP_STATUS_VLAN_VALID)
+            kind, src, tagged = classify(frame, tagged)
+            if not src or src.startswith(LOCAL_OUI):
+                continue
+            p = st[nic]
+            if tagged:
+                p["wifi"] = now          # an access point (Wi-Fi VLAN) is on this port
+                continue
+            if kind == "server":
+                p["server"] = now
+                if p["mode"] == "client":
+                    set_mode(nic, "modem", ports[nic], wifi)
+                    p.update(mode="modem", since=None, client_mac=None)
+                    guard({n for n, q in st.items() if q["mode"] == "client"})
+                    log(f"{nic}: a DHCP server appeared (a modem): back to modem mode")
+                    last_write = 0
+            elif kind == "client" and p["mode"] == "modem" and p["since"] is None:
+                p.update(since=now, client_mac=src)
+        for nic, p in st.items():
+            if not carrier(nic):
+                p["link_since"] = now
+                if p["mode"] == "client":
+                    set_mode(nic, "modem", ports[nic], wifi)
+                    guard({n for n, q in st.items() if q["mode"] == "client" and n != nic})
+                    log(f"{nic}: cable unplugged: back to modem mode")
+                    last_write = 0
+                p.update(mode="modem", since=None, client_mac=None, wifi=0.0)
+                continue
+            if p["mode"] == "modem" and p["since"]:
+                if leased is None or nic in leased or p["server"] >= p["link_since"]:
+                    p.update(since=None, client_mac=None)       # a modem is (or was) answering: uplink
+                elif now - p["link_since"] >= SETTLE and now - p["since"] >= DECIDE:
+                    p["mode"] = "client"
+                    guard({n for n, q in st.items() if q["mode"] == "client"})
+                    set_mode(nic, "client", ports[nic], wifi)
+                    log(f"{nic}: client device {p['client_mac']} and no modem: joined the site LAN")
+                    last_write = 0
+        if now - last_write > 5:
+            out = {n: {"mode": p["mode"], "client_mac": p["client_mac"] if p["mode"] == "client" else None,
+                       "wifi": now - p["wifi"] < WIFI_FRESH} for n, p in st.items()}
+            tmp = STATE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(out, f)
+            os.replace(tmp, STATE)
+            last_write = now
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+# pveum role BlackRelayController
+BlackRelayController Datastore.Audit,Sys.Audit,VM.Audit,VM.PowerMgmt
+# API tokens (ids only; secrets in /root/black-relay/pve-token.json)
+br-controller@pve!ui privsep=1
+# ACL
+/ br-controller@pve BlackRelayController
+/ br-controller@pve!ui BlackRelayController

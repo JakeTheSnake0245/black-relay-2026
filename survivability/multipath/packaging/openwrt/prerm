@@ -1,0 +1,6 @@
+#!/bin/sh
+# Put back any stock glorytun-udp black-relay-switch replaced before the
+# wrapper disappears.
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+/usr/sbin/black-relay-switch stock --all -y || true
+exit 0

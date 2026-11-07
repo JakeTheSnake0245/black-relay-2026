@@ -1,0 +1,11 @@
+[Unit]
+Description=Black Relay data-plane watchdog (restart tunnel if data wedges)
+After=black-relay@br0.service
+
+[Service]
+ExecStart=/usr/local/sbin/br-watchdog
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

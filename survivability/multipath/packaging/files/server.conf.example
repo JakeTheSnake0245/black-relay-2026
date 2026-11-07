@@ -1,0 +1,17 @@
+# /etc/black-relay/<name>.conf — standalone tunnel, SERVER end (Hetzner side).
+# Copy to /etc/black-relay/br0.conf and start black-relay@br0.
+#
+# The server is passive: it binds one UDP port and learns each client path
+# from the packets that arrive on it (no per-path config here). The UDP
+# port must be reachable from all three site uplinks. This package changes no
+# firewall rules; open PORT yourself.
+
+ROLE=server
+DEV=br0                         # tun device name, max 15 chars
+BIND=0.0.0.0                    # local address to listen on
+PORT=5000                       # UDP
+KEYFILE=/etc/black-relay/br0.key
+TUN_ADDR=10.255.0.2/30          # this end's overlay address
+
+# Per-tunnel overrides of /etc/black-relay/black-relay.env, if needed:
+#GT_RESEQ_MS=80

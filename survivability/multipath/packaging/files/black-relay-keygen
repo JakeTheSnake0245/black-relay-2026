@@ -1,0 +1,10 @@
+#!/bin/sh
+# black-relay-keygen [FILE] — write a new tunnel key (mode 600).
+# Default FILE: /etc/black-relay/tunnel.key. Run on ONE end only, then copy
+# the same file to the other end: both ends share one key.
+set -eu
+KEY=${1:-/etc/black-relay/tunnel.key}
+[ -e "$KEY" ] && { echo "black-relay-keygen: $KEY exists; not overwriting" >&2; exit 1; }
+umask 077
+/usr/lib/black-relay/glorytun keygen > "$KEY"
+echo "wrote $KEY"

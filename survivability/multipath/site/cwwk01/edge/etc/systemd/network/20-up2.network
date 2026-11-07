@@ -1,0 +1,16 @@
+# Uplink up2 (CWWK nic2): any modem (ports nic0-nic2 are interchangeable;
+# br-uplinks recognises the modem and sets its caps). Kept enabled: the
+# tunnel probes it every 200 ms and it joins the bond once it has internet.
+[Match]
+Name=up2
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+
+[DHCPv4]
+RouteMetric=102
+UseDNS=no
+UseHostname=no
+SendHostname=no

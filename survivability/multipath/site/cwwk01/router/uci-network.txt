@@ -1,0 +1,39 @@
+package network
+
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+config globals 'globals'
+	option dhcp_default_duid '00049af76a2cd4d6492abef2f7a8b5b7cdef'
+
+config device 'br_lan'
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'eth0'
+	list ports 'eth4'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '10.40.0.1'
+	option netmask '255.255.255.0'
+	option ipv6 '0'
+
+config interface 'wan'
+	option device 'eth1'
+	option proto 'static'
+	option ipaddr '10.39.0.2'
+	option netmask '255.255.255.252'
+	option gateway '10.39.0.1'
+	option ipv6 '0'
+
+config interface 'svc'
+	option device 'eth2'
+	option proto 'static'
+	option ipaddr '10.41.0.1'
+	option netmask '255.255.255.0'
+	option ipv6 '0'
+

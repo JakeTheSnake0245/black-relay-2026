@@ -1,0 +1,12 @@
+#!/bin/sh
+# On removal: stop standalone tunnels and put back any stock glorytun binary
+# black-relay-switch replaced, so OMR is never left pointing at a missing
+# wrapper. Upgrades leave everything alone.
+set -e
+if [ "$1" = remove ]; then
+	if [ -d /run/systemd/system ]; then
+		systemctl stop 'black-relay@*' >/dev/null 2>&1 || true
+	fi
+	/usr/sbin/black-relay-switch stock --all -y || true
+fi
+exit 0

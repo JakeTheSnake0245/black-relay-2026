@@ -1,0 +1,25 @@
+[Unit]
+Description=Black Relay bonding dashboard (read-only, LAN)
+After=network-online.target black-relay@br0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/sbin/br-dash
+Restart=always
+RestartSec=2
+# read-only view; needs root only to query the glorytun control socket and
+# bind ping/curl to the tunnel device
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

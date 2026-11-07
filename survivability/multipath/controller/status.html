@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network Status</title>
+<style>
+:root { color-scheme: dark; --page:#0d0d0d; --surface:#1a1a19; --ink:#f0efec; --ink-2:#c3c2b7; --muted:#898781; --ring:rgba(255,255,255,.10);
+  --good:#0ca30c; --warning:#fab219; --critical:#d03b3b; }
+@media (prefers-color-scheme: light) { :root { color-scheme: light; --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink-2:#52514e; --ring:rgba(11,11,11,.10); } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 560px; margin: 0 auto; padding: 28px 16px 40px; }
+.card { background: var(--surface); border-radius: 16px; box-shadow: inset 0 0 0 1px var(--ring); padding: 22px; margin-bottom: 14px; }
+.big { display: flex; align-items: center; gap: 16px; }
+.big svg { width: 56px; height: 56px; flex: none; }
+.big h1 { margin: 0; font-size: 28px; letter-spacing: -.02em; }
+.big p { margin: 2px 0 0; color: var(--ink-2); }
+ul { list-style: none; margin: 0; padding: 0; }
+li { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--ring); }
+li:last-child { border-bottom: 0; }
+li svg { width: 20px; height: 20px; flex: none; }
+h2 { font-size: 14px; color: var(--ink-2); margin: 0 0 8px; font-weight: 600; }
+.help li { display: list-item; list-style: decimal; margin-left: 20px; border: 0; padding: 4px 0; }
+.help { padding-left: 0; }
+.muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card big" id="hero"><div><h1>Checking…</h1></div></div>
+  <div class="card"><h2>Connections</h2><ul id="list"></ul></div>
+  <div class="card" id="tips"><h2>If something isn't working</h2>
+    <ol class="help">
+      <li>Wait one minute: the network repairs itself when a link drops.</li>
+      <li>Turn your device's Wi-Fi off and on again, or re-plug its cable.</li>
+      <li>Still nothing? Tell your site operator and show them this page.</li>
+    </ol>
+    <p class="muted">Your traffic is always encrypted. If the secure link is down, nothing is sent at all.</p>
+  </div>
+  <p class="muted" id="t"></p>
+</main>
+<script>
+"use strict";
+const I = {
+  good: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="var(--good)"/><path d="M4.6 8.2l2.2 2.2 4.6-4.8" stroke="#fff" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  warning: '<svg viewBox="0 0 16 16"><path d="M8 1.5l7 12.5H1z" fill="var(--warning)"/><path d="M8 6v3.6" stroke="#0b0b0b" stroke-width="1.8" stroke-linecap="round"/><circle cx="8" cy="11.8" r="1" fill="#0b0b0b"/></svg>',
+  critical: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="var(--critical)"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/></svg>',
+};
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+async function tick() {
+  try {
+    const s = await fetch("/api/public", { cache: "no-store" }).then((r) => r.json());
+    const up = (s.uplinks || []).filter((u) => u.ok).length, n = (s.uplinks || []).length;
+    let lvl, title, sub;
+    if (!s.internet) { lvl = "critical"; title = "Internet is down"; sub = "The site has no working link right now. It is being retried automatically."; }
+    else if (up < n) { lvl = "warning"; title = "Internet is working"; sub = `Running on ${up} of ${n} connections, so it may be slower than usual.`; }
+    else { lvl = "good"; title = "Internet is working"; sub = `All ${n} connections are up.`; }
+    document.getElementById("hero").innerHTML = I[lvl] + `<div><h1>${title}</h1><p>${esc(sub)}</p></div>`;
+    document.getElementById("list").innerHTML =
+      (s.uplinks || []).map((u) => `<li>${u.ok ? I.good : I.warning}<span>${esc(u.name)}</span><span style="margin-left:auto" class="muted">${u.ok ? "up" : "down"}</span></li>`).join("") +
+      `<li>${s.wifi ? I.good : I.warning}<span>Wi-Fi access point</span><span style="margin-left:auto" class="muted">${s.wifi ? "up" : "check"}</span></li>`;
+    document.getElementById("t").textContent = "Updated " + new Date().toLocaleTimeString() + " · refreshes every 10 s";
+  } catch (e) {
+    document.getElementById("hero").innerHTML = I.critical + "<div><h1>Can't reach the site box</h1><p>Check you are on the site Wi-Fi or plugged into the site network.</p></div>";
+  }
+}
+tick(); setInterval(tick, 10000);
+</script>
+</body>
+</html>

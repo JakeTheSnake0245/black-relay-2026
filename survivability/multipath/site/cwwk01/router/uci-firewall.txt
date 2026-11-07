@@ -1,0 +1,83 @@
+package firewall
+
+config defaults
+	option syn_flood '1'
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+
+config rule
+	option name 'Allow-DHCP-Renew'
+	option src 'wan'
+	option proto 'udp'
+	option dest_port '68'
+	option target 'ACCEPT'
+	option family 'ipv4'
+
+config rule
+	option name 'Allow-Ping'
+	option src 'wan'
+	option proto 'icmp'
+	option icmp_type 'echo-request'
+	option family 'ipv4'
+	option target 'ACCEPT'
+
+config rule
+	option name 'Allow-IGMP'
+	option src 'wan'
+	option proto 'igmp'
+	option family 'ipv4'
+	option target 'ACCEPT'
+
+config zone
+	option name 'lan'
+	list network 'lan'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+
+config zone
+	option name 'wan'
+	list network 'wan'
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	option masq '0'
+	option mtu_fix '1'
+
+config zone
+	option name 'svc'
+	list network 'svc'
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+
+config forwarding
+	option src 'lan'
+	option dest 'wan'
+
+config forwarding
+	option src 'svc'
+	option dest 'wan'
+
+config forwarding
+	option src 'lan'
+	option dest 'svc'
+
+config rule
+	option name 'svc-DHCP-DNS'
+	option src 'svc'
+	option proto 'tcp udp'
+	option dest_port '53 67 68'
+	option target 'ACCEPT'
+
+config rule 'br_remote_ctl'
+	option name 'Allow-Remote-Controller'
+	option src 'wan'
+	option src_ip '10.255.1.1'
+	option dest 'lan'
+	option dest_ip '10.40.0.10'
+	option proto 'tcp'
+	option dest_port '8444'
+	option target 'ACCEPT'
+

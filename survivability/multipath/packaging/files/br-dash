@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""br-dash: live Black Relay bonding dashboard for the site (edge) end.
+
+Python stdlib only, so it needs nothing beyond python3 and works offline.
+Read-only: it never changes tunnel state.
+
+Every second it samples:
+  - per-uplink byte/packet counters (/proc/net/dev): the real live lane mix
+  - glorytun path status / public address / RTT / rate caps / loss
+  - the tunnel device (inner traffic) counters
+  - hub reachability (ping through the tunnel, every 2 s)
+  - egress identity through the tunnel (every 60 s)
+
+Serves:  /             the dashboard page
+         /api/state    current snapshot + history (JSON)
+         /api/events   Server-Sent Events, one snapshot per second
+
+Config (optional): /etc/black-relay/dash.json
+  {"listen": "10.40.0.1", "port": 8088, "site": "cwwk01",
+   "lanes": {"up0": "ISP", "up1": "Starlink", "up2": "Spitz 4G"}}
+"""
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+GT = "/usr/lib/black-relay/glorytun"
+ETC = "/etc/black-relay"
+WEB = os.environ.get("BR_DASH_WEB", "/usr/share/black-relay/dash/index.html")
+HISTORY = 300  # seconds kept for the charts
+
+# name = tunnel config name (/etc/black-relay/<name>.conf), dev = its tun device
+CFG = {"listen": "10.40.0.1", "port": 8088, "name": "br0", "dev": "br0", "site": "", "lanes": {}}
+try:
+    with open(os.path.join(ETC, "dash.json")) as f:
+        CFG.update(json.load(f))
+except FileNotFoundError:
+    pass
+
+
+def sh(*args, timeout=3):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def read_conf(path):
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    out[k.strip()] = v.strip().strip('"')
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def uplinks_detected():
+    """What br-uplinks found in each port (site boxes with interchangeable
+    uplink ports); empty when the detector isn't installed."""
+    try:
+        with open("/run/black-relay/uplinks.json") as f:
+            return {u["if"]: u for u in json.load(f).get("uplinks", [])}
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+def tunnel_conf():
+    env = read_conf(os.path.join(ETC, "black-relay.env"))
+    env.update(read_conf(os.path.join(ETC, CFG["name"] + ".conf")))
+    lanes = []
+    for spec in env.get("UPLINKS", "").split():
+        parts = spec.split(":")
+        ifc, rate = parts[0], (parts[1] if len(parts) > 1 else "auto")
+        if rate == "auto":
+            tx = rx = None
+        elif "/" in rate:
+            tx, rx = (int(x) for x in rate.split("/", 1))
+        else:
+            tx = rx = int(rate)
+        lanes.append({"if": ifc, "cap_tx": tx, "cap_rx": rx})
+    return env, lanes
+
+
+def proc_net_dev():
+    stats = {}
+    with open("/proc/net/dev") as f:
+        for line in f.readlines()[2:]:
+            name, data = line.split(":", 1)
+            v = data.split()
+            stats[name.strip()] = (int(v[0]), int(v[1]), int(v[8]), int(v[9]))  # rxB rxP txB txP
+    return stats
+
+
+def iface_info():
+    """interface -> {addr, carrier}"""
+    info = {}
+    for line in sh("ip", "-4", "-o", "addr", "show").splitlines():
+        p = line.split()
+        info.setdefault(p[1], {})["addr"] = p[3].split("/")[0]
+    for ifc in os.listdir("/sys/class/net"):
+        try:
+            with open(f"/sys/class/net/{ifc}/carrier") as f:
+                info.setdefault(ifc, {})["carrier"] = f.read().strip() == "1"
+        except OSError:
+            info.setdefault(ifc, {})["carrier"] = False
+    return info
+
+
+def gt_table(*show):
+    rows = []
+    for line in sh(GT, "path", "dev", CFG["dev"], "show", *show).splitlines():
+        p = line.split()
+        if p and p[0] == "path":
+            rows.append(p[1:])
+    return rows
+
+
+def split_addr(a):
+    m = re.match(r"^(.*)\.(\d+)$", a)
+    return (m.group(1), m.group(2)) if m else (a, "")
+
+
+class Sampler:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.hist = deque(maxlen=HISTORY)
+        self.events = deque(maxlen=60)
+        self.snap = {}
+        self.prev = None
+        self.ping = {"ok": None, "ms": None, "fails": 0}
+        self.egress = {}
+        self.lane_state = {}
+        self.started = time.time()
+
+    def event(self, level, text):
+        self.events.appendleft({"t": time.time(), "level": level, "text": text})
+
+    def pinger(self):
+        hub = None
+        while True:
+            if not hub:
+                env, _ = tunnel_conf()
+                peer = env.get("TUN_ADDR", "").split("/")[0]
+                if peer:
+                    a = [int(x) for x in peer.split(".")]
+                    hub = f"{a[0]}.{a[1]}.{a[2]}.{a[3] - 1}"
+            out = sh("ping", "-n", "-c1", "-W1", "-I", CFG["dev"], hub or "10.255.0.1", timeout=3)
+            m = re.search(r"time=([\d.]+)", out)
+            with self.lock:
+                was = self.ping["ok"]
+                if m:
+                    self.ping = {"ok": True, "ms": float(m.group(1)), "fails": 0, "hub": hub}
+                    if was is False:
+                        self.event("good", "Hub reachable through the tunnel again")
+                else:
+                    f = self.ping["fails"] + 1
+                    self.ping = {"ok": f < 3, "ms": None, "fails": f, "hub": hub}
+                    if f == 3:
+                        self.event("critical", "Hub not answering through the tunnel")
+            time.sleep(2)
+
+    def egress_check(self):
+        while True:
+            out = sh("curl", "-s", "-m", "8", "--interface", CFG["dev"],
+                     "https://1.1.1.1/cdn-cgi/trace", timeout=10)
+            kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+            with self.lock:
+                old = self.egress.get("ip")
+                self.egress = {"ip": kv.get("ip"), "colo": kv.get("colo"), "t": time.time()}
+                if kv.get("ip") and old and kv["ip"] != old:
+                    self.event("warning", f"Egress identity changed {old} -> {kv['ip']}")
+            time.sleep(60)
+
+    def lane_health(self, lane):
+        if not lane["carrier"]:
+            return "offline", "no cable / link"
+        if not lane["addr"]:
+            return "offline", "no DHCP lease"
+        st = lane.get("status")
+        if st is None:
+            return "critical", "not in tunnel"
+        if st != "running" or not lane.get("rtt"):
+            return "serious", "no replies from hub"
+        # glorytun's loss figure is an estimate that over-reads under bursty
+        # load (measured 25-31% while ~98% of packets arrived), so only a
+        # large, sustained value marks a lane down a step.
+        loss = max(lane.get("tx_loss") or 0, lane.get("rx_loss") or 0)
+        if loss >= 50:
+            return "serious", f"~{loss:.0f}% loss (est.)"
+        if loss >= 20:
+            return "warning", f"~{loss:.0f}% loss (est.)"
+        return "good", "healthy"
+
+    def sample(self):
+        now = time.time()
+        env, lanes_cfg = tunnel_conf()
+        dev = proc_net_dev()
+        info = iface_info()
+        wss = env.get("TRANSPORT") == "wss"
+        nl = max(1, int(env.get("WSS_LANES", "1") or 1))
+        det = uplinks_detected()
+
+        # One glorytun path per uplink (udp: keyed by the uplink's address) or
+        # WSS_LANES paths per uplink (wss: local 127.0.0.1, remote 127.0.1.<k>,
+        # uplink index (k-1)//WSS_LANES). Collect per path, then fold per uplink.
+        def key(local, remote):
+            if wss:
+                m = re.match(r"^127\.0\.1\.(\d+)\.", remote)
+                return ("u", (int(m.group(1)) - 1) // nl) if m else None
+            return ("a", local)
+
+        paths = {}
+        for r in gt_table():
+            # LOCAL REMOTE STATUS PUBLIC
+            if len(r) >= 3:
+                paths.setdefault((r[0], r[1]), {}).update(
+                    status=r[2], public=split_addr(r[3])[0] if len(r) > 3 and r[3] != "unknown" and not wss else None)
+        for r in gt_table("stat"):
+            if len(r) >= 6:
+                paths.setdefault((r[0], r[1]), {}).update(
+                    tx_rate=int(r[2]), rx_rate=int(r[3]), tx_loss=float(r[4]), rx_loss=float(r[5]))
+        for r in gt_table("rtt"):
+            if len(r) >= 4:
+                paths.setdefault((r[0], r[1]), {}).update(rtt=float(r[2]) or None, rtt_var=float(r[3]))
+        groups = {}
+        for (local, remote), pv in paths.items():
+            k = key(local, remote)
+            if k:
+                groups.setdefault(k, []).append(pv)
+        by_key = {}
+        for k, pl in groups.items():
+            run = [x for x in pl if x.get("status") == "running"]
+            rtts = [x["rtt"] for x in run if x.get("rtt")]
+            agg = {
+                "status": "running" if run else (pl[0].get("status") if pl else None),
+                "public": next((x.get("public") for x in pl if x.get("public")), None),
+                "tx_rate": sum(x.get("tx_rate", 0) for x in pl),
+                "rx_rate": sum(x.get("rx_rate", 0) for x in pl),
+                "tx_loss": max((x.get("tx_loss", 0) for x in pl), default=0),
+                "rx_loss": max((x.get("rx_loss", 0) for x in pl), default=0),
+                "rtt": sum(rtts) / len(rtts) if rtts else None,
+                "rtt_var": max((x.get("rtt_var", 0) for x in run), default=0),
+                "conns": "%d/%d" % (len(run), len(pl)) if wss else None,
+            }
+            by_key[k] = agg
+
+        dt = (now - self.prev[0]) if self.prev else None
+        lanes = []
+        for i, lc in enumerate(lanes_cfg):
+            ifc = lc["if"]
+            ii = info.get(ifc, {})
+            d = det.get(ifc, {})
+            label = d.get("label") or CFG["lanes"].get(ifc) or ifc
+            if d.get("port"):
+                label = f"{label} ({d['port']})"
+            lane = {"if": ifc, "slot": i, "label": label, "port": d.get("port"), "kind": d.get("kind"),
+                    "warn": d.get("warn"),
+                    "addr": ii.get("addr"), "carrier": ii.get("carrier", False),
+                    "cap_tx": lc["cap_tx"], "cap_rx": lc["cap_rx"]}
+            if wss:
+                lane.update(by_key.get(("u", i), {}) if lane["addr"] else {})
+            else:
+                lane.update(by_key.get(("a", lane["addr"]), {}) if lane["addr"] else {})
+            cur = dev.get(ifc)
+            if dt and cur and ifc in self.prev[1]:
+                p = self.prev[1][ifc]
+                lane["rx_bps"] = max(0, (cur[0] - p[0]) * 8 / dt)
+                lane["rx_pps"] = max(0, (cur[1] - p[1]) / dt)
+                lane["tx_bps"] = max(0, (cur[2] - p[2]) * 8 / dt)
+                lane["tx_pps"] = max(0, (cur[3] - p[3]) / dt)
+            lane["health"], lane["why"] = self.lane_health(lane)
+            old = self.lane_state.get(ifc)
+            if old and old != lane["health"]:
+                lvl = lane["health"] if lane["health"] != "offline" else "warning"
+                self.event(lvl, f"{lane['label']} ({ifc}): {old} -> {lane['health']} ({lane['why']})")
+            self.lane_state[ifc] = lane["health"]
+            lanes.append(lane)
+
+        tun = {}
+        d = CFG["dev"]
+        if dt and d in dev and d in self.prev[1]:
+            c, p = dev[d], self.prev[1][d]
+            tun = {"rx_bps": max(0, (c[0] - p[0]) * 8 / dt), "tx_bps": max(0, (c[2] - p[2]) * 8 / dt),
+                   "rx_pps": max(0, (c[1] - p[1]) / dt), "tx_pps": max(0, (c[3] - p[3]) / dt)}
+        tun["up"] = d in info and bool(info.get(d, {}).get("addr"))
+
+        fail_closed = "unreachable default" in sh("ip", "route", "show", "table", "200")
+        svc = sh("systemctl", "is-active", f"black-relay@{CFG['name']}").strip()
+
+        with self.lock:
+            ping = dict(self.ping)
+            good = [l for l in lanes if l["health"] == "good"]
+            live = [l for l in lanes if l["health"] != "offline"]
+            if not tun["up"] or ping["ok"] is False or not good:
+                overall = "critical"
+            elif len(good) < len(live) or any(l["health"] in ("warning", "serious") for l in lanes):
+                overall = "warning"
+            else:
+                overall = "good"
+            snap = {
+                "t": now, "site": CFG["site"] or env.get("DEV", ""), "overall": overall,
+                "service": svc, "fail_closed": fail_closed, "tunnel": tun, "ping": ping,
+                "egress": dict(self.egress), "server": env.get("SERVER"), "port": env.get("PORT"),
+                "tun_addr": env.get("TUN_ADDR"),
+                "knobs": {k: env.get(k) for k in ("GT_SCHED", "GT_RESEQ", "GT_RESEQ_MS", "GT_FEC", "GT_HP", "TRANSPORT", "WSS_LANES")},
+                "lanes": lanes, "uptime": now - self.started,
+                "uplinks": list(det.values()),
+            }
+            self.snap = snap
+            self.hist.append({
+                "t": round(now, 2),
+                "tx": [round(l.get("tx_bps", 0)) for l in lanes],
+                "rx": [round(l.get("rx_bps", 0)) for l in lanes],
+                "rtt": [l.get("rtt") for l in lanes],
+                "tun": [round(tun.get("tx_bps", 0)), round(tun.get("rx_bps", 0))],
+                "hub": ping.get("ms"),
+            })
+        self.prev = (now, dev)
+
+    def run(self):
+        threading.Thread(target=self.pinger, daemon=True).start()
+        threading.Thread(target=self.egress_check, daemon=True).start()
+        while True:
+            t0 = time.time()
+            try:
+                self.sample()
+            except Exception as e:  # keep the dashboard alive on a bad sample
+                with self.lock:
+                    self.event("warning", f"sampler: {e}")
+            time.sleep(max(0.1, 1 - (time.time() - t0)))
+
+    def state(self, full):
+        with self.lock:
+            out = dict(self.snap)
+            out["events"] = list(self.events)[:30]
+            out["point"] = self.hist[-1] if self.hist else None
+            if full:
+                out["history"] = list(self.hist)
+            return out
+
+
+S = Sampler()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "br-dash"
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass
+
+    def head(self, code, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            try:
+                with open(WEB, "rb") as f:
+                    body = f.read()
+            except OSError:
+                body = b"dashboard page missing"
+            self.head(200, "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/state":
+            body = json.dumps(S.state(True)).encode()
+            self.head(200, "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/events":
+            self.head(200, "text/event-stream")
+            self.end_headers()
+            try:
+                while True:
+                    self.wfile.write(b"data: " + json.dumps(S.state(False)).encode() + b"\n\n")
+                    self.wfile.flush()
+                    time.sleep(1)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+        else:
+            self.head(404, "text/plain")
+            self.end_headers()
+
+
+if __name__ == "__main__":
+    threading.Thread(target=S.run, daemon=True).start()
+    srv = ThreadingHTTPServer((CFG["listen"], int(CFG["port"])), Handler)
+    srv.daemon_threads = True
+    srv.serve_forever()

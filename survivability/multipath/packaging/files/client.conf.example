@@ -1,0 +1,25 @@
+# /etc/black-relay/<name>.conf — standalone tunnel, CLIENT end (site side).
+# Copy to /etc/black-relay/br0.conf and start black-relay@br0.
+#
+# On the real edge nodes OMR owns the tunnel. Use `black-relay-switch fork`
+# there instead of this file. This standalone client is for test boxes:
+# a second VPS, a Lima/UTM VM, or any Linux host with more than one route
+# to the server.
+
+ROLE=client
+DEV=br0
+BIND=0.0.0.0
+PORT=5000                       # must match the server's PORT
+KEYFILE=/etc/black-relay/br0.key   # same key file as the server
+TUN_ADDR=10.255.0.1/30
+
+# One line per uplink. Each local source IP must route out its own uplink
+# (policy routing per source). Rates are BYTES/s (glorytun's unit):
+#   1 Mbit/s = 125000 B/s.  300 Mbit = 37500000, 40 Mbit = 5000000.
+#
+# <local-src-ip>  <server-public-ip>  <tx B/s>  <rx B/s>  [pref]
+PATHS="
+192.0.2.10    203.0.113.10   37500000  37500000
+198.51.100.20 203.0.113.10   18750000  18750000
+100.64.0.30   203.0.113.10    5000000   5000000
+"

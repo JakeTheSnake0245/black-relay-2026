@@ -1,0 +1,314 @@
+#!/bin/sh
+# /usr/lib/black-relay/tunnel — helper behind black-relay@<name>.service, the
+# standalone (non-OMR) tunnel. Config: /etc/black-relay/<name>.conf.
+#
+#   tunnel check <name>   validate config + key (ExecStartPre)
+#   tunnel run   <name>   exec glorytun bind in the foreground (ExecStart)
+#   tunnel post  <name>   address the tun, route + add client paths (ExecStartPost)
+#   tunnel down  <name>   remove the per-uplink routing (ExecStopPost)
+#   tunnel paths <name>   show live path status
+#   tunnel watch <name>   restart the tunnel when an uplink's address/gateway changes
+#
+# Client transport (TRANSPORT=):
+#   udp (default)  each uplink sends UDP straight to SERVER:PORT
+#   wss            each uplink carries the tunnel's UDP inside its own
+#                  WebSocket-over-TLS connection to WSS_URL (port 443, behind
+#                  the hub's reverse proxy), so the hub needs no UDP port.
+#                  One wstunnel client per uplink, pinned to that uplink by
+#                  SO_MARK + an fwmark rule; glorytun talks to them on
+#                  127.0.1.<n>:PORT. Needs BIND=127.0.0.1, WSS_URL, WSS_PREFIX.
+#                  WSS_LANES=N opens N connections per uplink (each its own
+#                  path, 1/N of the uplink's rate): a loss then stalls only
+#                  part of that uplink, and the combined window grows N x
+#                  faster on long, lossy paths.
+set -eu
+
+GT=/usr/lib/black-relay/glorytun
+ETC=/etc/black-relay
+
+die() { echo "black-relay[$NAME]: $*" >&2; exit 1; }
+log() { echo "$*" >&2; }
+
+cmd=${1:-}; NAME=${2:-}
+[ -n "$cmd" ] && [ -n "$NAME" ] || { sed -n '2,11p' "$0"; exit 2; }
+CONF=$ETC/$NAME.conf
+[ -r "$CONF" ] || die "missing $CONF (run black-relay-setup, or copy one from /usr/share/black-relay/examples/)"
+
+# global knobs first, then the tunnel's own config (which may override them)
+set -a
+[ -r "$ETC/black-relay.env" ] && . "$ETC/black-relay.env"
+. "$CONF"
+set +a
+
+ROLE=${ROLE:-}
+DEV=${DEV:-br-$NAME}
+BIND=${BIND:-0.0.0.0}
+PORT=${PORT:-5000}
+KEYFILE=${KEYFILE:-$ETC/$NAME.key}
+TUN_ADDR=${TUN_ADDR:-}
+PATHS=${PATHS:-}
+SERVER=${SERVER:-}
+UPLINKS=${UPLINKS:-}
+PEER=${PEER:-}
+LAN_ROUTES=${LAN_ROUTES:-}
+TABLE_BASE=${TABLE_BASE:-7100}
+AUTO_CAP=${AUTO_CAP:-125000000}     # B/s ceiling for rate auto (1 Gbit)
+TRANSPORT=${TRANSPORT:-udp}
+WSS_URL=${WSS_URL:-}
+WSS_PREFIX=${WSS_PREFIX:-}
+WSS_LANES=${WSS_LANES:-1}       # WebSocket connections per uplink (wss)
+WSTUNNEL=${WSTUNNEL:-/usr/local/bin/wstunnel}
+
+check() {
+	case "$ROLE" in server|client) ;; *) die "ROLE must be server or client" ;; esac
+	[ ${#DEV} -le 15 ] || die "DEV '$DEV' is longer than 15 characters"
+	[ -n "$TUN_ADDR" ] || die "TUN_ADDR not set (e.g. 10.255.0.2/30)"
+	[ -s "$KEYFILE" ] || die "no key at $KEYFILE. Make one on ONE end with
+  black-relay-keygen $KEYFILE
+and copy the same file to the other end (scp, then chmod 600)."
+	if [ "$ROLE" = client ]; then
+		if [ -n "$UPLINKS" ]; then
+			[ -n "$SERVER" ] || die "UPLINKS needs SERVER=<server public IPv4>"
+		elif [ -z "$(echo "$PATHS" | grep -v '^[[:space:]]*\(#\|$\)')" ]; then
+			die "ROLE=client needs UPLINKS (+SERVER) or PATHS"
+		fi
+		case "$TRANSPORT" in
+			udp) ;;
+			wss)
+				[ -n "$UPLINKS" ] || die "TRANSPORT=wss needs UPLINKS"
+				[ -n "$WSS_URL" ] && [ -n "$WSS_PREFIX" ] || die "TRANSPORT=wss needs WSS_URL and WSS_PREFIX"
+				[ "$BIND" = 127.0.0.1 ] || die "TRANSPORT=wss needs BIND=127.0.0.1 (the lanes listen on 127.0.1.<n>:$PORT)"
+				[ -x "$WSTUNNEL" ] || die "TRANSPORT=wss needs wstunnel at $WSTUNNEL"
+				case "$WSS_LANES" in [1-9]|1[0-6]) ;; *) die "WSS_LANES must be 1-16" ;; esac
+				;;
+			*) die "TRANSPORT must be udp or wss" ;;
+		esac
+	fi
+}
+
+# wss lane i (0-based): its wstunnel client runs as a transient systemd unit,
+# marks its TCP connection with the uplink's table number so the fwmark rule
+# routes it out that uplink, and exposes 127.0.1.<i+1>:PORT for glorytun.
+lane_unit() { echo "black-relay-lane-$NAME-$1"; }   # <ifc>-<j>
+lane_start() {   # <i> <ifc> <mark>
+	u=$(lane_unit "$2")
+	# The path prefix is a secret: hand it over in a root-only environment
+	# file, never on the command line (visible in ps and the journal).
+	install -d -m 0700 /run/black-relay
+	envf=/run/black-relay/$NAME.wss.env
+	( umask 077; printf 'WSTUNNEL_HTTP_UPGRADE_PATH_PREFIX=%s\n' "$WSS_PREFIX" >"$envf" )
+	systemctl stop "$u" 2>/dev/null || true
+	systemctl reset-failed "$u" 2>/dev/null || true
+	systemd-run --quiet --unit="$u" --collect \
+		--property=Restart=always --property=RestartSec=2 \
+		--property=PartOf="black-relay@$NAME.service" \
+		--property=EnvironmentFile="$envf" \
+		"$WSTUNNEL" client --log-lvl WARN --tls-verify-certificate \
+		--socket-so-mark "$3" --websocket-ping-frequency 10s \
+		-L "udp://127.0.1.$(($1 + 1)):$PORT:127.0.0.1:$PORT?timeout_sec=0" \
+		"$WSS_URL"
+}
+
+run() {
+	check
+	# separates this end's control-message nonces from the other end's
+	export GT_ROLE="${GT_ROLE:-$ROLE}"
+	exec "$GT" bind dev "$DEV" keyfile "$KEYFILE" from addr "$BIND" port "$PORT"
+}
+
+wait_ready() {
+	i=0
+	while [ $i -lt 100 ]; do
+		if ip link show dev "$DEV" >/dev/null 2>&1 &&
+		   "$GT" show dev "$DEV" >/dev/null 2>&1; then
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 0.1
+	done
+	die "tunnel device $DEV did not come up within 10s"
+}
+
+# UPLINKS="IF:MBIT[:GATEWAY] ...", MBIT a number, TX/RX, or "auto" (glorytun's
+# experimental rate detection). For each uplink: read its current IPv4,
+# give it its own routing table that reaches SERVER through that interface,
+# and a rule sending traffic sourced from that address there. Prints one
+# PATHS line per usable uplink. An uplink with no IPv4 yet is skipped (the
+# others still come up); restart the service once it has a lease.
+uplink_routes() {
+	i=0
+	for spec in $UPLINKS; do
+		t=$((TABLE_BASE + i)); i=$((i + 1))
+		ifc=${spec%%:*}; rest=${spec#*:}
+		[ "$rest" != "$spec" ] || die "UPLINKS entry '$spec' must be IF:MBIT[:GATEWAY]"
+		mbit=${rest%%:*}; gw=""
+		[ "$mbit" != "$rest" ] && gw=${rest#*:}
+		# MBIT is one number (both directions), TX/RX (this end's upload /
+		# download, e.g. 5/20 for a capped 4G link), or auto
+		txm=${mbit%%/*}; rxm=${mbit#*/}
+		case "$mbit" in
+			auto) ;;
+			*/*) case "$txm$rxm" in ''|*[!0-9]*) die "UPLINKS '$spec': TX/RX must be whole Mbit numbers" ;; esac ;;
+			''|*[!0-9]*) die "UPLINKS '$spec': MBIT must be a whole number, TX/RX, or auto" ;;
+		esac
+
+		if ! ip link show dev "$ifc" >/dev/null 2>&1; then
+			log "uplink $ifc: no such interface, skipped"; continue
+		fi
+		src=$(ip -4 -o addr show dev "$ifc" scope global | awk '{split($4, a, "/"); print a[1]; exit}')
+		if [ -z "$src" ]; then
+			log "uplink $ifc: no IPv4 address yet, skipped"; continue
+		fi
+		[ -n "$gw" ] || gw=$(ip -4 route show default dev "$ifc" | awk '/ via / {for (n = 1; n < NF; n++) if ($n == "via") {print $(n + 1); exit}}')
+
+		ip route flush table "$t" 2>/dev/null || true
+		if [ -n "$gw" ]; then
+			ip route add "$SERVER/32" via "$gw" dev "$ifc" src "$src" table "$t"
+		else
+			# point-to-point links (wwan, ppp) need no gateway
+			ip route add "$SERVER/32" dev "$ifc" src "$src" table "$t"
+		fi
+		while ip rule del pref "$t" 2>/dev/null; do :; done
+		if [ "$TRANSPORT" = wss ]; then
+			# every lane of this uplink carries mark $t -> table $t -> uplink
+			ip rule add pref "$t" fwmark "$t" lookup "$t"
+			j=0
+			while [ $j -lt "$WSS_LANES" ]; do
+				k=$(( (i - 1) * WSS_LANES + j ))
+				lane_start "$k" "$ifc-$j" "$t" >&2   # stdout here becomes PATHS
+				if [ "$mbit" = auto ]; then
+					echo "127.0.0.1 127.0.1.$((k + 1)) auto auto"
+				else
+					echo "127.0.0.1 127.0.1.$((k + 1)) $((txm * 125000 / WSS_LANES)) $((rxm * 125000 / WSS_LANES))"
+				fi
+				j=$((j + 1))
+			done
+			log "uplink $ifc: $src via ${gw:-direct} (table $t, tx $txm / rx $rxm Mbit, wss x$WSS_LANES)"
+			continue
+		else
+			ip rule add pref "$t" from "$src" lookup "$t"
+			psrc=$src; pdst=$SERVER
+		fi
+		if [ "$mbit" = auto ]; then
+			log "uplink $ifc: $src via ${gw:-direct} (table $t, rate auto, $TRANSPORT)"
+			echo "$psrc $pdst auto auto"
+		else
+			log "uplink $ifc: $src via ${gw:-direct} (table $t, tx $txm / rx $rxm Mbit, $TRANSPORT)"
+			echo "$psrc $pdst $((txm * 125000)) $((rxm * 125000))"
+		fi
+	done
+}
+
+post() {
+	wait_ready
+	ip addr replace "$TUN_ADDR" dev "$DEV"
+	ip link set "$DEV" up
+	# Idle keepalive per path (stock 25 s). The hub marks a passive path
+	# "waiting" (and stops sending on it) after ~5 beats (0.5 s) without
+	# packets on it, so an idle client lane drops out of the hub's mix
+	# unless the client keeps every path talking more often than that.
+	if [ -n "${GT_KEEPALIVE_MS:-}" ]; then
+		# glorytun reads a bare number as seconds; give the unit explicitly
+		"$GT" set dev "$DEV" keepalive "${GT_KEEPALIVE_MS}ms" >/dev/null &&
+			echo "keepalive ${GT_KEEPALIVE_MS} ms per path"
+	fi
+	if [ "$ROLE" = server ]; then
+		for net in $LAN_ROUTES; do
+			[ -n "$PEER" ] || die "LAN_ROUTES needs PEER=<site overlay address>"
+			ip route replace "$net" via "$PEER" dev "$DEV"
+			echo "route $net via $PEER ($DEV)"
+		done
+		echo "server $DEV up: $TUN_ADDR (paths are learned from the client)"
+		return 0
+	fi
+
+	[ -n "$UPLINKS" ] && PATHS="$PATHS
+$(uplink_routes)"
+
+	# each line: <local-src-ip> <server-ip> <tx B/s> <rx B/s> [pref]
+	n=0
+	for line in $(echo "$PATHS" | sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e '/^$/d' -e 's/[[:space:]][[:space:]]*/,/g'); do
+		IFS=, read -r src dst tx rx pref <<EOF
+$line
+EOF
+		[ -n "$dst" ] && [ -n "$tx" ] && [ -n "$rx" ] || die "bad PATHS line: $line"
+		if [ "$tx" = auto ]; then
+			# auto needs a ceiling: it starts from tx/rx and adapts below them
+			set -- path dev "$DEV" addr "$src" to addr "$dst" port "$PORT" \
+				set up rate auto tx "$AUTO_CAP" rx "$AUTO_CAP"
+		else
+			set -- path dev "$DEV" addr "$src" to addr "$dst" port "$PORT" \
+				set up rate fixed tx "$tx" rx "$rx"
+		fi
+		[ -n "${pref:-}" ] && set -- "$@" pref "$pref"
+		"$GT" "$@" >/dev/null
+		echo "path $src -> $dst:$PORT  tx=$tx rx=$rx${pref:+ pref=$pref}"
+		n=$((n + 1))
+	done
+	[ $n -gt 0 ] || die "no usable paths (check UPLINKS interfaces have IPv4 addresses)"
+	echo "client $DEV up: $TUN_ADDR, $n path(s)"
+}
+
+down() {
+	[ "$ROLE" = client ] && [ -n "$UPLINKS" ] || return 0
+	i=0
+	for spec in $UPLINKS; do
+		t=$((TABLE_BASE + i)); i=$((i + 1))
+		[ "$TRANSPORT" = wss ] && systemctl stop "$(lane_unit "${spec%%:*}")-*" 2>/dev/null
+		while ip rule del pref "$t" 2>/dev/null; do :; done
+		ip route flush table "$t" 2>/dev/null || true
+	done
+	return 0
+}
+
+paths() {
+	"$GT" path dev "$DEV" show stat
+	"$GT" path dev "$DEV" show rtt
+}
+
+# One line describing every uplink's current IPv4 + default gateway, and
+# whether its routing table still holds the route to the server. A link flap
+# or DHCP re-acquire that returns the SAME address still makes the kernel
+# flush routes on that device; without the route, that lane's tunnel packets
+# fall through to the main table (and into the tunnel itself), so a missing
+# route must count as a change too.
+uplink_sig() {
+	i=0
+	for spec in $UPLINKS; do
+		t=$((TABLE_BASE + i)); i=$((i + 1))
+		ifc=${spec%%:*}
+		a=$(ip -4 -o addr show dev "$ifc" scope global 2>/dev/null | awk '{print $4}' | tr '\n' ' ')
+		g=$(ip -4 route show default dev "$ifc" 2>/dev/null | awk '{print $3; exit}')
+		r=$(ip -4 route show table "$t" 2>/dev/null | grep -c . || true)
+		rl=$(ip rule show pref "$t" 2>/dev/null | grep -c . || true)
+		printf '%s=%s/%s/r%s%s;' "$ifc" "$a" "$g" "$r" "$rl"
+	done
+}
+
+# black-relay-watch@<name>: a DHCP renew, a SIM swap, or Starlink coming up
+# after the box re-ups the tunnel with the new addresses (sequence numbers
+# continue across restarts, so the hub accepts the new process at once).
+watch() {
+	[ "$ROLE" = client ] && [ -n "$UPLINKS" ] || { log "watch: nothing to watch ($ROLE)"; exit 0; }
+	base=$(uplink_sig)
+	log "watching uplinks: $base"
+	while sleep "${WATCH_SECS:-5}"; do
+		now=$(uplink_sig)
+		[ "$now" = "$base" ] && continue
+		sleep 3                                   # let DHCP settle
+		[ "$(uplink_sig)" = "$now" ] || continue
+		log "uplinks changed: $base -> $now; restarting black-relay@$NAME"
+		systemctl restart --no-block "black-relay@$NAME"
+		exit 0                                    # PartOf restarts the watcher too
+	done
+}
+
+case "$cmd" in
+	check) check ;;
+	run) run ;;
+	post) post ;;
+	down) down ;;
+	paths) paths ;;
+	watch) watch ;;
+	*) sed -n '2,11p' "$0"; exit 2 ;;
+esac

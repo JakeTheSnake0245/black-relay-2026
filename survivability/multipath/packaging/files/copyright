@@ -1,0 +1,19 @@
+Black Relay glorytun fork — package contents and licences.
+
+glorytun (ysurac/glorytun @ 203c5f2, with the mud submodule), plus the Black
+Relay patch (sequence number, resequencer, FEC, schedulers, header
+protection, anti-replay):
+  BSD-2-Clause. Copyright (c) Adrien Gallouët and contributors.
+  Upstream: https://github.com/angt/glorytun
+
+libsodium 1.0.20 (statically linked):
+  ISC License. Copyright (c) 2013-2024 Frank Denis.
+  https://libsodium.org
+
+musl libc (statically linked):
+  MIT License. Copyright (c) 2005-2020 Rich Felker, et al.
+  https://musl.libc.org
+
+Black Relay scripts (glorytun-br, black-relay-switch, black-relay-lab,
+tunnel helper, analysis tools, lab scripts): same terms as the fork,
+BSD-2-Clause.

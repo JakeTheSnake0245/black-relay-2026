@@ -1,0 +1,11 @@
+{
+  "listen": "10.39.0.1",
+  "port": 8088,
+  "site": "cwwk01",
+  "lanes": {
+    "up0": "empty port",
+    "up1": "empty port",
+    "up2": "empty port",
+    "up3": "Wi-Fi AP port"
+  }
+}

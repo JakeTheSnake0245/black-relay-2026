@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Black Relay Controller</title>
+<style>
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222220; --surface-3: #2a2a28;
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --accent: #3987e5; --accent-ink: #ffffff;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --unknown: #898781;
+}
+@media (prefers-color-scheme: light) {
+  :root:where(:not([data-theme="dark"])) {
+    color-scheme: light;
+    --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee; --surface-3: #ebeae5;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10); --accent: #2a78d6;
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee; --surface-3: #ebeae5;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10); --accent: #2a78d6;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.num { font-variant-numeric: tabular-nums; }
+button, input, select, textarea { font: inherit; color: inherit; }
+.btn { background: var(--surface-2); border: 1px solid var(--ring); border-radius: 8px; padding: 6px 12px; cursor: pointer; color: var(--ink); text-decoration: none; display: inline-block; }
+.btn:hover { background: var(--surface-3); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+.btn.danger { color: var(--critical); }
+.btn:disabled { opacity: .5; cursor: default; }
+input, select, textarea { background: var(--surface-2); border: 1px solid var(--ring); border-radius: 8px; padding: 7px 10px; width: 100%; }
+label { display: block; color: var(--ink-2); font-size: 12px; margin: 10px 0 4px; }
+
+/* layout */
+.app { display: grid; grid-template-columns: 220px 1fr; min-height: 100%; }
+nav { background: var(--surface); border-right: 1px solid var(--ring); padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; position: sticky; top: 0; height: 100vh; }
+nav .brand { font-weight: 700; font-size: 16px; padding: 4px 10px 14px; letter-spacing: -.01em; }
+nav .brand small { display: block; color: var(--muted); font-weight: 500; font-size: 12px; }
+nav a { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; color: var(--ink-2); text-decoration: none; cursor: pointer; }
+nav a:hover { background: var(--surface-2); color: var(--ink); }
+nav a.on { background: var(--surface-3); color: var(--ink); font-weight: 600; }
+nav a .dot { width: 8px; height: 8px; border-radius: 50%; margin-left: auto; background: var(--unknown); }
+nav .spacer { flex: 1; }
+main { padding: 22px 24px 48px; min-width: 0; max-width: 1400px; }
+header.page { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 18px; }
+header.page h1 { font-size: 20px; margin: 0; font-weight: 650; }
+header.page .sub { color: var(--muted); }
+.spacer { flex: 1; }
+.card { background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--ring); padding: 16px; min-width: 0; }
+.card h2 { font-size: 13px; font-weight: 600; color: var(--ink-2); margin: 0 0 12px; }
+.card h2 span { color: var(--muted); font-weight: 500; }
+.grid { display: grid; gap: 12px; margin-bottom: 12px; }
+.g2 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+.g3 { grid-template-columns: repeat(3, minmax(0,1fr)); }
+.g4 { grid-template-columns: repeat(4, minmax(0,1fr)); }
+@media (max-width: 1100px) { .g4 { grid-template-columns: repeat(2, minmax(0,1fr)); } .g3 { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 760px) { .app { grid-template-columns: 1fr; } nav { position: static; height: auto; flex-direction: row; flex-wrap: wrap; } nav .spacer, nav .brand small { display: none; } .g2, .g3, .g4 { grid-template-columns: 1fr; } main { padding: 16px; } }
+
+/* status */
+.status { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+.ico { width: 16px; height: 16px; flex: none; }
+.hero { display: flex; align-items: center; gap: 18px; padding: 22px; }
+.hero .big { font-size: 26px; font-weight: 700; letter-spacing: -.02em; }
+.hero .ico { width: 40px; height: 40px; }
+.tile { display: flex; flex-direction: column; gap: 6px; cursor: pointer; }
+.tile:hover { box-shadow: inset 0 0 0 1px var(--axis); }
+.tile .name { font-weight: 650; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+.tile .detail { color: var(--ink-2); font-size: 13px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; margin: 0; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+td { padding: 7px 8px; border-bottom: 1px solid var(--grid); }
+tr:last-child td { border-bottom: 0; }
+.meter { height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; min-width: 60px; }
+.meter div { height: 100%; background: var(--accent); border-radius: 3px; }
+.events { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow: auto; font-size: 13px; }
+.events li { display: flex; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--grid); align-items: flex-start; }
+.events time { color: var(--muted); flex: none; }
+.empty { color: var(--muted); }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.frame { width: 100%; height: 1500px; border: 0; border-radius: 12px; background: var(--surface); }
+.svc { display: flex; flex-direction: column; gap: 8px; }
+.svc .head { display: flex; align-items: center; gap: 10px; }
+.svc .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.svc p { margin: 0; color: var(--ink-2); font-size: 13px; }
+.toast { position: fixed; right: 18px; bottom: 18px; background: var(--surface-3); box-shadow: 0 0 0 1px var(--ring), 0 8px 24px rgba(0,0,0,.3); border-radius: 10px; padding: 10px 14px; max-width: 420px; display: none; z-index: 10; }
+dialog { background: var(--surface); color: var(--ink); border: 0; border-radius: 14px; box-shadow: 0 0 0 1px var(--ring), 0 20px 50px rgba(0,0,0,.4); padding: 20px; width: min(520px, 92vw); }
+dialog::backdrop { background: rgba(0,0,0,.5); }
+.login { min-height: 100%; display: grid; place-items: center; }
+.login .card { width: min(380px, 92vw); padding: 26px; }
+.login h1 { margin: 0 0 4px; font-size: 20px; }
+.err { color: var(--critical); font-size: 13px; min-height: 18px; margin-top: 8px; }
+.hide { display: none !important; }
+.fix { border-left: 4px solid var(--warning); }
+.fix.critical { border-left-color: var(--critical); }
+.fix h3 { margin: 0 0 6px; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+.fix ol { margin: 0; padding-left: 22px; color: var(--ink-2); font-size: 13px; }
+.fix ol li { margin: 3px 0; }
+.ports { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; }
+.port { border-radius: 10px; box-shadow: inset 0 0 0 1px var(--ring); padding: 12px; background: var(--surface-2); }
+.port .jack { width: 38px; height: 30px; border-radius: 4px; background: var(--surface-3); border: 2px solid var(--axis); position: relative; margin-bottom: 8px; }
+.port .jack::after { content: ""; position: absolute; top: 4px; right: 4px; width: 8px; height: 8px; border-radius: 50%; background: var(--unknown); }
+.port.up .jack::after { background: var(--good); box-shadow: 0 0 6px var(--good); }
+.port.blink .jack::after { animation: bl .5s steps(2) infinite; background: var(--warning); }
+@keyframes bl { 50% { opacity: .1; } }
+.port .pn { font-weight: 700; font-size: 15px; }
+.port .pr { font-size: 12px; color: var(--ink-2); min-height: 32px; }
+.port .ps { font-size: 12px; margin: 6px 0; }
+@media (max-width: 900px) { .ports { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+.banner { border-radius: 14px; padding: 18px 20px; margin-bottom: 12px; background: var(--surface-2); box-shadow: inset 0 0 0 2px var(--accent); }
+.banner h2 { margin: 0 0 10px; font-size: 20px; }
+.banner .jacks { display: grid; grid-template-columns: 3fr 1fr; gap: 10px; }
+.banner .zone { border-radius: 10px; padding: 14px; text-align: center; font-weight: 700; font-size: 17px; line-height: 1.3; }
+.banner .zone small { display: block; font-weight: 500; font-size: 13px; margin-top: 4px; color: var(--ink-2); }
+.banner .modems { background: color-mix(in srgb, var(--good) 18%, var(--surface)); box-shadow: inset 0 0 0 2px var(--good); }
+.banner .ap { background: color-mix(in srgb, var(--warning) 22%, var(--surface)); box-shadow: inset 0 0 0 2px var(--warning); }
+.banner .nics { display: flex; justify-content: center; gap: 8px; margin-bottom: 6px; font-size: 22px; }
+.banner.bad { box-shadow: inset 0 0 0 3px var(--critical); }
+.alarm { border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; font-weight: 650; font-size: 15px;
+  background: color-mix(in srgb, var(--critical) 20%, var(--surface)); box-shadow: inset 0 0 0 2px var(--critical); }
+.links { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; }
+.links a { display: block; padding: 10px 12px; border-radius: 8px; background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--ring); color: var(--ink); text-decoration: none; }
+.links a:hover { background: var(--surface-3); }
+.links a b { display: block; }
+.links a span { font-size: 12px; color: var(--muted); }
+.port .det { font-size: 12px; font-weight: 650; margin-top: 2px; }
+@media (max-width: 760px) { .banner .jacks { grid-template-columns: 1fr; } }
+.check { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid var(--grid); font-size: 13px; }
+.check:last-child { border-bottom: 0; }
+.check .what { font-weight: 600; min-width: 220px; }
+.check .hint { color: var(--ink-2); }
+.guide h3 { font-size: 14px; margin: 14px 0 6px; }
+.guide p, .guide li { font-size: 13px; color: var(--ink-2); }
+.guide ol, .guide ul { padding-left: 20px; margin: 4px 0; }
+.kbd { font-family: ui-monospace, Menlo, monospace; font-size: 12px; background: var(--surface-3); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
+.help { color: var(--muted); font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<div class="login hide" id="login">
+  <form class="card" id="loginform">
+    <h1>Black Relay</h1>
+    <div class="help" style="margin:0 0 14px">CWWK site controller</div>
+    <div id="pwbox">
+      <label for="pw">Admin password</label>
+      <input id="pw" type="password" autocomplete="current-password" autofocus>
+      <div class="err" id="loginerr"></div>
+      <button class="btn primary" style="width:100%;margin-top:10px" type="submit">Sign in</button>
+    </div>
+    <div id="ssobox" class="hide">
+      <div class="help" id="ssowho" style="margin:0 0 12px"></div>
+      <a class="btn primary" id="ssobtn" href="oidc/login" style="display:block;width:100%;margin-top:10px;text-align:center;box-sizing:border-box;text-decoration:none">Sign in with Pocket ID</a>
+    </div>
+  </form>
+</div>
+
+<div class="app hide" id="app">
+  <nav id="nav">
+    <div class="brand">Black Relay<small>CWWK controller · cwwk01</small></div>
+    <a data-v="health">Health<span class="dot" id="d-overall"></span></a>
+    <a data-v="multipath">Multipath<span class="dot" id="d-multipath"></span></a>
+    <a data-v="network">Network<span class="dot" id="d-network"></span></a>
+    <a data-v="wifi">Wi-Fi<span class="dot" id="d-wifi"></span></a>
+    <a data-v="compute">Compute<span class="dot" id="d-compute"></span></a>
+    <a data-v="services">Services<span class="dot" id="d-services"></span></a>
+    <a data-v="setup">Setup &amp; self-test</a>
+    <a data-v="help">Field guide</a>
+    <a data-v="settings">Settings</a>
+    <div class="spacer"></div>
+    <a id="theme">Theme</a>
+    <a id="logout">Sign out</a>
+  </nav>
+  <main id="main"></main>
+</div>
+<div class="toast" id="toast"></div>
+
+<dialog id="svcdlg">
+  <form method="dialog" id="svcform">
+    <h2 style="margin:0 0 8px;font-size:16px">Service</h2>
+    <input type="hidden" name="id">
+    <label>Name</label><input name="name" required maxlength="60">
+    <label>Kind (anything: Cameras, TAK Server, Sensors, Map tiles…)</label><input name="kind" maxlength="40" list="svckinds">
+    <datalist id="svckinds"><option>Cameras · Frigate</option><option>TAK Server</option><option>Sensors</option><option>Map tiles</option><option>Chat</option><option>Files</option></datalist>
+    <label>Main link (opens with "Open")</label><input name="url" placeholder="https://10.41.0.20:8443/">
+    <label>More links, one per line: label | url (http(s), tcp, tls, rtsp, udp, ssh)</label>
+    <textarea name="links" rows="3" placeholder="Admin | https://10.41.0.20:8446/&#10;Streaming | tls://10.41.0.20:8089&#10;Camera 1 | rtsp://10.41.0.30:554/live"></textarea>
+    <label>Health check (http(s)://, tcp://host:port, tls://host:port, rtsp://)</label><input name="health_url" placeholder="tls://10.41.0.20:8089">
+    <label>Address / ports (shown on the card)</label><input name="address" maxlength="120" placeholder="10.41.0.20 · 8089/tls, 8443/https">
+    <label>Description</label><input name="description" maxlength="500">
+    <label>Notes (logins live elsewhere; never put passwords here)</label><textarea name="notes" rows="3" maxlength="1000"></textarea>
+    <label style="display:flex;gap:8px;align-items:center;margin-top:12px"><input type="checkbox" name="deployed" style="width:auto"> Deployed (check its health)</label>
+    <div class="row" style="margin-top:16px"><button class="btn primary" value="save">Save</button><button class="btn" value="cancel" formnovalidate>Cancel</button><span class="spacer"></span><button class="btn danger" value="delete" id="svcdel" formnovalidate>Delete</button></div>
+  </form>
+</dialog>
+<dialog id="svcimp">
+  <form method="dialog">
+    <h2 style="margin:0 0 8px;font-size:16px">Import services</h2>
+    <div class="help" style="margin:0 0 8px">Paste JSON (one service, a list, or {"services": [...]}; keys like name/title, url/href, health/healthcheck, links/endpoints, kind/type are understood) or one service per line: name | url | health | kind. Same name replaces the existing card.</div>
+    <textarea id="svcimptext" rows="10" style="width:100%" placeholder='[{"name": "TAK Server", "kind": "TAK Server", "url": "https://10.41.0.20:8443/", "health": "tls://10.41.0.20:8089"}]'></textarea>
+    <div class="row" style="margin-top:12px"><button class="btn primary" value="import">Import</button><button class="btn" value="cancel" formnovalidate>Cancel</button></div>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ICON = {
+  good: '<svg class="ico" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="var(--good)"/><path d="M4.6 8.2l2.2 2.2 4.6-4.8" stroke="#fff" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  warning: '<svg class="ico" viewBox="0 0 16 16"><path d="M8 1.5l7 12.5H1z" fill="var(--warning)"/><path d="M8 6v3.6" stroke="#0b0b0b" stroke-width="1.8" stroke-linecap="round"/><circle cx="8" cy="11.8" r="1" fill="#0b0b0b"/></svg>',
+  serious: '<svg class="ico" viewBox="0 0 16 16"><rect x="1.5" y="1.5" width="13" height="13" rx="3" fill="var(--serious)"/><path d="M8 4.5v4.4" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/><circle cx="8" cy="11.4" r="1" fill="#fff"/></svg>',
+  critical: '<svg class="ico" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="var(--critical)"/><path d="M5.5 5.5l5 5M10.5 5.5l-5 5" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/></svg>',
+  unknown: '<svg class="ico" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2" fill="none" stroke="var(--unknown)" stroke-width="1.6" stroke-dasharray="2.5 2"/></svg>',
+};
+const WORD = { good: "Healthy", warning: "Degraded", serious: "Impaired", critical: "Down", unknown: "Unknown" };
+const st = (l, t) => `<span class="status">${ICON[l] || ICON.unknown}<span>${esc(t || WORD[l] || l)}</span></span>`;
+const pct = (a, b) => (b ? (a / b * 100) : 0);
+const gb = (b) => (b / 1073741824).toFixed(1);
+const dur = (s) => { s = Math.floor(s || 0); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
+const hhmm = (t) => new Date(t * 1000).toLocaleTimeString([], { hour12: false });
+
+let CSRF = null, S = null, view = (location.hash || "#health").slice(1), es = null;
+
+/* theme */
+try { const t = localStorage.getItem("brc-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+$("#theme").onclick = () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const cur = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const nx = cur === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = nx;
+  try { localStorage.setItem("brc-theme", nx); } catch (e) {}
+};
+
+function toast(msg, bad) {
+  const t = $("#toast"); t.innerHTML = (bad ? ICON.critical : ICON.good) + " " + esc(msg);
+  t.style.display = "flex"; t.style.gap = "8px"; clearTimeout(t._h); t._h = setTimeout(() => (t.style.display = "none"), 5000);
+}
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF": CSRF || "" }, body: JSON.stringify(body) } : {});
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) { showLogin(); throw new Error("login required"); }
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+async function act(body, okmsg) {
+  try { const j = await api("api/action", body); toast(okmsg || (typeof j.result === "string" ? j.result : "done")); return j; }
+  catch (e) { toast(e.message, true); }
+}
+
+/* login */
+let SESS = {};
+async function showLogin() {
+  $("#app").classList.add("hide"); $("#login").classList.remove("hide"); if (es) { es.close(); es = null; }
+  SESS = await fetch("api/session").then((x) => x.json()).catch(() => SESS);
+  const gw = !!SESS.gateway;
+  $("#pwbox").classList.toggle("hide", gw); $("#ssobox").classList.toggle("hide", !gw);
+  if (!gw) { $("#pw").focus(); return; }
+  $("#ssowho").textContent = "Remote access: sign in with your Pocket ID account (survivability or headscale-users group).";
+  $("#ssobtn").classList.toggle("hide", !SESS.login_url);
+}
+$("#loginform").onsubmit = async (e) => {
+  e.preventDefault(); $("#loginerr").textContent = "";
+  try {
+    const r = await fetch("api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: $("#pw").value }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "login failed");
+    CSRF = j.csrf; $("#pw").value = ""; start();
+  } catch (err) { $("#loginerr").textContent = err.message; }
+};
+$("#logout").onclick = async () => { try { await api("api/logout", {}); } catch (e) {} showLogin(); };
+
+/* nav */
+document.querySelectorAll("nav a[data-v]").forEach((a) => (a.onclick = () => { view = a.dataset.v; location.hash = view; render(true); }));
+window.addEventListener("hashchange", () => { view = (location.hash || "#health").slice(1); render(true); });
+
+/* ---------- views ---------- */
+const V = {};
+
+V.health = () => {
+  const subs = S.subsystems || {};
+  const order = [["multipath", "Multipath uplinks", "Bonded HTTPS tunnel to the hub"], ["network", "Router", "LAN, DHCP, DNS, firewall"], ["wifi", "Wi-Fi", "Spitz access point"], ["compute", "Compute", "Proxmox host and containers"], ["services", "Services", "Cameras, TAK, sensors, ..."]];
+  const tiles = order.map(([k, n, d]) => {
+    const s = subs[k] || { level: "unknown", detail: "waiting for data" };
+    return `<div class="card tile" onclick="location.hash='${k}'"><div class="name">${ICON[s.level] || ICON.unknown}${esc(n)}</div><div class="detail">${esc(s.detail)}</div><div class="help" style="margin:0">${esc(d)}</div></div>`;
+  }).join("");
+  const mp = S.multipath || {}, eg = mp.egress || {};
+  const ev = (S.events || []).map((e) => `<li><time class="num">${hhmm(e.t)}</time>${ICON[e.level] || ICON.unknown}<span>${esc(e.text)}</span></li>`).join("") || '<li class="empty">No events yet.</li>';
+  return `
+    <header class="page"><h1>Site health</h1><span class="sub">updated ${S.t ? hhmm(S.t) : "–"}</span></header>
+    <div class="card hero" style="margin-bottom:12px">${ICON[S.overall] || ICON.unknown}<div><div class="big">${esc({ good: "All systems healthy", warning: "Degraded — attention needed", serious: "Impaired", critical: "Something is down", unknown: "Checking…" }[S.overall] || S.overall)}</div>
+      <div class="sub" style="color:var(--ink-2)">Internet exit ${esc(eg.ip || "?")} ${eg.colo ? "· " + esc(eg.colo) : ""} · Leak guard ${mp.fail_closed ? "armed" : "<b>NOT armed</b>"}</div></div></div>
+    ${fixPanel()}
+    <div class="grid g3">${tiles}</div>
+    <div class="card" style="margin-bottom:12px"><h2>CWWK ports <span>· green light = cable connected · Setup page has Blink buttons to find a port</span></h2>${portMap(false)}</div>
+    <div class="grid g2">
+      <div class="card"><h2>Recent events</h2><ul class="events">${ev}</ul></div>
+      <div class="card"><h2>At a glance</h2><dl class="kv num">${glance()}</dl></div>
+    </div>`;
+};
+function fixPanel() {
+  const ps = S.problems || [];
+  if (!ps.length) return `<div class="card" style="margin-bottom:12px">${st("good", "Nothing needs fixing right now")}<div class="help">Problems appear here with step-by-step fixes, worst first.</div></div>`;
+  return `<div class="grid" style="margin-bottom:12px">` + ps.map((p) => `
+    <div class="card fix ${p.level === "critical" ? "critical" : ""}"><h3>${ICON[p.level] || ICON.warning}${esc(p.title)}</h3>
+      <ol>${p.steps.map((x) => `<li>${esc(x)}</li>`).join("")}</ol></div>`).join("") + `</div>`;
+}
+function portRole(p) {
+  if (!p.link) return "empty: plug anything in";
+  if (p.mode === "client") return "client device on the site LAN";
+  return p.wifi ? "modem + Wi-Fi access point" : "modem port";
+}
+function detected() { const o = {}; ((S.multipath || {}).uplinks || []).forEach((u) => (o[u.port] = u)); return o; }
+const BLINKING = {};
+function portMap(withButtons) {
+  const ports = S.ports;
+  if (!ports) return `<div class="help">Port status unavailable (host helper not answering).</div>`;
+  return `<div class="ports">` + ports.map((p) => {
+    const bl = (BLINKING[p.nic] || 0) > Date.now() || p.blinking;
+    return `<div class="port ${p.link ? "up" : ""} ${bl ? "blink" : ""}"><div class="jack"></div>
+      <div class="pn">${esc(p.nic)}</div><div class="pr">${esc(portRole(p))}</div>
+      ${(() => { const d = detected()[p.nic]; if (!d) return ""; if (p.mode === "client") return `<div class="det">${ICON.good} device on the site LAN</div>`; return d.label ? `<div class="det">${ICON.good} ${esc(d.label)}</div>` : (p.link ? `<div class="det">working out what this is (up to a minute)</div>` : ""); })()}
+      <div class="ps">${p.link ? st("good", "connected" + (p.speed ? " · " + (p.speed >= 1000 ? p.speed / 1000 + " Gbit" : p.speed + " Mbit") : "")) : st("warning", "no cable / no link")}</div>
+      ${withButtons ? `<button class="btn" onclick="blink('${p.nic}')">${bl ? "Blinking…" : "Blink port"}</button>` : ""}</div>`;
+  }).join("") + `</div>`;
+}
+window.blink = async (nic) => { BLINKING[nic] = Date.now() + 15000; render(true); await act({ area: "setup", action: "blink", nic }, `${nic}: look for the flashing LED on the CWWK`); setTimeout(() => render(true), 15500); };
+function glance() {
+  const mp = S.multipath || {}, t = mp.tunnel || {}, n = S.network || {}, c = S.compute || {}, ns = c.status || {};
+  const rows = [
+    ["Tunnel down / up", t.rx_bps != null ? `${(t.rx_bps / 1e6).toFixed(1)} / ${(t.tx_bps / 1e6).toFixed(1)} Mbit/s` : "–"],
+    ["Hub round trip", mp.ping && mp.ping.ms ? mp.ping.ms.toFixed(0) + " ms" : "–"],
+    ["Lanes", (mp.lanes || []).map((l) => `${l.label} ${l.health === "good" ? "✓" : "✗"}`).join(" · ") || "–"],
+    ["DHCP clients", n.leases ? n.leases.length : "–"],
+    ["Host CPU / RAM", ns.cpu != null ? `${(ns.cpu * 100).toFixed(0)}% / ${pct(ns.memory.used, ns.memory.total).toFixed(0)}%` : "–"],
+    ["Containers running", c.guests ? `${c.guests.filter((g) => g.status === "running").length} of ${c.guests.length}` : "–"],
+    ["CPU temperature", S.temps && S.temps.cpu != null ? S.temps.cpu.toFixed(0) + " C" + (S.temps.cpu >= 85 ? " (hot)" : "") : "–"],
+  ];
+  return rows.map(([a, b]) => `<dt>${esc(a)}</dt><dd>${esc(b)}</dd>`).join("");
+}
+
+const CAPLABEL = { isp: "ISP", starlink: "Starlink", spitz: "Spitz" };
+const capKinds = () => ((S.multipath_conf || {}).caps || "").split(" ").filter(Boolean).map((x) => x.split(":")[0]).map((k) => [k, CAPLABEL[k] || k]);
+V.multipath = () => {
+  const cf = S.multipath_conf || {};
+  const caps = (cf.caps || "").split(" ").reduce((o, x) => { const [k, v] = x.split(":"); if (k) o[k] = v; return o; }, {});
+  const opt = (v, cur) => `<option ${v === cur ? "selected" : ""}>${v}</option>`;
+  return `
+    <header class="page"><h1>Multipath</h1><span class="sub">Multithread · HTTPS 443 · ${esc(cf.lanes || "?")} connections per uplink</span><span class="spacer"></span>
+      <button class="btn" onclick="if(confirm('Restart the tunnel? Traffic pauses for a few seconds.')) act({area:'multipath',action:'restart-tunnel'},'tunnel restarting')">Restart tunnel</button></header>
+    <div class="card" style="margin-bottom:12px"><h2>Tuning <span>· changes apply when the tunnel restarts</span></h2>
+      <div class="grid g4" style="margin:0">
+        <div><label>Mixing</label><select id="m-sched">${["random", "arrival", "scatter"].map((v) => opt(v, cf.sched)).join("")}</select>
+          <div class="help">random = per-packet mix weighted by caps · arrival = fastest lane first · scatter = strict round-robin</div></div>
+        <div><label>Reorder hold (ms)</label><input id="m-hold" type="number" min="50" max="2000" value="${esc(cf.hold || 400)}"></div>
+        <div><label>Connections per uplink</label><select id="m-lanes">${["1", "2", "3", "4", "5", "6"].map((v) => opt(v, cf.lanes)).join("")}</select></div>
+        <div><label>Speed caps per modem, Mbit up/down</label>
+          <div class="row">${capKinds().map(([k, t]) => `<input id="cap-${k}" value="${esc(caps[k] || "")}" title="${t}" style="width:${Math.floor(96 / Math.max(1, capKinds().length))}%">`).join("")}</div>
+          <div class="help">${capKinds().map(([, t]) => t).join(" · ")}, as TX/RX. Follows the modem into whichever port it's in.</div></div>
+      </div>
+      <div class="row" style="margin-top:12px"><button class="btn primary" onclick="applyMp()">Apply and restart tunnel</button><span class="help">Current: ${esc(cf.sched)} · hold ${esc(cf.hold)} ms · FEC ${esc(cf.fec)} · ${esc(cf.transport)} · service ${esc(cf.service)}</span></div>
+    </div>
+    <iframe class="frame" src="mp/" title="Multipath live dashboard"></iframe>`;
+};
+window.applyMp = async () => {
+  const cf = S.multipath_conf || {}, steps = [];
+  const s = $("#m-sched").value, h = $("#m-hold").value, l = $("#m-lanes").value;
+  const caps = capKinds().map(([k]) => `${k}:${$("#cap-" + k).value.trim()}`).join(" ");
+  if (s !== cf.sched) steps.push({ action: "set-sched", value: s });
+  if (String(h) !== String(cf.hold)) steps.push({ action: "set-hold", value: h });
+  if (String(l) !== String(cf.lanes)) steps.push({ action: "set-lanes", value: l });
+  if (caps !== cf.caps) steps.push({ action: "set-caps", value: caps });
+  if (!steps.length) return toast("nothing changed");
+  for (const st of steps) { const r = await act({ area: "multipath", ...st }, st.action + " ok"); if (!r) return; }
+  await act({ area: "multipath", action: "restart-tunnel" }, "applied — tunnel restarting");
+};
+
+V.network = () => {
+  const n = S.network;
+  if (!n) return `<header class="page"><h1>Network</h1></header><div class="card">${st("critical", "Router API unavailable")}</div>`;
+  const ifr = Object.entries(n.interfaces || {}).filter(([k]) => k !== "loopback").map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v.up ? st("good", "up") : st("critical", "down")}</td><td class="num">${esc((v.addr || []).join(", "))}</td><td>${esc(v.device || "")}</td><td class="num">${v.uptime ? dur(v.uptime) : "–"}</td></tr>`).join("");
+  const now = Date.now() / 1000;
+  const lr = (n.leases || []).map((l) => `<tr><td>${esc(l.hostname || "–")}</td><td class="num">${esc(l.ipaddr)}</td><td class="num">${esc(l.macaddr)}</td><td class="num">${l.expires > 0 ? dur(l.expires) : "static"}</td></tr>`).join("") || '<tr><td colspan="4" class="empty">No DHCP clients yet.</td></tr>';
+  const i = n.info || {}, b = n.board || {};
+  return `
+    <header class="page"><h1>Network</h1><span class="sub">br-router · ${esc((b.release || {}).description || "OpenWrt")}</span><span class="spacer"></span>
+      <a class="btn" href="https://10.40.0.1/" target="_blank" rel="noopener">Open router admin (LuCI)</a></header>
+    <div class="grid g3">
+      <div class="card"><h2>Router</h2><dl class="kv num"><dt>Uptime</dt><dd>${dur(i.uptime)}</dd><dt>Load</dt><dd>${i.load ? (i.load[0] / 65536).toFixed(2) : "–"}</dd><dt>Memory free</dt><dd>${i.memory ? (i.memory.free / 1048576).toFixed(0) + " MB" : "–"}</dd><dt>LAN</dt><dd>10.40.0.0/24</dd><dt>Services</dt><dd>10.41.0.0/24</dd><dt>Uplink</dt><dd>10.39.0.2 → multipath</dd></dl></div>
+      <div class="card" style="grid-column:span 2"><h2>Interfaces</h2><table><tr><th>Name</th><th>State</th><th>Address</th><th>Device</th><th>Up for</th></tr>${ifr}</table></div>
+    </div>
+    <div class="card"><h2>DHCP clients <span>· wired and Wi-Fi</span></h2><table><tr><th>Host</th><th>Address</th><th>MAC</th><th>Lease left</th></tr>${lr}</table>
+      <div class="help">Static reservations, DNS names and firewall rules: router admin (LuCI) → Network.</div></div>`;
+};
+
+V.wifi = () => {
+  const w = S.wifi || {}, n = S.network || {};
+  const sub = (S.subsystems || {}).wifi || {};
+  return `
+    <header class="page"><h1>Wi-Fi</h1><span class="sub">Spitz (GL-X3000) as access point</span></header>
+    <div class="grid g2">
+      <div class="card"><h2>Access point</h2>${st(sub.level || "unknown", sub.detail)}
+        <dl class="kv" style="margin-top:12px"><dt>Networks</dt><dd>GL-X3000-0fd · GL-X3000-0fd-5G</dd><dt>Addressing</dt><dd>from the CWWK router (10.40.0.x)</dd><dt>Port</dt><dd>${esc(w.port || ((S.ports || []).find((p) => p.wifi) || {}).nic || "?")} (any port works)</dd><dt>Path</dt><dd>Wi-Fi → VLAN 40 → router → multipath tunnel</dd><dt>Spitz uplink</dt><dd>192.168.9.0/24 (untagged) → multipath lane "Spitz 4G"</dd></dl>
+        <div class="help">SSID, password and radio settings live on the <a href="https://192.168.9.1" target="_blank" rel="noopener">Spitz admin page</a> (192.168.9.1; also under Setup, Quick links). Wi-Fi clients never route through the Spitz's own WAN.</div></div>
+      <div class="card"><h2>Clients</h2><div style="font-size:28px;font-weight:650" class="num">${(n.leases || []).length}</div><div class="help">devices with a site-LAN lease (wired + Wi-Fi), see Network for the list</div></div>
+    </div>`;
+};
+
+V.compute = () => {
+  const c = S.compute;
+  if (!c) return `<header class="page"><h1>Compute</h1></header><div class="card">${st("critical", "Proxmox API unavailable")}</div>`;
+  const ns = c.status || {};
+  const cpu = (ns.cpu || 0) * 100, mem = pct(ns.memory.used, ns.memory.total), disk = pct(ns.rootfs.used, ns.rootfs.total);
+  const m = (v) => `<div class="meter"><div style="width:${Math.min(100, v).toFixed(0)}%"></div></div>`;
+  const rows = c.guests.map((g) => {
+    const on = g.status === "running";
+    return `<tr><td class="num">${g.vmid}</td><td>${esc(g.name)}</td><td>${g.type === "lxc" ? "container" : "VM"}</td><td>${on ? st("good", "running") : st("unknown", g.status)}</td>
+      <td class="num">${on ? (g.cpu * 100).toFixed(0) + "%" : "–"}</td><td class="num">${on ? gb(g.mem) + " / " + gb(g.maxmem) + " GB" : "–"}</td><td class="num">${on ? dur(g.uptime) : "–"}</td>
+      <td style="text-align:right">${(S.protected || []).includes(g.vmid) ? (on ? '<span class="help" style="margin:0">protected</span>' : `<button class="btn" onclick="pw(${g.vmid},'${g.type}','start')">Start</button>`) : on ? `<button class="btn" onclick="pw(${g.vmid},'${g.type}','reboot')">Reboot</button> <button class="btn danger" onclick="pw(${g.vmid},'${g.type}','shutdown')">Stop</button>` : `<button class="btn" onclick="pw(${g.vmid},'${g.type}','start')">Start</button>`}</td></tr>`;
+  }).join("");
+  return `
+    <header class="page"><h1>Compute</h1><span class="sub">Proxmox node ${esc(c.node)} · ${esc((ns.cpuinfo || {}).model || "")}</span><span class="spacer"></span>
+      <a class="btn" href="https://10.40.0.2:8006/" target="_blank" rel="noopener">Open Proxmox</a></header>
+    <div class="grid g4">
+      <div class="card"><h2>CPU</h2><div class="num" style="font-size:24px;font-weight:650">${cpu.toFixed(0)}%</div>${m(cpu)}</div>
+      <div class="card"><h2>Memory</h2><div class="num" style="font-size:24px;font-weight:650">${gb(ns.memory.used)} / ${gb(ns.memory.total)} GB</div>${m(mem)}</div>
+      <div class="card"><h2>Disk (root)</h2><div class="num" style="font-size:24px;font-weight:650">${disk.toFixed(0)}%</div>${m(disk)}</div>
+      <div class="card"><h2>Uptime</h2><div class="num" style="font-size:24px;font-weight:650">${dur(ns.uptime)}</div><div class="help">load ${esc((ns.loadavg || []).join(" "))}</div></div>
+    </div>
+    <div class="card"><h2>Containers and VMs</h2><table><tr><th>ID</th><th>Name</th><th>Type</th><th>State</th><th>CPU</th><th>Memory</th><th>Up</th><th></th></tr>${rows}</table>
+      <div class="help">101 multipath, 102 router and 103 this controller carry the site network: they can be started here but not stopped.</div></div>`;
+};
+window.pw = (vmid, type, action) => { if (action !== "start" && !confirm(`${action} ${vmid}?`)) return; act({ area: "compute", vmid, type, action }, `${vmid}: ${action} requested`); };
+
+V.services = () => {
+  const svcs = S.services || [];
+  const openable = (u) => /^https?:\/\//.test(u || "");
+  const linkEl = (l) => openable(l.url) ? `<a class="btn" href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url.replace(/^https?:\/\//, ""))}</a>`
+    : `<span class="kbd" title="${esc(l.label || "")}">${esc((l.label ? l.label + ": " : "") + l.url)}</span>`;
+  const cards = svcs.map((s) => `
+    <div class="card svc"><div class="head">${ICON[s.level] || ICON.unknown}<div><div style="font-weight:650">${esc(s.name)}</div><div class="kind">${esc(s.kind || "Service")}</div></div><span class="spacer"></span>
+      <button class="btn" onclick='editSvc(${JSON.stringify(s.id)})'>Edit</button></div>
+      ${s.description ? `<p>${esc(s.description)}</p>` : ""}
+      <div class="help" style="margin:0">${esc(s.detail || "")}${s.address ? " · " + esc(s.address) : ""}</div>
+      <div class="row" style="flex-wrap:wrap;gap:6px">${s.url ? (openable(s.url) ? `<a class="btn primary" href="${esc(s.url)}" target="_blank" rel="noopener">Open</a>` : linkEl({ label: "Main", url: s.url })) : ""}${(s.links || []).map(linkEl).join("")}${!s.url && !(s.links || []).length ? `<span class="help" style="margin:0">No links yet</span>` : ""}</div>
+      ${s.notes ? `<details style="margin-top:8px"><summary class="help" style="margin:0;cursor:pointer">Notes</summary><div class="help" style="white-space:pre-wrap">${esc(s.notes)}</div></details>` : ""}</div>`).join("");
+  return `
+    <header class="page"><h1>Services</h1><span class="sub">site applications (services network 10.41.0.0/24, or anywhere reachable)</span><span class="spacer"></span>
+      <button class="btn" onclick="$('#svcimp').showModal()">Import</button><button class="btn primary" onclick="editSvc(null)">Add service</button></header>
+    <div class="grid g3">${cards || '<div class="card empty">No services yet.</div>'}</div>
+    <div class="help">Any kind of service fits: a web UI, a TLS-only port (TAK 8089), RTSP cameras, several endpoints. Give it a health check (http(s)://, tcp://, tls://, rtsp://) and mark it deployed, and it joins the site's overall health. Import takes JSON (one service, a list, or {"services": [...]}) or one per line: name | url | health | kind.</div>`;
+};
+window.editSvc = (id) => {
+  const s = (S.services || []).find((x) => x.id === id) || { kind: "" };
+  const f = $("#svcform");
+  for (const k of ["id", "name", "kind", "url", "health_url", "address", "description", "notes"]) f.elements[k].value = s[k] || "";
+  f.elements.links.value = (s.links || []).map((l) => (l.label ? l.label + " | " : "") + l.url).join("\n");
+  f.elements.deployed.checked = !!s.deployed;
+  $("#svcdel").classList.toggle("hide", !id);
+  $("#svcdlg").showModal();
+};
+$("#svcdlg").addEventListener("close", async () => {
+  const v = $("#svcdlg").returnValue, f = $("#svcform");
+  if (v === "save") {
+    const s = Object.fromEntries(["id", "name", "kind", "url", "health_url", "address", "description", "notes"].map((k) => [k, f.elements[k].value]));
+    s.links = f.elements.links.value.split("\n").map((x) => x.trim()).filter(Boolean).map((x) => { const i = x.lastIndexOf("|"); return i < 0 ? { label: "", url: x } : { label: x.slice(0, i).trim(), url: x.slice(i + 1).trim() }; });
+    s.deployed = f.elements.deployed.checked;
+    await act({ area: "services", action: "save", service: s }, "service saved");
+  } else if (v === "delete" && f.elements.id.value && confirm("Delete this service card?")) {
+    await act({ area: "services", action: "delete", id: f.elements.id.value }, "service deleted");
+  }
+});
+$("#svcimp").addEventListener("close", async () => {
+  if ($("#svcimp").returnValue !== "import") return;
+  await act({ area: "services", action: "import", text: $("#svcimptext").value });
+  $("#svcimptext").value = "";
+});
+
+let SELFTEST = null, SELFTEST_BUSY = false;
+V.setup = () => {
+  const det = detected(), ports = S.ports || [];
+  const modems = Object.values(det).filter((u) => u.ip);
+  const clients = ports.filter((p) => p.mode === "client");
+  const wifi = ports.find((p) => p.wifi) || (Object.values(det).find((u) => u.kind === "spitz") || {});
+  const empty = ports.filter((p) => !p.link).length;
+  return `
+  <header class="page"><h1>Setup &amp; self-test</h1><span class="sub">plug in, power up, then prove everything works</span></header>
+  <div class="banner">
+    <h2>Any cable, any port</h2>
+    <div class="jacks"><div class="zone modems"><div class="nics">${ports.map((p) => `<span class="kbd">${esc(p.nic)}</span>`).join("")}</div>
+      PLUG ANYTHING INTO ANY PORT<small>Modems (ISP, Starlink), the Spitz (Wi-Fi), a laptop or a switch. The CWWK works out what each one is within about a minute.</small></div>
+      <div class="zone ap"><div class="nics">⚠</div>ONE CABLE PER DEVICE<small>Never plug the same box into two ports.</small></div></div>
+    <div class="help" style="margin-top:10px">Right now: ${modems.length} modem${modems.length === 1 ? "" : "s"} online (${esc(modems.map((u) => `${u.label} ${u.port}`).join(", ") || "none")}) · Wi-Fi ${wifi.port || wifi.nic ? "on " + esc(wifi.port || wifi.nic) : "not found yet"} · ${clients.length} client device${clients.length === 1 ? "" : "s"} · ${empty} empty port${empty === 1 ? "" : "s"}</div>
+  </div>
+  <div class="card" style="margin-bottom:12px"><h2>1 · Cables <span>· press Blink port and look for the flashing LED on the CWWK's network jacks</span></h2>${portMap(true)}
+    <div class="help">Moved a cable? Wait a minute: the CWWK notices, works out what it is, and carries on by itself.</div></div>
+  <div class="card" style="margin-bottom:12px"><h2>Quick links <span>· open from a device on the site Wi-Fi or a client port</span></h2>${quickLinks()}</div>
+  <div class="grid g2">
+    <div class="card"><h2>2 · Power-up order</h2><ol style="margin:0;padding-left:20px;font-size:13px;color:var(--ink-2)">
+      <li><b>Modems first:</b> ISP, Starlink (needs open sky, up to 5 min), Spitz (cellular needs a SIM).</li>
+      <li><b>Then the CWWK.</b> It boots in about 1.5 minutes and starts everything itself.</li>
+      <li><b>Wait for green:</b> Health turns green when at least one modem carries the tunnel.</li>
+      <li><b>Join Wi-Fi:</b> <span class="kbd">GL-X3000-0fd</span> (or <span class="kbd">-5G</span>), or plug a laptop into a free port; devices get a 10.40.0.x address.</li>
+      <li><b>Run the self-test</b> (right) and fix anything red before relying on the kit.</li></ol></div>
+    <div class="card"><h2>3 · Self-test <span>· about 15 s, safe to run any time</span></h2>
+      <button class="btn primary" id="stbtn" onclick="runSelftest()" ${SELFTEST_BUSY ? "disabled" : ""}>${SELFTEST_BUSY ? "Testing…" : "Run self-test"}</button>
+      <div id="stres" style="margin-top:10px">${selftestView()}</div></div>
+  </div>`;
+};
+function quickLinks() {
+  const L = [];
+  for (const u of Object.values(detected())) {
+    if (!u.ip) continue;
+    (u.admin || []).forEach((a, i) => L.push([`${u.label}${i ? " (dish)" : ""} admin`, `${u.kind === "spitz" ? "https" : "http"}://${a}`, `on ${u.port}`]));
+  }
+  L.push(["Site router (LuCI)", "https://10.40.0.1", "DHCP, DNS, firewall"],
+    ["Proxmox (CWWK host)", "https://10.40.0.2:8006", "containers, console"],
+    ["Status page (anyone)", "https://status.lan", "no login"],
+    ["This controller, remotely", "https://headscale.l8s.dev/cwwk/", "Pocket ID sign-in, from anywhere"]);
+  return `<div class="links">${L.map(([t, u, d]) => `<a href="${esc(u)}" target="_blank" rel="noopener"><b>${esc(t)}</b><span>${esc(u.replace(/^https?:\/\//, ""))} · ${esc(d)}</span></a>`).join("")}</div>
+    <div class="help">Modem admin pages appear here as soon as each modem is detected; they open only from devices on the site network. The Starlink app also works over the site Wi-Fi.</div>`;
+}
+function selftestView() {
+  const r = SELFTEST;
+  if (!r) return `<div class="help">Checks every cable, modem, the Wi-Fi access point, the tunnel, DNS, internet exit and the leak guard.</div>`;
+  const ports = {}; (r.ports || []).forEach((p) => (ports[p.nic] = p));
+  const rows = [];
+  const row = (ok, what, detail, hint) => rows.push(`<div class="check">${ok === true ? ICON.good : ok === false ? ICON.critical : ok === "info" ? ICON.unknown : ICON.warning}<div class="what">${esc(what)}</div><div class="hint">${esc(detail)}${ok !== true && ok !== "info" && hint ? "<br><b>Fix:</b> " + esc(hint) : ""}</div></div>`);
+  const ups = (r.uplinks || []).filter((u) => u.port);
+  const live = (S.ports || []);
+  const wifiPort = (live.find((p) => p.wifi) || {}).nic || (ups.find((u) => u.kind === "spitz" && u.ip) || {}).port;
+  row(wifiPort ? true : false, "Wi-Fi access point", wifiPort ? `found on ${wifiPort}` : "none found", "plug the Spitz LAN port into any free port; give it 2 minutes after power-on");
+  let working = 0;
+  for (const u of ups) {
+    const p = ports[u.port] || {}, lp = live.find((x) => x.nic === u.port) || {};
+    const name = `${u.port}${u.label && u.ip ? " · " + u.label : ""}`;
+    if (!p.link) { row("info", `${u.port}: empty`, "nothing plugged in (fine)", ""); continue; }
+    if (lp.mode === "client") { row(true, `${u.port}: client device`, "on the site LAN", ""); continue; }
+    row(!!u.ip, `${name}: address from modem`, u.ip ? `${u.ip} via ${u.gw}` : "none", "power-cycle the modem; Starlink can take 5 min; Spitz needs a SIM for cellular");
+    if (!u.ip) continue;
+    row(u.gw_ms != null, `${name}: modem answers`, u.gw_ms != null ? `${u.gw_ms.toFixed(1)} ms` : "no reply", "modem is hung: power-cycle it");
+    row(u.lanes_running > 0 ? (u.lanes_running === u.lanes_total ? true : null) : false, `${name}: lanes to hub`, `${u.lanes_running}/${u.lanes_total} running`, "this modem has no internet (SIM data, Starlink obstruction, ISP); other modems carry the load");
+    if (u.lanes_running > 0) working++;
+  }
+  row(working > 0, "Modems carrying the tunnel", `${working}`, "plug a working modem into any free port");
+  row(r.hub_ms != null, "Tunnel to hub", r.hub_ms != null ? `${r.hub_ms.toFixed(0)} ms round trip` : "no reply", "if every modem answers but this fails, the hub is down: call the hub admin");
+  row(!!r.dns, "Name lookups (DNS)", r.dns ? "working" : "failing", "usually follows the tunnel; restart the tunnel from Multipath");
+  row(!!r.egress, "Internet exit", r.egress ? `traffic leaves as ${r.egress}` : "no exit", "tunnel down; see above");
+  row(!!r.guard, "Leak guard", r.guard ? "armed: nothing leaves unencrypted" : "NOT armed", "reboot the CWWK; if it persists, stop using the kit for sensitive traffic");
+  return rows.join("") + `<div class="help">Ran ${hhmm(r.t)}</div>`;
+}
+window.runSelftest = async () => {
+  SELFTEST_BUSY = true; render(true);
+  const j = await act({ area: "setup", action: "selftest" }, "self-test finished");
+  SELFTEST_BUSY = false; if (j && j.result) SELFTEST = j.result; render(true);
+};
+
+V.help = () => `
+  <header class="page"><h1>Field guide</h1><span class="sub">for operators under pressure: start at the top</span></header>
+  <div class="banner" style="margin-bottom:12px"><h2>The rules</h2>
+    <div class="jacks"><div class="zone modems"><div class="nics">✓</div>ANY CABLE, ANY PORT<small>modems (ISP, Starlink), the Spitz (its LAN port), a laptop, a switch</small></div>
+    <div class="zone ap"><div class="nics">✗</div>ONE CABLE PER DEVICE<small>never the same box into two ports</small></div></div></div>
+  <div class="grid g2 guide">
+    <div class="card"><h2>When something breaks</h2>
+      <ol><li><b>Open Health.</b> The "Fix it" boxes say what is wrong and what to do, worst first.</li>
+      <li><b>Run the self-test</b> (Setup). Fix the first red line; later lines often depend on it.</li>
+      <li><b>Wait 60 seconds</b> after any fix. Modems, DHCP and the tunnel recover on their own.</li>
+      <li><b>Last resort:</b> reboot the CWWK (power button). Everything starts by itself in ~1.5 min.</li></ol>
+      <h3>No internet at all</h3><ul>
+      <li>Is at least one modem plugged in with a green port? If not: cables / modem power.</li>
+      <li>Ports green but no lanes: the modems have no internet, or the hub is down.</li>
+      <li>Nothing leaks while it's down: the kit refuses to send traffic unencrypted.</li></ul>
+      <h3>Slow</h3><ul>
+      <li>Count the modems that are green; each missing one costs speed.</li>
+      <li>Starlink drops for seconds at a time when obstructed; that's normal. Check it in the Starlink app or its quick link.</li>
+      <li>The Spitz is held to 4G speed (20 down / 5 up) on purpose.</li></ul>
+      <h3>No Wi-Fi / a device has no address</h3><ul>
+      <li>The Spitz is the Wi-Fi: its <b>LAN</b> port must be plugged into the CWWK (any port). Setup shows which port it's on.</li>
+      <li>Toggle the device's Wi-Fi off and on. It should get a 10.40.0.x address.</li>
+      <li>Network page: check the router is up and the device is listed under DHCP clients.</li></ul>
+      <h3>Moved a cable? Plugged in a laptop?</h3><ul>
+      <li>Fine. Within about a minute the CWWK works out what is on each port: a modem joins the tunnel (with its own speed settings), a laptop or switch joins the site network.</li>
+      <li>A laptop gets no address after 2 minutes? Unplug it for 5 seconds and plug it back in.</li></ul></div>
+    <div class="card"><h2>Safe to press</h2><ul>
+      <li><b>Run self-test, Blink port:</b> always safe.</li>
+      <li><b>Restart tunnel:</b> traffic pauses ~5–10 s, then resumes.</li>
+      <li><b>Start a container:</b> safe. The three core containers can't be stopped from here on purpose.</li>
+      <li><b>Tuning changes:</b> safe to try; defaults are random mix, 400 ms hold, 6 connections, ISP 100/150, Starlink 10/150, Spitz 5/20 (downloads split evenly between ISP and Starlink).</li></ul>
+      <h3>Addresses (on the site network)</h3><ul>
+      <li><span class="kbd">https://controller.lan</span>: this page · <span class="kbd">https://status.lan</span>: simple status, no login</li>
+      <li><span class="kbd">https://router.lan</span>: router admin (LuCI)</li>
+      <li>Modem admin pages: Setup, Quick links (one link per detected modem)</li>
+      <li><span class="kbd">https://headscale.l8s.dev/cwwk/</span>: this page from anywhere, Pocket ID sign-in</li></ul>
+      <p>Names not working? Devices running Tailscale use the tailnet's DNS: type the address instead: controller <span class="kbd">10.40.0.10</span>, router <span class="kbd">10.40.0.1</span>. Browsers warn about the certificate on the site network; that's expected.</p>
+      <h3>Who gets in remotely</h3><ul>
+      <li>Pocket ID group <b>survivability</b> (or the site admin group): full control.</li>
+      <li><b>headscale-users</b>: view only.</li>
+      <li>Tunnel down? Remote sign-in can't work; on site use <span class="kbd">https://10.40.0.10</span> with the admin password.</li></ul>
+      <h3>Words used here</h3><ul>
+      <li><b>Modem / uplink:</b> one internet connection (ISP, Starlink, Spitz cellular).</li>
+      <li><b>Lane:</b> one encrypted HTTPS connection over a modem; each carries 6.</li>
+      <li><b>Hub:</b> the server in Helsinki (Hetzner) that puts traffic back together and sends it on.</li>
+      <li><b>Leak guard / fail closed:</b> if the tunnel is down, nothing goes out at all.</li></ul>
+      <h3>Tips</h3><ul>
+      <li>Ports don't matter, but labelling cables still helps when you troubleshoot.</li>
+      <li>Keep the CWWK shaded and ventilated; it has no fan.</li>
+      <li>Starlink: clear view of the sky, away from trees and buildings.</li>
+      <li>Change the default passwords before deployment (Settings, and router admin).</li></ul></div>
+  </div>`;
+V.settings = () => `
+  <header class="page"><h1>Settings</h1></header>
+  <div class="grid g2">
+    <div class="card"><h2>Admin password</h2>
+      <label>Current</label><input id="p0" type="password" autocomplete="current-password">
+      <label>New (12+ characters)</label><input id="p1" type="password" autocomplete="new-password">
+      <div class="row" style="margin-top:12px"><button class="btn primary" onclick="chpw()">Change password</button></div></div>
+    <div class="card"><h2>About</h2><dl class="kv"><dt>Controller</dt><dd>br-controller (CT 103) · 10.40.0.10</dd><dt>Multipath</dt><dd>br-edge (CT 101) · 10.39.0.1</dd><dt>Router</dt><dd>br-router (CT 102) · 10.40.0.1</dd><dt>Hub</dt><dd>BR2026 · headscale.l8s.dev:443</dd><dt>Tailnet</dt><dd>https://100.64.0.11/</dd></dl>
+      <div class="help">Backend access is least-privilege: Proxmox token (view + power only), multipath changes through a forced-command key (fixed verbs).</div></div>
+  </div>`;
+window.chpw = async () => { const r = await act({ area: "settings", action: "password", current: $("#p0").value, new: $("#p1").value }); if (r) setTimeout(showLogin, 1200); };
+
+/* ---------- render loop ---------- */
+let lastView = null;
+function render(force) {
+  if (!S) return;
+  document.querySelectorAll("nav a[data-v]").forEach((a) => a.classList.toggle("on", a.dataset.v === view));
+  const subs = S.subsystems || {};
+  const setDot = (id, lvl) => { const d = $("#" + id); if (d) d.style.background = `var(--${lvl || "unknown"})`; };
+  setDot("d-overall", S.overall);
+  for (const k of ["multipath", "network", "wifi", "compute", "services"]) setDot("d-" + k, (subs[k] || {}).level);
+  // don't rebuild the page under the user's hands (forms, iframe)
+  const busy = document.activeElement && ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName);
+  if (!force && (busy || view === "multipath" || view === "settings" || view === "help" || (view === "setup" && SELFTEST_BUSY) || $("#svcdlg").open || $("#svcimp").open)) return;
+  const fn = V[view] || V.health;
+  $("#main").innerHTML = fn();
+  lastView = view;
+}
+async function start() {
+  $("#login").classList.add("hide"); $("#app").classList.remove("hide");
+  try { S = await api("api/state"); render(true); } catch (e) { return; }
+  if (es) es.close();
+  es = new EventSource("api/events");
+  es.onmessage = (m) => { S = JSON.parse(m.data); render(false); };
+  es.onerror = async () => { const r = await fetch("api/session").then((x) => x.json()).catch(() => ({})); if (!r.authed) showLogin(); };
+}
+(async () => {
+  const r = await fetch("api/session").then((x) => x.json()).catch(() => ({}));
+  if (r.authed) { CSRF = r.csrf; start(); } else showLogin();
+})();
+</script>
+</body>
+</html>

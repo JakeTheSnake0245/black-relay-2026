@@ -1,0 +1,4 @@
+VMID       Status     Lock         Name                
+101        running                 br-edge             
+102        running                 br-router           
+103        running                 br-controller       

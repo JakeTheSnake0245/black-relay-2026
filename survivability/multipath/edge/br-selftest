@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""br-selftest: one-shot end-to-end check of the multipath box (JSON out)."""
+import json, re, subprocess, time
+
+def sh(*a, t=8):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=t).stdout
+    except Exception:
+        return ""
+
+def conf():
+    c = {}
+    for f in ("/etc/black-relay/black-relay.env", "/etc/black-relay/br0.conf"):
+        for line in open(f):
+            line = line.split("#", 1)[0].strip()
+            if "=" in line:
+                k, v = line.split("=", 1); c[k.strip()] = v.strip().strip('"')
+    return c
+
+c = conf()
+# what is plugged into each port: br-uplinks (refreshed now; ports move)
+try:
+    det = {u["if"]: u for u in json.loads(sh("/usr/local/sbin/br-uplinks", t=10))["uplinks"]}
+except Exception:
+    det = {}
+nl = int(c.get("WSS_LANES", "1") or 1)
+paths = sh("/usr/lib/black-relay/glorytun", "path", "dev", "br0", "show")
+run = {}
+for line in paths.splitlines():
+    p = line.split()
+    if p and p[0] == "path":
+        m = re.match(r"127\.0\.1\.(\d+)\.", p[2])
+        if m:
+            u = (int(m.group(1)) - 1) // nl
+            run.setdefault(u, [0, 0]); run[u][1] += 1
+            if p[3] == "running": run[u][0] += 1
+ups = []
+for i, spec in enumerate(c.get("UPLINKS", "").split()):
+    ifc = spec.split(":")[0]
+    d = det.get(ifc, {})
+    r = {"if": ifc, "port": d.get("port"), "role": d.get("role", "uplink"), "kind": d.get("kind"),
+         "label": d.get("label") or ("Wi-Fi AP port" if d.get("role") == "ap" else "empty port"),
+         "link": d.get("link"), "warn": d.get("warn"), "admin": d.get("admin", [])}
+    a = sh("ip", "-4", "-o", "addr", "show", "dev", ifc).split()
+    r["ip"] = a[3].split("/")[0] if len(a) > 3 else None
+    g = sh("ip", "-4", "route", "show", "default", "dev", ifc).split()
+    r["gw"] = g[g.index("via") + 1] if "via" in g else None
+    r["gw_ms"] = None
+    if r["gw"]:
+        # local-only exception: ping exactly this uplink's own gateway, then remove it
+        sh("nft", "insert", "rule", "inet", "edge", "output", "oifname", ifc, "ip", "daddr", r["gw"],
+           "icmp", "type", "echo-request", "accept", "comment", "selftest")
+        out = sh("ping", "-n", "-c", "2", "-W", "1", "-I", ifc, r["gw"], t=6)
+        for h in re.findall(r"handle (\d+)", sh("nft", "-a", "list", "chain", "inet", "edge", "output")):
+            pass
+        for line in sh("nft", "-a", "list", "chain", "inet", "edge", "output").splitlines():
+            if 'comment "selftest"' in line:
+                sh("nft", "delete", "rule", "inet", "edge", "output", "handle", line.split()[-1])
+        m = re.search(r"time=([\d.]+)", out)
+        r["gw_ms"] = float(m.group(1)) if m else None
+    r["lanes_running"], r["lanes_total"] = run.get(i, [0, 0])
+    ups.append(r)
+hub = re.search(r"time=([\d.]+)", sh("ping", "-n", "-c", "2", "-W", "2", "-I", "br0", "10.255.1.1", t=8))
+dns = bool(sh("getent", "hosts", "debian.org", t=6).strip())
+tr = sh("curl", "-s", "-m", "8", "--interface", "br0", "https://1.1.1.1/cdn-cgi/trace", t=10)
+egress = dict(l.split("=", 1) for l in tr.splitlines() if "=" in l).get("ip")
+guard = "uplink-leak-guard" in sh("nft", "list", "chain", "inet", "edge", "output") and \
+        "unreachable default" in sh("ip", "route", "show", "table", "200")
+print(json.dumps({"t": time.time(), "uplinks": ups, "hub_ms": float(hub.group(1)) if hub else None,
+                  "dns": dns, "egress": egress, "guard": guard,
+                  "service": sh("systemctl", "is-active", "black-relay@br0").strip()}))

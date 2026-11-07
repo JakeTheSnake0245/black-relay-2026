@@ -1,0 +1,19 @@
+#!/bin/sh
+# Installs files only. Starts nothing, enables nothing, swaps no binary.
+set -e
+if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	# upgrade: running tunnels pick up the new binary (both ends must match)
+	if [ -n "${2:-}" ]; then
+		systemctl try-restart 'black-relay@*.service' >/dev/null 2>&1 || true
+	fi
+fi
+cat <<'EOF'
+black-relay-glorytun installed. Nothing is running yet.
+  test box:   sudo black-relay-lab up && sudo black-relay-lab probe
+  standalone: see /usr/share/black-relay/examples/, then
+              systemctl start black-relay@<name>
+  OMR server: sudo black-relay-switch status   (then `fork` when ready)
+Knobs: /etc/black-relay/black-relay.env
+EOF
+exit 0
