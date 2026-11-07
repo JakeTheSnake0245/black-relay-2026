@@ -130,12 +130,14 @@ EGRESS=$(ip -4 route show default | awk '{for (n = 1; n < NF; n++) if ($n == "de
 # Never forwarded to: this-network, private, CGNAT, loopback, link-local,
 # IETF protocol assignments, benchmarking, multicast and reserved.
 EXCLUDED='{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 }'
-# Nor to this host's own public address: that would reach the host's own
-# services from a Docker network instead of from the internet.
+# This host's own public address: only its public web services (80/443:
+# Headscale, Pocket ID, the site lanes) - the same as from the internet. Every
+# other port would reach host services from a Docker network instead.
 own=''
 case "${BR_PUBLIC_IP:-}" in
 	''|*[!0-9.]*) ;;
-	*) own="iifname \"br*\" ip daddr $BR_PUBLIC_IP drop" ;;
+	*) own="iifname \"br*\" ip daddr $BR_PUBLIC_IP tcp dport { 80, 443 } accept
+		iifname \"br*\" ip daddr $BR_PUBLIC_IP drop" ;;
 esac
 case "${BR_FORWARD:-egress}" in
 	egress) fwd="iifname \"br*\" oifname \"$EGRESS\" ip daddr != $EXCLUDED accept" ;;
