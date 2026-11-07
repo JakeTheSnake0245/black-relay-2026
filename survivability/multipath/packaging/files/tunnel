@@ -114,6 +114,9 @@ run() {
 	check
 	# separates this end's control-message nonces from the other end's
 	export GT_ROLE="${GT_ROLE:-$ROLE}"
+	# WebSocket/TLS lanes have no path MTU to discover: a fixed tunnel MTU
+	# (the hub adopts it from our control messages). Raw UDP keeps probing.
+	[ "${TRANSPORT:-udp}" = wss ] && export GT_MTU="${GT_MTU:-1400}"
 	exec "$GT" bind dev "$DEV" keyfile "$KEYFILE" from addr "$BIND" port "$PORT"
 }
 

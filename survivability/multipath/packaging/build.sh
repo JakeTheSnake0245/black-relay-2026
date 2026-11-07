@@ -26,7 +26,7 @@ ARCHES="${ARCHES:-x86_64 aarch64}"
 
 GT_PIN=203c5f2223d7d5146d659b51159b2f02c2480d15
 GT_VERSION=0.3.4-br
-PKG_VERSION=0.3.4+br5          # deb (ipk uses 0.3.4-br5)
+PKG_VERSION=0.3.4+br6          # deb (ipk uses 0.3.4-br6)
 SODIUM_VER=1.0.20
 SODIUM_SHA256=ebb65ef6ca439333c2bb41a0c1990587288da07f6c7fd07cb3a18cc18d30ce19
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1761436800}"   # 2025-10-26
@@ -67,6 +67,7 @@ fetch() {
 	cp "$FORK/reseq.c" "$FORK/reseq.h" "$FORK/fec.c" "$FORK/fec.h" "$src/src/"
 	git -C "$src" apply "$FORK/0001-black-relay-bonding-reseq.patch"
 	git -C "$src" apply "$FORK/0002-black-relay-paths-64-passive-timeout.patch"
+	git -C "$src" apply "$FORK/0003-black-relay-fixed-mtu.patch"
 	echo ">> fork patches applied"
 }
 

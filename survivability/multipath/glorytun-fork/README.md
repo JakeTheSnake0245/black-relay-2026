@@ -94,12 +94,19 @@ These move to the `glorytun set` ctl path before hardware rollout (Phase 8
 Or by hand, against a checkout of `ysurac/glorytun@203c5f2` with submodules:
 
     cp reseq.c reseq.h <glorytun>/src/
-    cd <glorytun> && git apply 0001-black-relay-bonding-reseq.patch
+    cd <glorytun> && git apply 0001-black-relay-bonding-reseq.patch \
+        && git apply 0002-black-relay-paths-64-passive-timeout.patch \
+        && git apply 0003-black-relay-fixed-mtu.patch
     # add src/reseq.c to the build (see build.sh for the gcc line)
 
 ## Files
 
 - `0001-black-relay-bonding-reseq.patch` — the diff vs stock.
+- `0002-black-relay-paths-64-passive-timeout.patch` — 64 paths, `GT_PASSIVE_TIMEOUT_S`.
+- `0003-black-relay-fixed-mtu.patch` — `GT_MTU=<bytes>`: fixed tunnel MTU for lanes over a stream
+  transport (WebSocket/TLS). There is no path MTU to probe there; probing only measured loss, and
+  because the tunnel takes the smallest path MTU, one lossy lane held it at the 573-byte floor. The
+  tunnel helper sets 1400 for `TRANSPORT=wss`; the hub adopts it from the site's control messages.
 - `reseq.c`, `reseq.h` — the resequencer (new files; also included in the
   patch, provided separately for convenience).
 - `build.sh` — reproducible clone + apply + build.

@@ -1,0 +1,101 @@
+--- a/mud/mud.h	2026-11-07 09:45:56
++++ b/mud/mud.h	2026-11-07 09:45:56
+@@ -134,6 +134,7 @@
+  * without packets on it (stock: 300). Lanes that reconnect from a new source
+  * port leave their old path behind; a short timeout frees those slots. */
+ int mud_set_passive_timeout (struct mud *, unsigned long);
++int mud_set_fixed_mtu       (struct mud *, size_t);
+ 
+ /* Black Relay: toggle timestamp header protection (both ends must match). */
+ int mud_set_hp (struct mud *, int);
+--- a/mud/mud.c	2026-11-07 09:45:56
++++ b/mud/mud.c	2026-11-07 09:45:56
+@@ -181,6 +181,7 @@
+     unsigned char role;     /* Black Relay: 1 client, 2 server, 0 unset */
+     uint64_t scatter_budget;/* Black Relay: max owd lag (us) a scatter lane may have */
+     uint64_t passive_timeout;/* Black Relay: drop idle passive paths after this (us) */
++    size_t fixed_mtu;        /* Black Relay: wire MTU when paths have none to discover */
+     /* Black Relay: anti-replay sliding window over decrypted seq (RFC 6479
+      * style). rw_max is the highest seq accepted; rw_bits marks the window
+      * below it. Tolerates reordering up to MUD_REPLAY_BITS. */
+@@ -794,6 +795,23 @@
+         return -1;
+     }
+     mud->sched = sched;
++    return 0;
++}
++
++/* Black Relay: fixed tunnel MTU (the size mud_get_mtu() reports). For paths
++ * carried over a stream transport (WebSocket/TLS lanes) there is no path MTU:
++ * probing only measures loss, and one lossy path would hold the whole tunnel
++ * at the MUD_MTU_MIN floor, since the tunnel takes the smallest path MTU. */
++int
++mud_set_fixed_mtu(struct mud *mud, size_t mtu)
++{
++    size_t wire = mtu + MUD_PKT_MIN_SIZE + MUD_SEQ_SIZE;
++
++    if (wire < MUD_MTU_MIN || wire > MUD_MTU_MAX) {
++        errno = EINVAL;
++        return -1;
++    }
++    mud->fixed_mtu = wire;
+     return 0;
+ }
+ 
+@@ -1366,8 +1384,14 @@
+ }
+ 
+ static void
+-mud_update_mtu(struct mud_path *path, size_t size)
++mud_update_mtu(struct mud *mud, struct mud_path *path, size_t size)
+ {
++    if (mud->fixed_mtu) {   /* Black Relay: nothing to probe */
++        path->mtu.min = path->mtu.max = mud->fixed_mtu;
++        path->mtu.last = path->mtu.ok = mud->fixed_mtu;
++        path->mtu.probe = 0;
++        return;
++    }
+     if (!path->mtu.probe) {
+         if (!path->mtu.last) {
+             path->mtu.min = MUD_MTU_MIN;
+@@ -1452,7 +1476,7 @@
+         if (path->conf.state == MUD_PASSIVE)
+             return;
+ 
+-        mud_update_mtu(path, size);
++        mud_update_mtu(mud, path, size);
+ 
+         if (path->mtu.last && path->mtu.last == MUD_LOAD_MSG(msg->mtu))
+             path->mtu.ok = path->mtu.last;
+@@ -1627,7 +1651,7 @@
+ 
+     if (path->msg.sent >= MUD_MSG_SENT_MAX) {
+         if (path->mtu.probe) {
+-            mud_update_mtu(path, 0);
++            mud_update_mtu(mud, path, 0);
+             path->msg.sent = 0;
+         } else {
+             path->msg.sent = MUD_MSG_SENT_MAX;
+--- a/src/bind.c	2026-11-07 09:45:56
++++ b/src/bind.c	2026-11-07 09:45:56
+@@ -191,6 +191,20 @@
+                 gt_log("GT_PASSIVE_TIMEOUT_S=%s ignored (5-3600)\n", pt);
+             else
+                 gt_log("passive path timeout: %lus\n", s);
++        }
++    }
++
++    /* Black Relay: GT_MTU=<bytes>, a fixed tunnel MTU for lanes carried over a
++     * stream transport (WebSocket/TLS): no path MTU to probe there, and one
++     * lossy lane would otherwise pin the whole tunnel at the 573-byte floor. */
++    {
++        const char *m = getenv("GT_MTU");
++        if (m) {
++            unsigned long v = strtoul(m, NULL, 10);
++            if (mud_set_fixed_mtu(mud, (size_t)v))
++                gt_log("GT_MTU=%s ignored (out of range)\n", m);
++            else
++                gt_log("fixed tunnel MTU: %lu\n", v);
+         }
+     }
+ 
