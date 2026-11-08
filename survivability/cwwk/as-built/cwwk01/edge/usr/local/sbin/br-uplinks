@@ -38,6 +38,10 @@ OUT = "/run/black-relay/uplinks.json"
 RECHECK = "/run/black-relay/recheck.json"
 RESTART_EVERY = 300
 DEFAULT = {"kind": "isp", "caps": "100/150", "label": "ISP", "match": "any"}
+# Management ports beyond 80/443 that a recognised device's probe target serves
+# (site devices may reach exactly these; nft set modem_api). Starlink dish:
+# 9200 = gRPC for the Starlink app, 9201 = gRPC-web for the dish page.
+API_PORTS = {"starlink": (9200, 9201)}
 
 
 def ports():
@@ -182,12 +186,12 @@ def detect():
         u = {"if": ifc, "port": nic, "present": present, "link": present and link_up(ifc),
              "ip": ip, "gw": gw, "kind": r["kind"], "label": r["label"], "caps": r["caps"],
              "fallback": bool(ip) and r.get("match") == "any", "alive": None,
-             "admin": [], "warn": None}
+             "admin": [], "api": [], "warn": None}
         if ip and gw:
             u["alive"] = gw_alive(ifc, ip, gw)
         if ip and not lease_ok(ip, plen, server):
             u["warn"] = f"{nic}: the modem handed out {ip}/{plen}, which overlaps the site's own addresses; ignored"
-            u.update(kind=None, label="Rejected modem", admin=[])
+            u.update(kind=None, label="Rejected modem", admin=[], api=[])
             out.append(u)
             continue
         prefix = ipaddress.ip_network(f"{ip}/{plen}", strict=False) if ip else None
@@ -198,6 +202,7 @@ def detect():
                 host = r["match"][6:].rpartition(":")[0]
                 if host != gw and safe_admin(host):
                     u["admin"].append(host)
+                    u["api"] = [[host, p] for p in API_PORTS.get(r["kind"], ())]
         out.append(u)
     return out
 
@@ -261,6 +266,11 @@ def load_admin(ups):
             addrs.append(a)
             if a != u["gw"]:
                 routes.append((a, u["gw"], u["if"]))
+    api = sorted({(a, p) for u in ups if u["gw"] and u["ip"] for a, p in u.get("api", [])})
+    sh("nft", "flush", "set", "inet", "edge", "modem_api")
+    if api:
+        sh("nft", "add", "element", "inet", "edge", "modem_api",
+           "{ " + ", ".join(f"{a} . {p}" for a, p in api) + " }")
     sh("nft", "flush", "set", "inet", "edge", "modem_admin")
     if addrs:
         sh("nft", "add", "element", "inet", "edge", "modem_admin", "{ " + ", ".join(sorted(set(addrs))) + " }")

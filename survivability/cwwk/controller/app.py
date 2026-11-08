@@ -408,6 +408,75 @@ def worst(*levels):
     return max(levels, key=lambda l: RANK.get(l, 1)) if levels else "unknown"
 
 
+# ---------------------------------------------------------------- site lock
+# br-lockd on the host owns the lock (vault, edge gate, tailnet, gated guests).
+# The controller authenticates the admin and passes the vault passphrase on;
+# it never stores or logs it. TLS pinned to the host's cert, bearer token.
+UNLOCK_FAILS = {}   # ip -> [timestamps]
+
+
+def lockd(method, path, body=None, timeout=10):
+    L = CONF.get("lockd")
+    if not L:
+        return None, {"error": "site lock not installed"}
+    ctx = ssl.create_default_context(cafile=L["cafile"])
+    ctx.check_hostname = False   # pinned by file
+    c = http.client.HTTPSConnection(L.get("host", "10.40.0.2"), int(L.get("port", 8092)), timeout=timeout, context=ctx)
+    h = {"Authorization": "Bearer " + L["token"]}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        h["Content-Type"] = "application/json"
+    try:
+        c.request(method, path, body=data, headers=h)
+        r = c.getresponse()
+        raw = r.read()
+    finally:
+        c.close()
+    try:
+        obj = json.loads(raw or b"{}")
+    except ValueError:
+        obj = {"error": f"HTTP {r.status}"}
+    return r.status, obj
+
+
+def lock_state():
+    try:
+        code, obj = lockd("GET", "/state", timeout=5)
+        return obj if code == 200 else {"state": "unknown", "error": obj.get("error")}
+    except Exception as e:
+        return {"state": "unknown", "error": str(e)[:120]}
+
+
+def site_unlock(ip, who, passphrase):
+    now = time.time()
+    with LOCK:
+        f = [t for t in UNLOCK_FAILS.get(ip, []) if now - t < 900]
+        UNLOCK_FAILS[ip] = f
+        if len(f) >= 5:
+            raise PermissionError("too many wrong passphrases from here: wait 15 minutes")
+    if not isinstance(passphrase, str) or not 8 <= len(passphrase) <= 512:
+        raise ValueError("enter the vault passphrase")
+    code, obj = lockd("POST", "/unlock", {"passphrase": passphrase, "who": who}, timeout=240)
+    if code != 200:
+        with LOCK:
+            UNLOCK_FAILS.setdefault(ip, []).append(time.time())
+        event("warning", f"unlock refused for {who} from {ip}: {obj.get('error', code)}"[:160])
+        raise PermissionError(obj.get("error") or "unlock refused")
+    with LOCK:
+        UNLOCK_FAILS.pop(ip, None)
+    event("good", f"site UNLOCKED by {who}")
+    return obj
+
+
+def site_lock(who):
+    code, obj = lockd("POST", "/lock", {"who": who}, timeout=240)
+    if code != 200:
+        raise RuntimeError(obj.get("error") or "lock failed")
+    event("warning", f"site LOCKED by {who}")
+    return obj
+
+
 # ---------------------------------------------------------------- inventory
 # Everything that lives on the CWWK, each with a live state, for the health
 # page. Built from the same sources as the tiles plus three read-only lists:
@@ -523,6 +592,14 @@ def inventory(snap, router, subs):
         (f"{tn.get('ip') or '?'} · online" if tn.get("online") else (tn.get("state") or "no answer")))
     unit(w, None, hs, "ssh", "Host SSH", "Key-only console access", helper=True)
 
+    lk = snap.get("lock") or {}
+    if lk.get("state") in ("locked", "unlocked"):
+        add(w, None, "Site lock", "The box starts locked; USB key or admin + vault passphrase opens it",
+            "good" if lk["state"] == "unlocked" else "unknown",
+            ("unlocked" + (f" by {lk.get('by')}" if lk.get("by") else "")) if lk["state"] == "unlocked" else "LOCKED")
+        if lk.get("usb_inserted") and lk["state"] == "unlocked":
+            add(w, None, "USB key", "Should be with a person, not in the box", "warning", "still plugged in: pull it out")
+
     # Wi-Fi
     sp = snap.get("wifi")
     add("Wi-Fi · Spitz", "wifi", "Access point", "Site Wi-Fi bridged to the LAN",
@@ -555,6 +632,7 @@ def inventory(snap, router, subs):
 
 def poll_once(pve, router):
     snap = {"t": time.time()}
+    snap["lock"] = lock_state()
     subs = {}
 
     # multipath (edge)
@@ -1551,6 +1629,19 @@ class H(BaseHTTPRequestHandler):
                 with LOCK:
                     SESSIONS.pop(tok or "", None)
                 self.json(200, {"ok": True}, {"Set-Cookie": "brc=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"})
+                return
+            if path in ("/api/unlock", "/api/lock"):
+                if s.get("role") != "admin":
+                    self.json(403, {"error": "only an admin can lock or unlock the site"})
+                    return
+                who = f"{s.get('user') or 'admin'} via {s.get('via') or 'controller'}"
+                if path == "/api/unlock":
+                    out = site_unlock(ip, who, self.body().get("passphrase"))
+                else:
+                    out = site_lock(who)
+                with LOCK:
+                    STATE["lock"] = out
+                self.json(200, {"ok": True, "lock": out})
                 return
             if path == "/api/action":
                 if s.get("role") != "admin":

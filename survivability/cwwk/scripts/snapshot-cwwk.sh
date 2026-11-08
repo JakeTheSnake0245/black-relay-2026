@@ -29,6 +29,7 @@ ct_glob() { # ct glob dest-subdir
 # ---- host (Proxmox)
 cp_host /etc/network/interfaces /etc/network/interfaces.d/* /etc/pve/lxc/101.conf /etc/pve/lxc/102.conf /etc/pve/lxc/103.conf
 cp_host /etc/systemd/system/br-*.service /etc/systemd/system/br-*.timer /usr/local/sbin/br-* /etc/sysctl.d/*.conf
+cp_host /etc/br-lockd/config.json /etc/br-lockd/cert.pem /etc/pve/storage.cfg   # site lock settings (token and key stay on the host)
 for d in /etc/systemd/system/*.service.d; do [ -d "$d" ] && cp_host "$d"/*.conf; done
 { echo "# tailscale serve status"; tailscale serve status 2>&1 || true
   echo; echo "# tailscale ip / tags"; tailscale ip -4 2>&1 || true

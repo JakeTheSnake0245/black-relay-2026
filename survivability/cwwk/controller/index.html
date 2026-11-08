@@ -251,6 +251,7 @@ const gb = (b) => (b / 1073741824).toFixed(1);
 const dur = (s) => { s = Math.floor(s || 0); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
 const hhmm = (t) => new Date(t * 1000).toLocaleTimeString([], { hour12: false });
 
+let ME = { role: null, user: null }, LOCKED_SHOWN = false;
 let CSRF = null, S = null, view = (location.hash || "#health").slice(1), es = null;
 
 /* theme */
@@ -296,7 +297,7 @@ $("#loginform").onsubmit = async (e) => {
     const r = await fetch("api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: $("#pw").value }) });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || "login failed");
-    CSRF = j.csrf; $("#pw").value = ""; start();
+    CSRF = j.csrf; ME = { role: "admin", user: "admin (password)" }; $("#pw").value = ""; start();
   } catch (err) { $("#loginerr").textContent = err.message; }
 };
 $("#logout").onclick = async () => { try { await api("api/logout", {}); } catch (e) {} showLogin(); };
@@ -304,6 +305,48 @@ $("#logout").onclick = async () => { try { await api("api/logout", {}); } catch 
 /* nav */
 document.querySelectorAll("nav a[data-v]").forEach((a) => (a.onclick = () => { view = a.dataset.v; location.hash = view; render(true); }));
 window.addEventListener("hashchange", () => { view = (location.hash || "#health").slice(1); render(true); });
+
+/* ---------- site lock ---------- */
+function lockScreen() {
+  const L = S.lock || {};
+  const admin = ME.role === "admin";
+  const since = L.since ? `since ${hhmm(L.since)}` + (L.by && L.by !== "boot" ? ` · locked by ${esc(L.by)}` : " · power-on") : "";
+  return `
+    <header class="page"><h1>Site locked</h1><span class="sub">${since}</span></header>
+    <div class="card hero" style="margin-bottom:12px">${ICON.warning}<div><div class="big">This CWWK is locked</div>
+      <div class="sub" style="color:var(--ink-2)">Nothing on site reaches the internet, the services or the tailnet until it is unlocked. Wi-Fi, modems and this page keep working.</div></div></div>
+    <div class="grid g2">
+      <div class="card"><h2>With the USB key</h2><ol>
+        <li>Plug the key (stick labelled <b>BRKEY</b>) into any USB port on the CWWK.</li>
+        <li>Wait about 10 seconds. This page changes by itself.</li>
+        <li>Pull the key out and keep it with you.</li></ol>
+        ${L.usb_inserted ? `<div class="help">A key is plugged in now. If nothing happens, pull it out and plug it in again.</div>` : ""}</div>
+      <div class="card"><h2>With the vault passphrase</h2>
+        ${admin ? `<form onsubmit="doUnlock(event)"><input id="unlockpw" type="password" autocomplete="off" placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX" style="width:100%;margin-bottom:8px">
+          <button class="btn primary" id="unlockbtn" type="submit">Unlock</button> <span id="unlockerr" class="help" style="color:var(--critical)"></span></form>
+          <div class="help">Signed in as ${esc(ME.user || "admin")}. Five wrong tries wait 15 minutes.</div>`
+        : `<div class="help" style="margin:0">Only an admin can unlock with the passphrase. Use the USB key, or ask a survivability admin; they can also unlock it remotely at https://headscale.l8s.dev/cwwk/.</div>`}</div>
+    </div>`;
+}
+window.doUnlock = async (e) => {
+  e.preventDefault();
+  const b = $("#unlockbtn"), pw = $("#unlockpw");
+  b.disabled = true; b.textContent = "Unlocking… (up to a minute)"; $("#unlockerr").textContent = "";
+  try {
+    const j = await api("api/unlock", { passphrase: pw.value });
+    pw.value = ""; S.lock = j.lock; toast("Site unlocked"); render(true);
+  } catch (err) { $("#unlockerr").textContent = err.message; b.disabled = false; b.textContent = "Unlock"; pw.value = ""; pw.focus(); }
+};
+window.doLock = async () => {
+  if (!confirm("Lock the site now?\n\nInternet, services and the tailnet stop for everyone on site until someone unlocks it with the USB key or the vault passphrase.")) return;
+  try { const j = await api("api/lock", {}); S.lock = j.lock; toast("Site locked"); render(true); } catch (err) { toast(err.message, true); }
+};
+function lockBar() {
+  const L = S.lock || {};
+  if (L.state !== "unlocked") return "";
+  const usb = L.usb_inserted ? `<div class="card fix" style="margin-bottom:12px"><h3>${ICON.warning}USB key is still in the CWWK</h3><ol><li>Pull it out and keep it with you: anyone holding it can unlock the box.</li></ol></div>` : "";
+  return usb + `<div class="row" style="justify-content:flex-end;margin:-4px 0 10px"><span class="help" style="margin:0 8px 0 0">Unlocked${L.by ? " by " + esc(L.by) : ""}${L.since ? " at " + hhmm(L.since) : ""}</span>${ME.role === "admin" ? `<button class="btn" onclick="doLock()">Lock site</button>` : ""}</div>`;
+}
 
 /* ---------- views ---------- */
 const V = {};
@@ -319,6 +362,7 @@ V.health = () => {
   const ev = (S.events || []).map((e) => `<li><time class="num">${hhmm(e.t)}</time>${ICON[e.level] || ICON.unknown}<span>${esc(e.text)}</span></li>`).join("") || '<li class="empty">No events yet.</li>';
   return `
     <header class="page"><h1>Site health</h1><span class="sub">updated ${S.t ? hhmm(S.t) : "–"}</span></header>
+    ${lockBar()}
     <div class="card hero" style="margin-bottom:12px">${ICON[S.overall] || ICON.unknown}<div><div class="big">${esc({ good: "All systems healthy", warning: "Degraded — attention needed", serious: "Impaired", critical: "Something is down", unknown: "Checking…" }[S.overall] || S.overall)}</div>
       <div class="sub" style="color:var(--ink-2)">Internet exit ${esc(eg.ip || "?")} ${eg.colo ? "· " + esc(eg.colo) : ""} · Leak guard ${mp.fail_closed ? "armed" : "<b>NOT armed</b>"}</div></div></div>
     ${servicesCard()}
@@ -569,7 +613,8 @@ V.setup = () => {
   <div class="grid g2">
     <div class="card"><h2>2 · Power-up order</h2><ol style="margin:0;padding-left:20px;font-size:13px;color:var(--ink-2)">
       <li><b>Modems first:</b> ISP, Starlink (needs open sky, up to 5 min), Spitz (cellular needs a SIM).</li>
-      <li><b>Then the CWWK.</b> It is ready about 2 minutes after power-on and starts everything itself.</li>
+      <li><b>Then the CWWK.</b> About 2 minutes after power-on it is up but <b>locked</b>: Wi-Fi and this page work, no internet yet.</li>
+      <li><b>Unlock:</b> plug the USB key (<span class="kbd">BRKEY</span>) into the CWWK, wait 10 s, then pull it out and keep it. Or an admin enters the vault passphrase here.</li>
       <li><b>Wait for green:</b> Health turns green when at least one modem carries the tunnel.</li>
       <li><b>Join Wi-Fi:</b> <span class="kbd">GL-X3000-0fd</span> (or <span class="kbd">-5G</span>), or plug a laptop into a free port; devices get a 10.40.0.x address.</li>
       <li><b>Run the self-test</b> (right) and fix anything red before relying on the kit.</li></ol></div>
@@ -636,7 +681,7 @@ V.help = () => `
       <ol><li><b>Open Health.</b> The "Fix it" boxes say what is wrong and what to do, worst first.</li>
       <li><b>Run the self-test</b> (Setup). Fix the first red line; later lines often depend on it.</li>
       <li><b>Wait 60 seconds</b> after any fix. Modems, DHCP and the tunnel recover on their own.</li>
-      <li><b>Last resort:</b> reboot the CWWK (power button). Everything starts by itself in about 2 min.</li></ol>
+      <li><b>Last resort:</b> reboot the CWWK (power button). It is back in about 2 min, locked: unlock it again (USB key or vault passphrase).</li></ol>
       <h3>No internet at all</h3><ul>
       <li>Is at least one modem plugged in with a green port? If not: cables / modem power.</li>
       <li>Ports green but no lanes: the modems have no internet, or the hub is down.</li>
@@ -699,6 +744,13 @@ function render(force) {
   const setDot = (id, lvl) => { const d = $("#" + id); if (d) d.style.background = `var(--${lvl || "unknown"})`; };
   setDot("d-overall", S.overall);
   for (const k of ["multipath", "network", "wifi", "compute", "services"]) setDot("d-" + k, (subs[k] || {}).level);
+  // Locked: every page is the lock screen (rebuilt unless someone is typing the passphrase)
+  if (S.lock && S.lock.state === "locked") {
+    const typing = document.activeElement && document.activeElement.id === "unlockpw";
+    if (force || !typing || !LOCKED_SHOWN) { $("#main").innerHTML = lockScreen(); LOCKED_SHOWN = true; }
+    return;
+  }
+  if (LOCKED_SHOWN) { LOCKED_SHOWN = false; force = true; }
   // don't rebuild the page under the user's hands (forms, iframe)
   const busy = document.activeElement && ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName);
   if (!force && (busy || view === "multipath" || view === "settings" || view === "help" || (view === "setup" && SELFTEST_BUSY) || $("#svcdlg").open || $("#svcimp").open)) return;
@@ -716,7 +768,7 @@ async function start() {
 }
 (async () => {
   const r = await fetch("api/session").then((x) => x.json()).catch(() => ({}));
-  if (r.authed) { CSRF = r.csrf; start(); } else showLogin();
+  if (r.authed) { CSRF = r.csrf; ME = { role: r.role, user: r.user }; start(); } else showLogin();
 })();
 </script>
 </body>

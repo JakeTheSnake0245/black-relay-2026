@@ -86,6 +86,43 @@ Change caps, mixing, hold and lanes on the controller's Multipath page. Hub side
 - Rotate the controller's Proxmox token and the router root password: `br-rotate-secrets` on the host
   (never prints secrets).
 
+## Site lock
+
+The box **starts locked at every power-on** (and after Lock, or a reboot). Locked:
+site devices get Wi-Fi/LAN addresses and this controller, and reach only the sign-in path at
+BR2026 (443), the router's DNS and the modem/dish pages. No internet, no services, no tailnet.
+The vault (encrypted volume `pve/br-vault`, mounted at `/mnt/br-vault`) is closed: it holds the
+host's tailnet identity, the host secrets (`/root/black-relay` points into it) and the storage
+of every service container (Proxmox storage `vault`). Host SSH and the Proxmox UI answer only
+the controller.
+
+**Unlock** (any one):
+- **USB key:** plug the stick labelled `BRKEY` into the CWWK; ~10 s. Pull it out afterwards
+  (a key left in counts as used; it must be re-inserted while locked to unlock again).
+- **On site:** https://10.40.0.10 → admin password → vault passphrase.
+- **Anywhere:** https://headscale.l8s.dev/cwwk/ → Pocket ID (admin) → vault passphrase.
+
+**Lock:** Health page → Lock site (admins). Five wrong passphrases wait 15 minutes.
+
+Owner: `br-lockd` on the host (`br-lockd status | lock`; console unlock: `br-lockd unlock`, then
+type the passphrase). It also re-applies the edge gate if br-edge restarts.
+
+**Service containers** that must stay off while locked: put their disks on storage `vault` and
+give them the Proxmox tag `br-gated` (set onboot off). br-lockd starts them on unlock and shuts
+them down on lock.
+
+**Keys** (on the host, box unlocked):
+- see the key slots: `cryptsetup luksDump /dev/pve/br-vault`
+- lost USB key: `cryptsetup luksKillSlot /dev/pve/br-vault 1` (slot 1 is the USB key; give the
+  passphrase when asked), then make a new stick (wipe it, label `BRKEY`, `BR-UNLOCK/cwwk01.key` =
+  64 random bytes) and `cryptsetup luksAddKey /dev/pve/br-vault <keyfile>`
+- new passphrase: `cryptsetup luksChangeKey /dev/pve/br-vault` (slot 0)
+- the tunnel's own site key stays outside the vault on purpose: the locked box needs the
+  tunnel to reach the sign-in page. Revoke it at the hub if the box is lost.
+
+First-time setup: `br-vault-init` on the host (creates the vault, shows the passphrase once,
+writes the USB key, moves the tailnet identity and secrets in).
+
 ## Health page
 
 Top to bottom: overall state, **Services** (every service card, deployed first, with Open
@@ -116,6 +153,8 @@ health. LAN → services is allowed; services → LAN is not; services → inter
 | `br-hostinfo` (service, 10.40.0.2:8091, controller only) | port links, temperatures, Blink port, host service states |
 | `br-controller-oidc` | store the Pocket ID client for the controller |
 | `br-rotate-secrets` | new Proxmox token + router root password |
+| `br-lockd` (service, 10.40.0.2:8092 TLS, controller only) | the site lock: vault, edge gate, tailnet, gated containers, USB key |
+| `br-vault-init` | one-time: create the vault and the USB key |
 
 Snapshot of the whole box (redacted): `../scripts/snapshot-cwwk.sh` → `../as-built/cwwk01/`.
 After a power-off test: `../scripts/capture-cold-start.sh` (see `../docs/cold-start-test.md`).

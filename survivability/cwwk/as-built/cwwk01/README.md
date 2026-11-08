@@ -53,7 +53,11 @@ only on the Proxmox host in `/root/black-relay/` (root-only) and are never copie
 5. **Host tools and tailnet:** restore `host/` units and scripts (`br-port-roles`, `br-hostinfo`; sources in `survivability/cwwk/controller/`),
    `systemctl enable --now` them, SSH drop-in (keys only), and enroll Tailscale with a tag-only
    pre-auth key for `tag:proxmox-subnet-router`.
-6. **Prove it:** controller **Setup → Run self-test**, everything green; then a cold start
+6. **Site lock:** install `br-lockd` (+ unit) from `survivability/cwwk/controller/`, enable it, give the
+   controller its cert and token (`lockd` in `config.json`), load the edge `nftables.conf` (it has
+   the `site_open` gate), then run `br-vault-init` on the host with the USB stick plugged in. From
+   then on the box starts locked.
+7. **Prove it:** controller **Setup → Run self-test**, everything green; then a cold start
    (`survivability/cwwk/scripts/capture-cold-start.sh`, `survivability/cwwk/docs/cold-start-test.md`).
 
 ## Where secrets come from (never in git)

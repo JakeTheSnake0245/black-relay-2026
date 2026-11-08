@@ -53,7 +53,8 @@ td { border-bottom: 1px solid #c3c2b7; padding: 2.5px 4px; vertical-align: top; 
     <h2>Power up</h2>
     <ol>
       <li><b>Modems first:</b> ISP router; Starlink (open sky, up to 5 min); Spitz (needs a SIM for its own cellular).</li>
-      <li><b>Then the CWWK.</b> Ready about 2 min after power-on; starts everything itself.</li>
+      <li><b>Then the CWWK:</b> up in ~2 min, <b>locked</b> (Wi-Fi only, no internet).</li>
+      <li><b>Unlock:</b> USB key <span class="mono">BRKEY</span> in, 10 s, <b>pull it out, keep it</b>. Or admin + vault passphrase in the controller.</li>
       <li><b>Wait for green</b> on the controller's Health page.</li>
       <li><b>Get on the network:</b> Wi-Fi <span class="mono">GL-X3000-0fd</span> (or <span class="mono">-5G</span>), or plug a laptop into a free port.</li>
       <li><b>Controller → Setup → Run self-test.</b> Fix the first red line first.</li>
@@ -96,7 +97,7 @@ td { border-bottom: 1px solid #c3c2b7; padding: 2.5px 4px; vertical-align: top; 
 <h2>Top fixes</h2>
 <table>
   <tr><th style="width:30%">You see</th><th>Do this</th></tr>
-  <tr><td><b>No internet at all</b></td><td>Is at least one modem plugged in with its power on? Setup shows each modem found. Modems found but no lanes: the modems have no internet, or the hub is down: call the hub admin.</td></tr>
+  <tr><td><b>No internet at all</b></td><td>"Site locked"? Unlock (Power up, 3). Else: is at least one modem plugged in with its power on? Setup shows each modem found. Modems found but no lanes: the modems have no internet, or the hub is down: call the hub admin.</td></tr>
   <tr><td><b>One modem red / slow</b></td><td>The others carry the traffic. Power-cycle that modem (unplug 10 s). Starlink: clear sky, wait 5 min, check it via its quick link or the Starlink app.</td></tr>
   <tr><td><b>No Wi-Fi</b></td><td>The Spitz must be on, with its <b>LAN</b> port cabled to the CWWK (any port). Give it 2 min after power-on.</td></tr>
   <tr><td><b>Laptop on a cable gets no address</b></td><td>Wait one minute. Still nothing after 2 min: unplug it for 5 s and plug it back in.</td></tr>

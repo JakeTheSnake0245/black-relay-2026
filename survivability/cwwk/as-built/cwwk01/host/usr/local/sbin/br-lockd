@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""br-lockd: the CWWK site lock. The box powers on LOCKED and opens only after an
+admin unlocks it.
+
+Locked (every power-on):
+  - edge gate closed: site devices reach only the sign-in path at BR2026 (443),
+    the router's DNS and modem admin pages; the controller also reaches the hub's
+    identity snapshot. No internet, no services.
+  - the vault (LUKS volume pve/br-vault) is closed: it holds the host's tailnet
+    identity, the host secrets and the storage of every service container.
+  - host tailnet (tailscaled) off; containers tagged `br-gated` stopped.
+  - host SSH / Proxmox UI answer only the controller.
+
+Unlock (any one):
+  - USB key: a stick labelled BRKEY with BR-UNLOCK/<site>.key, plugged into the CWWK.
+  - the vault passphrase, sent by the controller after an admin signed in
+    (on site: admin password; anywhere: Pocket ID at headscale.l8s.dev/cwwk/).
+Every key is checked by the vault itself: a key that cannot open it opens nothing.
+
+  br-lockd serve            the daemon (systemd: br-lockd.service)
+  br-lockd status           state as JSON
+  br-lockd lock             lock now
+  br-lockd unlock           read the passphrase from stdin (console use)
+
+API for the controller only (TLS on the host's LAN address, bearer token):
+  GET /state   POST /unlock {"passphrase", "who"}   POST /lock {"who"}
+"""
+import hmac
+import json
+import os
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CONF_PATH = "/etc/br-lockd/config.json"
+RUN = "/run/br-lockd"
+STATE_PATH = RUN + "/state.json"
+DEFAULTS = {
+    "site": "cwwk01",
+    "lv": "/dev/pve/br-vault",
+    "mapper": "br-vault",
+    "mount": "/mnt/br-vault",
+    "usb_label": "BRKEY",
+    "gated_tag": "br-gated",
+    "edge_ct": 101,
+    "edge_open": "10.32.0.0/11",
+    "controller": "10.40.0.10",
+    "listen": ["10.40.0.2", 8092],
+    "token_file": "/etc/br-lockd/token",
+    "cert": "/etc/br-lockd/cert.pem",
+    "key": "/etc/br-lockd/key.pem",
+    "auto_lock_hours": 0,
+}
+LOCKS = threading.Lock()          # one lock/unlock at a time
+FAILS = []                        # timestamps of wrong keys (rate limit)
+USB_SEEN = {"dev": None}          # a key stays inserted -> tried once
+
+
+def conf():
+    c = dict(DEFAULTS)
+    try:
+        c.update(json.load(open(CONF_PATH)))
+    except (OSError, ValueError):
+        pass
+    return c
+
+
+def run(*a, inp=None, timeout=60, check=False):
+    p = subprocess.run(a, input=inp, capture_output=True, timeout=timeout)
+    if check and p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout).decode(errors="replace").strip()[:200] or f"{a[0]} failed")
+    return p
+
+
+def log(msg):
+    subprocess.run(["logger", "-t", "br-lockd", msg])
+
+
+def vault_exists(c):
+    return os.path.exists(c["lv"])
+
+
+def vault_open(c):
+    return os.path.exists(f"/dev/mapper/{c['mapper']}")
+
+
+def mounted(path):
+    return run("mountpoint", "-q", path).returncode == 0
+
+
+def read_state():
+    try:
+        return json.load(open(STATE_PATH))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(s):
+    os.makedirs(RUN, mode=0o700, exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f)
+    os.replace(tmp, STATE_PATH)
+
+
+def current(c):
+    """locked | unlocked | setup (no vault yet: nothing to lock, gate held open)."""
+    if not vault_exists(c):
+        return "setup"
+    return "unlocked" if vault_open(c) and mounted(c["mount"]) else "locked"
+
+
+# ------------------------------------------------------------------ pieces
+def edge_gate(c, open_):
+    ct = str(c["edge_ct"])
+    if open_:
+        run("pct", "exec", ct, "--", "nft", "add", "element", "inet", "edge", "site_open", "{ " + c["edge_open"] + " }")
+    else:
+        run("pct", "exec", ct, "--", "nft", "flush", "set", "inet", "edge", "site_open")
+
+
+def edge_gate_is_open(c):
+    p = run("pct", "exec", str(c["edge_ct"]), "--", "nft", "list", "set", "inet", "edge", "site_open", timeout=15)
+    return p.returncode == 0 and c["edge_open"].split("/")[0] in p.stdout.decode()
+
+
+HOST_FW = """table inet br_lock {
+	chain input {
+		type filter hook input priority filter - 5; policy accept;
+		iifname "lo" accept
+		ct state established,related accept
+		tcp dport { 22, 8006 } ip saddr != %s drop
+	}
+}
+"""
+
+
+def host_fw(c, locked):
+    run("nft", "delete", "table", "inet", "br_lock")
+    if locked:
+        run("nft", "-f", "-", inp=(HOST_FW % c["controller"]).encode(), check=True)
+
+
+def gated_guests(c):
+    p = run("pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json", timeout=30)
+    try:
+        res = json.loads(p.stdout or b"[]")
+    except ValueError:
+        return []
+    out = []
+    for g in res:
+        tags = (g.get("tags") or "").replace(",", ";").split(";")
+        if c["gated_tag"] in tags:
+            out.append((g["type"], str(g["vmid"]), g.get("status")))
+    return out
+
+
+def guests(c, start):
+    for kind, vmid, status in gated_guests(c):
+        tool = "pct" if kind == "lxc" else "qm"
+        if start and status != "running":
+            run(tool, "start", vmid, timeout=120)
+        elif not start and status == "running":
+            if run(tool, "shutdown", vmid, "--timeout", "60", timeout=90).returncode != 0:
+                run(tool, "stop", vmid, timeout=60)
+
+
+def tailnet(start):
+    run("systemctl", "start" if start else "stop", "tailscaled", timeout=60)
+
+
+# ------------------------------------------------------------------ lock / unlock
+def unlock(secret, who, how):
+    c = conf()
+    if not vault_exists(c):
+        raise RuntimeError("no vault on this box yet (run br-vault-init)")
+    now = time.time()
+    FAILS[:] = [t for t in FAILS if now - t < 900]
+    if len(FAILS) >= 5:
+        raise PermissionError("too many wrong keys: wait 15 minutes")
+    with LOCKS:
+        if not vault_open(c):
+            p = run("cryptsetup", "open", "--key-file=-", c["lv"], c["mapper"], inp=secret, timeout=60)
+            if p.returncode != 0:
+                FAILS.append(time.time())
+                log(f"wrong key ({how}, {who})")
+                raise PermissionError("that key does not open this box")
+        os.makedirs(c["mount"], exist_ok=True)
+        if not mounted(c["mount"]):
+            run("mount", "-o", "nodev,nosuid", f"/dev/mapper/{c['mapper']}", c["mount"], check=True)
+        edge_gate(c, True)
+        host_fw(c, False)
+        tailnet(True)
+        guests(c, True)
+        FAILS.clear()
+        write_state({"state": "unlocked", "since": time.time(), "by": who, "how": how})
+        log(f"UNLOCKED by {who} ({how})")
+    return status()
+
+
+def lock(who, how="lock"):
+    c = conf()
+    with LOCKS:
+        guests(c, False)
+        tailnet(False)
+        edge_gate(c, False if vault_exists(c) else True)
+        if vault_exists(c):
+            host_fw(c, True)
+            run("sync")
+            if mounted(c["mount"]):
+                if run("umount", c["mount"]).returncode != 0:
+                    run("fuser", "-km", c["mount"])
+                    run("umount", "-l", c["mount"])
+            if vault_open(c):
+                run("cryptsetup", "close", c["mapper"], timeout=60)
+        write_state({"state": "locked", "since": time.time(), "by": who, "how": how})
+        log(f"LOCKED by {who} ({how})")
+    return status()
+
+
+def usb_key_dev(c):
+    p = f"/dev/disk/by-label/{c['usb_label']}"
+    return os.path.realpath(p) if os.path.exists(p) else None
+
+
+def try_usb(c):
+    dev = usb_key_dev(c)
+    if not dev:
+        USB_SEEN["dev"] = None
+        return
+    if USB_SEEN["dev"] == dev:
+        return                      # still inserted from the last try
+    USB_SEEN["dev"] = dev
+    mnt = RUN + "/usb"
+    os.makedirs(mnt, mode=0o700, exist_ok=True)
+    if run("mount", "-o", "ro,nodev,nosuid,noexec", dev, mnt).returncode != 0:
+        log(f"USB key {dev}: could not mount")
+        return
+    try:
+        with open(os.path.join(mnt, "BR-UNLOCK", c["site"] + ".key"), "rb") as f:
+            secret = f.read(4096)
+    except OSError:
+        secret = None
+    finally:
+        run("umount", mnt)
+    if not secret:
+        log(f"USB stick {dev} has no key for {c['site']}")
+        return
+    try:
+        unlock(secret, "USB key", "usb")
+    except Exception as e:
+        log(f"USB key rejected: {e}")
+
+
+def status():
+    c = conf()
+    st = read_state()
+    cur = current(c)
+    return {"state": cur, "since": st.get("since"), "by": st.get("by"), "how": st.get("how"),
+            "usb_inserted": bool(usb_key_dev(c)), "vault": vault_exists(c),
+            "auto_lock_hours": c.get("auto_lock_hours") or 0,
+            "wrong_keys_15min": len([t for t in FAILS if time.time() - t < 900])}
+
+
+def reconcile():
+    """Every few seconds: keep the pieces matching the state (a restarted edge
+    container comes up with its gate closed), watch for the USB key, auto-lock."""
+    tick = 0
+    while True:
+        c = conf()
+        try:
+            cur = current(c)
+            if cur == "locked":
+                try_usb(c)
+            else:
+                # a key already in while unlocked counts as used: it must be
+                # pulled and re-inserted to unlock again after a Lock
+                USB_SEEN["dev"] = usb_key_dev(c)
+            if tick % 4 == 0:   # ~every 12 s
+                want_open = current(c) in ("unlocked", "setup")
+                if edge_gate_is_open(c) != want_open:
+                    edge_gate(c, want_open)
+                    log(f"edge gate re-applied ({'open' if want_open else 'closed'})")
+            hrs = float(c.get("auto_lock_hours") or 0)
+            st = read_state()
+            if cur == "unlocked" and hrs > 0 and st.get("since") and time.time() - st["since"] > hrs * 3600:
+                lock("auto-lock", "auto")
+        except Exception as e:
+            log(f"reconcile: {e}"[:200])
+        tick += 1
+        time.sleep(3)
+
+
+# ------------------------------------------------------------------ API
+class H(BaseHTTPRequestHandler):
+    server_version = "br-lockd"
+    sys_version = ""
+    timeout = 15
+
+    def log_message(self, *a):
+        pass
+
+    def out(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def ok(self):
+        c = conf()
+        if self.client_address[0] != c["controller"]:
+            self.out(403, {"error": "forbidden"})
+            return False
+        try:
+            tok = open(c["token_file"]).read().strip()
+        except OSError:
+            tok = ""
+        got = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        if not tok or not hmac.compare_digest(got, tok):
+            self.out(403, {"error": "forbidden"})
+            return False
+        return True
+
+    def do_GET(self):
+        if not self.ok():
+            return
+        if self.path == "/state":
+            return self.out(200, status())
+        self.out(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self.ok():
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 4096:
+                return self.out(413, {"error": "too large"})
+            body = json.loads(self.rfile.read(n) or b"{}")
+            who = str(body.get("who") or "controller")[:80]
+            if self.path == "/unlock":
+                pw = body.get("passphrase")
+                if not isinstance(pw, str) or not 8 <= len(pw) <= 512:
+                    return self.out(400, {"error": "passphrase required"})
+                return self.out(200, unlock(pw.encode(), who, "passphrase"))
+            if self.path == "/lock":
+                return self.out(200, lock(who))
+            self.out(404, {"error": "not found"})
+        except PermissionError as e:
+            self.out(403, {"error": str(e)})
+        except Exception as e:
+            self.out(500, {"error": str(e)[:200]})
+
+
+class TLSServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr, handler, ctx):
+        super().__init__(addr, handler)
+        self.ctx = ctx
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        sock.settimeout(10)
+        return self.ctx.wrap_socket(sock, server_side=True), addr
+
+
+def serve():
+    c = conf()
+    os.makedirs(RUN, mode=0o700, exist_ok=True)
+    # Power-on: always locked (state lives in /run). Apply it before anything else.
+    if vault_exists(c) and current(c) != "unlocked":
+        lock("boot", "boot")
+    elif not vault_exists(c):
+        write_state({"state": "setup", "since": time.time(), "by": "boot", "how": "setup"})
+    threading.Thread(target=reconcile, daemon=True).start()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(c["cert"], c["key"])
+    while True:
+        try:
+            srv = TLSServer(tuple(c["listen"]), H, ctx)
+            break
+        except OSError:
+            time.sleep(3)   # LAN address not up yet
+    srv.serve_forever()
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "serve":
+        serve()
+    elif cmd == "status":
+        print(json.dumps(status(), indent=1))
+    elif cmd == "lock":
+        print(json.dumps(lock("console")))
+    elif cmd == "unlock":
+        pw = sys.stdin.readline().rstrip("\n").encode()
+        print(json.dumps(unlock(pw, "console", "passphrase")))
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

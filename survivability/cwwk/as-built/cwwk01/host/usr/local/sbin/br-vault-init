@@ -1,0 +1,155 @@
+#!/bin/bash
+# br-vault-init: one-time setup of the CWWK site lock's vault and its USB key.
+# Run it yourself on the host (it shows the vault passphrase ONCE, on your screen only):
+#
+#   ssh -t root@100.64.0.11 br-vault-init
+#
+# It:
+#   1. creates the vault: an encrypted volume (LUKS2, argon2id) pve/br-vault, 100 GB thin
+#   2. shows a new vault passphrase once: write it on paper, keep it apart from the USB key
+#   3. erases the USB stick you point at (asks first) and writes the unlock key onto it
+#      (label BRKEY, file BR-UNLOCK/<site>.key); the vault accepts that key too
+#   4. moves into the vault: the host's tailnet identity, the host secrets
+#      (/root/black-relay), and adds Proxmox storage "vault" for service containers
+#   5. leaves the box UNLOCKED. From the next power-on it starts LOCKED.
+# Nothing here is undone by itself; undo steps are in the CWWK runbook (Site lock).
+set -euo pipefail
+SITE=$(python3 -c 'import json;print(json.load(open("/etc/br-lockd/config.json")).get("site","cwwk01"))' 2>/dev/null || echo cwwk01)
+LV=/dev/pve/br-vault
+MAP=br-vault
+MNT=/mnt/br-vault
+W=$(mktemp -d /run/br-vault-init.XXXXXX); chmod 700 "$W"
+cleanup() { [ -f "$W/pass" ] && shred -u "$W/pass" 2>/dev/null; [ -f "$W/key" ] && shred -u "$W/key" 2>/dev/null; rm -rf "$W"; }
+trap cleanup EXIT
+
+[ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+[ -e "$LV" ] && { echo "A vault already exists ($LV). Nothing to do."; exit 1; }
+systemctl is-active -q br-lockd || { echo "br-lockd is not running; install it first."; exit 1; }
+
+echo "== installing cryptsetup"
+command -v cryptsetup >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -q cryptsetup-bin >/dev/null
+command -v cryptsetup >/dev/null || { echo "could not install cryptsetup"; exit 1; }
+
+# ---------------------------------------------------------------- the USB stick
+echo
+echo "== USB sticks plugged into the CWWK:"
+mapfile -t DISKS < <(lsblk -dnpo NAME,TRAN,SIZE,RM | awk '$2=="usb" && $3!="0B" {print $1}')
+if [ ${#DISKS[@]} -eq 0 ]; then echo "No USB stick found. Plug it into the CWWK and run this again."; exit 1; fi
+for d in "${DISKS[@]}"; do
+  echo "  $d  $(lsblk -dno SIZE,VENDOR,MODEL "$d" | tr -s ' ')"
+  lsblk -no NAME,SIZE,FSTYPE,LABEL "$d" | sed 's/^/      /'
+done
+if [ ${#DISKS[@]} -eq 1 ]; then USB=${DISKS[0]}; else read -rp "Which one is the key stick (e.g. /dev/sda)? " USB; fi
+case " ${DISKS[*]} " in *" $USB "*) ;; *) echo "$USB is not one of the USB sticks above"; exit 1 ;; esac
+read -rp "ERASE everything on $USB and make it the unlock key? Type YES: " ok
+[ "$ok" = YES ] || { echo "Stopped. Nothing changed."; exit 1; }
+
+# ---------------------------------------------------------------- secrets (never printed but once)
+PASS=<REDACTED>
+import secrets
+a = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+print("-".join("".join(secrets.choice(a) for _ in range(5)) for _ in range(6)))
+PY
+)
+printf '%s' "$PASS" > "$W/pass"
+head -c 64 /dev/urandom > "$W/key"
+
+# ---------------------------------------------------------------- vault
+echo "== creating the vault (100 GB, encrypted)"
+lvcreate -q -V 100G -T pve/data -n br-vault >/dev/null
+cryptsetup luksFormat -q --type luks2 --pbkdf argon2id --label br-vault --key-file="$W/pass" "$LV"
+cryptsetup luksAddKey -q --key-file="$W/pass" "$LV" "$W/key"
+cryptsetup open --key-file="$W/pass" "$LV" "$MAP"
+mkfs.ext4 -q -L br-vault "/dev/mapper/$MAP"
+mkdir -p "$MNT"
+mount -o nodev,nosuid "/dev/mapper/$MAP" "$MNT"
+mkdir -p "$MNT/tailscale" "$MNT/secrets" "$MNT/pve"
+chmod 700 "$MNT/tailscale" "$MNT/secrets"
+
+# ---------------------------------------------------------------- USB key
+echo "== writing the USB key"
+for p in $(lsblk -nlpo NAME "$USB" | tail -n +2); do umount "$p" 2>/dev/null || true; done
+wipefs -aq "$USB"
+sgdisk -Z "$USB" >/dev/null 2>&1 || true
+sgdisk -n 1:0:0 -t 1:0700 -c 1:BRKEY "$USB" >/dev/null
+partprobe "$USB" 2>/dev/null || blockdev --rereadpt "$USB" || true
+udevadm settle; sleep 1
+PART=$(lsblk -nlpo NAME "$USB" | sed -n 2p)
+mkfs.vfat -F 32 -n BRKEY "$PART" >/dev/null
+mkdir -p "$W/usb"; mount "$PART" "$W/usb"
+mkdir -p "$W/usb/BR-UNLOCK"
+cp "$W/key" "$W/usb/BR-UNLOCK/$SITE.key"
+cat > "$W/usb/README.txt" <<EOF
+Unlock key for the CWWK site box "$SITE".
+Plug this stick into the CWWK: the box unlocks within a few seconds.
+Then take it out and keep it with you. Anyone holding it can unlock the box.
+Lost it? Lock the box from the controller and tell the operator: the key is
+revoked by removing it from the vault (runbook: Site lock).
+EOF
+sync; umount "$W/usb"
+echo "   USB key written to $PART (label BRKEY)."
+echo "   NOTE: the stick is still plugged in. Pull it out now; the box treats a key that"
+echo "   stays inserted as used, and it only unlocks again when re-inserted while locked."
+
+# ---------------------------------------------------------------- host secrets into the vault
+echo "== moving host secrets into the vault"
+if [ -d /root/black-relay ] && [ ! -L /root/black-relay ]; then
+  cp -a /root/black-relay/. "$MNT/secrets/"
+  find /root/black-relay -type f -exec shred -u {} \;
+  rm -rf /root/black-relay
+  ln -s "$MNT/secrets" /root/black-relay
+fi
+
+# ---------------------------------------------------------------- Proxmox storage for service containers
+pvesm status 2>/dev/null | awk '{print $1}' | grep -qx vault || \
+  pvesm add dir vault --path "$MNT/pve" --content rootdir,images --is_mountpoint "$MNT" >/dev/null
+
+# ---------------------------------------------------------------- tailnet identity into the vault
+# Detached: restarting tailscaled can drop an SSH session that rides the tailnet.
+mkdir -p /etc/systemd/system/tailscaled.service.d
+cat > /etc/systemd/system/tailscaled.service.d/br-vault.conf <<EOF
+# Site lock: the tailnet identity lives in the vault; tailscaled runs only when
+# the box is unlocked (br-lockd starts and stops it).
+[Unit]
+RequiresMountsFor=$MNT
+ConditionPathIsMountPoint=$MNT
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/tailscaled --state=$MNT/tailscale/tailscaled.state --statedir=$MNT/tailscale --socket=/run/tailscale/tailscaled.sock --port=\${PORT} \$FLAGS
+EOF
+echo "== moving the tailnet identity (the tailnet blinks for a few seconds)"
+nohup sh -c "
+  systemctl stop tailscaled
+  cp -a /var/lib/tailscale/. $MNT/tailscale/
+  systemctl daemon-reload
+  systemctl disable -q tailscaled
+  systemctl start tailscaled
+  sleep 5
+  if tailscale status >/dev/null 2>&1; then
+    shred -u /var/lib/tailscale/tailscaled.state 2>/dev/null; rm -rf /var/lib/tailscale/files /var/lib/tailscale/profile-data
+    logger -t br-vault-init 'tailnet identity moved into the vault'
+  else
+    logger -t br-vault-init 'tailscaled did not come back from the vault: old state kept in /var/lib/tailscale'
+  fi
+" >/dev/null 2>&1 &
+
+python3 - <<'PY'
+import json, time, os
+os.makedirs("/run/br-lockd", mode=0o700, exist_ok=True)
+json.dump({"state": "unlocked", "since": time.time(), "by": "setup", "how": "setup"}, open("/run/br-lockd/state.json", "w"))
+PY
+
+echo
+echo "================================================================"
+echo " VAULT PASSPHRASE (shown once; write it down, keep it apart from the USB key):"
+echo
+echo "     $PASS"
+echo
+echo " It unlocks the box from the controller (with an admin sign-in) and is the"
+echo " way in if the USB key is lost. It cannot be shown again."
+echo "================================================================"
+unset PASS
+read -rp "Press Enter once you have written it down... " _
+clear 2>/dev/null || true
+echo "Done. The box is UNLOCKED now and starts LOCKED from the next power-on."
+echo "Test it: controller -> Lock now, then plug the USB key in."
