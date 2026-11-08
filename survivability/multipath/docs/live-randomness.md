@@ -90,12 +90,46 @@ holding everything up.
 **On the wire:** 23.7% of neighbouring packets (in the hub's send order) arrive at the site
 swapped; the resequencer puts them back in order.
 
+## Known data stream: what one carrier could reconstruct (third run)
+
+`payload-push.py` sent a 20 MB pseudo-random stream (20,000 × 1,000 bytes, seed 911) from br-edge
+to the hub as pings; the hub echoed it, so it crossed once each way. Meanwhile
+`wire-search.py` recorded every raw byte on each modem port and searched it, at every offset, for
+any 16-byte piece of the stream (1.25 million pieces). Both ends' lane captures gave which carrier
+carried each part (`stream-coverage.py`; the test packets are exactly 1,058 bytes on the lanes).
+
+**Delivered:** 20,000 of 20,000 packets came back byte-exact, 0 out of order.
+
+**What an eavesdropper on one carrier gets: nothing.**
+
+| where | captured | pieces of the stream found |
+|---|---|---|
+| Starlink port | 17.2 MB | 0 |
+| ISP port | 35.7 MB | 0 |
+| Spitz port | 6.2 MB | 0 |
+| tunnel inside (control, unencrypted) | 41.6 MB | 2,480,000 (the whole stream, both ways) |
+
+**Worst case, as if a carrier's encryption were broken:** what share it carried, and in what pieces.
+
+| carrier | upload share | longest unbroken stretch | complete 4 KB / 16 KB / 64 KB blocks | download share | longest stretch | complete 4 KB / 16 KB / 64 KB |
+|---|---|---|---|---|---|---|
+| ISP | 86.8% | 47 KB | 56.7% / 10.3% / 0% | 46.5% | 12 KB | 4.5% / 0% / 0% |
+| Starlink | 9.0% | 4 KB | 0 / 0 / 0 | 47.4% | 13 KB | 5.1% / 0% / 0% |
+| Spitz | 4.2% | 2 KB | 0 / 0 / 0 | 6.1% | 3 KB | 0 / 0 / 0 |
+
+Every block figure equals what pure random spreading predicts (e.g. ISP upload 4 KB: 56.7% vs
+56.8%). Downloads are well fragmented: no carrier ever holds 16 KB in one piece. Uploads lean on
+the ISP by design (caps 100 vs Starlink 10 and Spitz 5 Mbit up), so in this hypothetical the ISP
+holds most of the upload stream in stretches up to ~47 KB. Fragmenting uploads more means giving
+the ISP a smaller share, which costs upload speed (Starlink's real upload is ~9 Mbit).
+
 ## Conclusion
 
 Both schedulers, the site's (upload) and the hub's (download, measured at the hub), pick lanes
 randomly and in proportion to the caps: no pattern, no memory, no round-robin, equal use of each
-modem's lanes. Arrival order at the far end clusters a little because each lane is TCP. An observer on any one carrier sees only that carrier's encrypted lanes and its random
-share of the traffic. This is statistical randomness of path choice; confidentiality rests on the
+modem's lanes. Arrival order at the far end clusters a little because each lane is TCP. An observer on any one carrier sees only that carrier's encrypted lanes: a 20 MB known
+stream left no readable trace on any carrier, and even with the encryption broken a carrier
+would hold only its random share, in pieces. This is statistical randomness of path choice; confidentiality rests on the
 tunnel's encryption, not on the randomness.
 
 ## Re-run
@@ -111,9 +145,11 @@ python3 multipath/analysis/lane-randomness.py lanes.csv "$(grep ^UPLINKS /etc/bl
 # hub end at the same time (on BR2026):
 sudo nsenter -t "$(sudo docker inspect -f '{{.State.Pid}}' survivability-black-relay)" -n \
   python3 hub-lane-capture.py 80 /tmp/hub-lanes.csv
+# known-stream test (br-edge): payload-push.py SEED PACKETS + wire-search.py SECONDS SEED PACKETS,
+# then stream-coverage.py site.csv hub-mapped.csv "<UPLINKS>" 1058
 # then
 python3 multipath/analysis/lane-ends.py lanes.csv hub-lanes.csv hub-mapped.csv
 python3 multipath/analysis/lane-randomness.py hub-mapped.csv "<UPLINKS>" 6 hub
 ```
 
-Raw data (timings, lanes, sizes only): `archive/lane-test-20261108/` and `.../both-ends/` (local).
+Raw data (timings, lanes, sizes only): `archive/lane-test-20261108/` and `.../both-ends/`, `.../payload/` (local).
