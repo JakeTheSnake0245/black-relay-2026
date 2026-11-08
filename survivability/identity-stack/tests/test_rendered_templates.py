@@ -793,6 +793,9 @@ class SensorFusionDevTests(unittest.TestCase):
         self.assertEqual(dev["runtime"], "sysbox-runc")
         self.assertEqual(set(dev["networks"]), {"sf_dev"})
         self.assertNotIn("/var/run/docker.sock", " ".join(dev["volumes"]))
+        # One place per limit: compose refuses pids set both here and under deploy.
+        self.assertNotIn("deploy", dev)
+        self.assertEqual((dev["cpus"], dev["mem_limit"], dev["pids_limit"]), (2.0, "4G", 8192))
 
     def test_sf_dev_keeps_everything_on_its_disk(self):
         # Users' packages, Docker images and volumes, files and the node

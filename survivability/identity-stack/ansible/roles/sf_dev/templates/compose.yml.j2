@@ -14,6 +14,9 @@ services:
     runtime: sysbox-runc
     restart: unless-stopped
     devices: ["/dev/net/tun:/dev/net/tun"]
+    # Plain limits (one setting each; compose rejects pids in two places).
+    cpus: {{ sf_dev_cpus }}
+    mem_limit: "{{ sf_dev_memory }}"
     pids_limit: {{ sf_dev_pids_limit }}
     volumes:
       # Everything that must survive a rebuild is on the disk.
@@ -25,9 +28,6 @@ services:
       - "{{ sf_dev_dir }}/disk/tailscale:/var/lib/tailscale"
     networks:
       {{ sf_dev_network }}: {}
-    deploy:
-      resources:
-        limits: {memory: "{{ sf_dev_memory }}", cpus: "{{ sf_dev_cpus }}"}
 
 networks:
   {{ sf_dev_network }}:
