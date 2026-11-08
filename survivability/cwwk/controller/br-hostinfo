@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""br-hostinfo: tiny read-only facts about the CWWK host for the controller.
+
+Listens on the host's LAN address only and answers only the controller
+(10.40.0.10). Stdlib only.
+
+  GET  /nics    physical ports: link (cable), speed, role
+  GET  /temps   CPU package / board / NVMe temperatures (C)
+  GET  /units   the host's own services, the port guard and the tailnet (health page)
+  POST /blink   {"nic": "nic2"}  flash that port's LED for 15 s (ethtool -p)
+"""
+import json
+import os
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LISTEN = ("10.40.0.2", 8091)
+ALLOWED = {"10.40.0.10"}
+ROLE_STATE = "/run/br-port-roles.json"   # written by br-port-roles
+
+
+def phys_nics():
+    """Every physical Ethernet port, found at runtime (nothing fixed here)."""
+    out = []
+    for n in os.listdir("/sys/class/net"):
+        if os.path.exists(f"/sys/class/net/{n}/device") and not os.path.exists(f"/sys/class/net/{n}/wireless"):
+            out.append(n)
+    return sorted(out, key=lambda x: (len(x), x))
+
+
+BLINKING = {}
+
+
+def rd(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def nics():
+    out = []
+    try:
+        roles = json.load(open(ROLE_STATE))
+    except (OSError, ValueError):
+        roles = {}
+    for n in phys_nics():
+        r = roles.get(n, {})
+        mode = r.get("mode", "modem")
+        role = ("Client device: on the site LAN" if mode == "client"
+                else "Modem port" + (" + Wi-Fi access point" if r.get("wifi") else ""))
+        base = f"/sys/class/net/{n}"
+        carrier = rd(base + "/carrier") == "1"
+        speed = rd(base + "/speed")
+        out.append({"nic": n, "role": role, "link": carrier,
+                    "speed": int(speed) if carrier and speed and speed.lstrip("-").isdigit() and int(speed) > 0 else None,
+                    "mac": rd(base + "/address"), "blinking": BLINKING.get(n, 0) > time.time(),
+                    "mode": mode, "wifi": bool(r.get("wifi")), "client_mac": r.get("client_mac")})
+    return out
+
+
+def temps():
+    t = {}
+    for h in sorted(os.listdir("/sys/class/hwmon")):
+        name = rd(f"/sys/class/hwmon/{h}/name")
+        v = rd(f"/sys/class/hwmon/{h}/temp1_input")
+        if name and v and v.lstrip("-").isdigit():
+            t[{"coretemp": "cpu", "acpitz": "board", "nvme": "nvme"}.get(name, name)] = round(int(v) / 1000, 1)
+    return t
+
+
+HOST_UNITS = ["pveproxy", "pvedaemon", "pve-cluster", "ssh", "tailscaled", "br-port-roles", "br-hostinfo"]
+
+
+def run(*a, timeout=4):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def units():
+    out = {"units": {n: (run("systemctl", "is-active", n).strip() or "unknown") for n in HOST_UNITS}}
+    out["port_guard"] = "table bridge br_port_roles" in run("nft", "list", "tables")
+    try:
+        ts = json.loads(run("tailscale", "status", "--json", "--peers=false") or "{}")
+        me = ts.get("Self") or {}
+        out["tailnet"] = {"state": ts.get("BackendState"), "online": bool(me.get("Online")),
+                          "ip": (ts.get("TailscaleIPs") or [None])[0], "name": me.get("HostName")}
+    except ValueError:
+        out["tailnet"] = {"state": "unknown"}
+    return out
+
+
+class H(BaseHTTPRequestHandler):
+    server_version = "br-hostinfo"
+    sys_version = ""
+    timeout = 10   # slow / silent clients don't pile up
+
+    def log_message(self, *a):
+        pass
+
+    def out(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def ok(self):
+        if self.client_address[0] not in ALLOWED:
+            self.out(403, {"error": "forbidden"})
+            return False
+        return True
+
+    def do_GET(self):
+        if not self.ok():
+            return
+        if self.path == "/nics":
+            self.out(200, nics())
+        elif self.path == "/temps":
+            self.out(200, temps())
+        elif self.path == "/units":
+            self.out(200, units())
+        else:
+            self.out(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self.ok():
+            return
+        if self.path != "/blink":
+            return self.out(404, {"error": "not found"})
+        try:
+            ln = int(self.headers.get("Content-Length") or 0)
+            if not 0 <= ln <= 256:   # a negative length would read to EOF
+                return self.out(400, {"error": "bad body length"})
+            n = json.loads(self.rfile.read(ln) or b"{}").get("nic")
+        except Exception:
+            n = None
+        if n not in phys_nics():
+            return self.out(400, {"error": "unknown port"})
+        if BLINKING.get(n, 0) > time.time():
+            return self.out(200, {"ok": True, "note": "already blinking"})
+        BLINKING[n] = time.time() + 15
+        threading.Thread(target=lambda: subprocess.run(["/usr/sbin/ethtool", "-p", n, "15"],
+                                                       capture_output=True, timeout=30), daemon=True).start()
+        self.out(200, {"ok": True, "seconds": 15})
+
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer(LISTEN, H)
+    srv.daemon_threads = True
+    srv.serve_forever()

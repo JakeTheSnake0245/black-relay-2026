@@ -5,15 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Black Relay Bonding</title>
 <style>
-/* Tokens: reference data-viz palette. Lane colors are fixed per uplink
-   (slots 1-3 validate all-pairs for CVD in both modes). Status colors are
-   reserved and always paired with an icon + label. */
+/* Tokens: reference data-viz palette. Lane colors follow the kind of modem,
+   not the port (Starlink, ISP, Spitz; a second modem of the same kind gets
+   --lane-3; a port with nothing working is neutral). Slots 0-2 validate
+   all-pairs for CVD in both modes. Status colors are reserved and always
+   paired with an icon + label. */
 :root {
   color-scheme: dark;
   --page: #0d0d0d; --surface: #1a1a19; --surface-2: #222220;
   --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
   --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
-  --lane-0: #3987e5; --lane-1: #d95926; --lane-2: #199e70;
+  --lane-0: #3987e5; --lane-1: #d95926; --lane-2: #199e70; --lane-3: #9b7be0;
   --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b; --offline: #898781;
 }
 @media (prefers-color-scheme: light) {
@@ -22,7 +24,7 @@
     --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee;
     --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
     --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
-    --lane-0: #2a78d6; --lane-1: #eb6834; --lane-2: #1baf7a;
+    --lane-0: #2a78d6; --lane-1: #eb6834; --lane-2: #1baf7a; --lane-3: #7b5cc8;
   }
 }
 :root[data-theme="light"] {
@@ -30,7 +32,7 @@
   --page: #f9f9f7; --surface: #fcfcfb; --surface-2: #f3f2ee;
   --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
-  --lane-0: #2a78d6; --lane-1: #eb6834; --lane-2: #1baf7a;
+  --lane-0: #2a78d6; --lane-1: #eb6834; --lane-2: #1baf7a; --lane-3: #7b5cc8;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--page); color: var(--ink);
@@ -148,7 +150,15 @@ const HIST = 300;
 let hist = [], snap = null, lastT = 0;
 const $ = (id) => document.getElementById(id);
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-const laneColor = (i) => css("--lane-" + Math.min(i, 2));
+// Color = kind of modem (fixed), so a modem keeps its color in any port.
+const KIND_COLOR = { starlink: "--lane-0", isp: "--lane-1", spitz: "--lane-2" };
+function laneColor(i) {
+  const L = snap ? snap.lanes : [], l = L[i];
+  const k = l && l.addr ? String(l.kind || "").toLowerCase() : "";
+  if (!KIND_COLOR[k]) return css("--offline");
+  const repeat = L.slice(0, i).some((x) => x.addr && String(x.kind || "").toLowerCase() === k);
+  return css(repeat ? "--lane-3" : KIND_COLOR[k]);
+}
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 const ICONS = {

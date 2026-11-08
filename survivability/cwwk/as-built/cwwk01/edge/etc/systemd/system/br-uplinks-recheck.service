@@ -1,0 +1,8 @@
+[Unit]
+Description=Black Relay: re-check what is in each port (late Starlink, pulled cables)
+After=black-relay@br0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/br-uplinks recheck
+TimeoutStartSec=60

@@ -59,6 +59,21 @@ PY
 		done
 		/usr/local/sbin/br-uplinks apply >/dev/null
 		log "caps=$*"; echo "ok (applies on restart-tunnel)" ;;
+	units)
+		# read-only: the edge's own services, for the controller's health page
+		python3 - <<'PY'
+import json, subprocess
+def run(*a):
+    return subprocess.run(a, capture_output=True, text=True, timeout=5).stdout
+names = ["black-relay@br0", "black-relay-watch@br0", "br-uplinks-recheck.timer", "br-lane-nurse", "br-watchdog", "br-dash",
+         "dnsmasq", "nftables", "systemd-networkd"]
+units = {n: (run("systemctl", "is-active", n).strip() or "unknown") for n in names}
+lanes = [l.split() for l in run("systemctl", "list-units", "--all", "--type=service", "--no-legend",
+                                 "--plain", "black-relay-lane-*").splitlines() if l.strip()]
+print(json.dumps({"units": units, "lanes_total": len(lanes),
+                  "lanes_running": sum(1 for l in lanes if len(l) > 3 and l[3] == "running")}))
+PY
+		;;
 	uplinks)
 		# what is plugged into each port (written before every tunnel start)
 		cat /run/black-relay/uplinks.json 2>/dev/null || /usr/local/sbin/br-uplinks ;;
@@ -85,5 +100,5 @@ if sp:
 print(json.dumps({"reachable": ok, "port": sp.get("port", "")}))
 PY
 		;;
-	*) echo "verbs: status set-sched set-hold set-lanes set-caps restart-tunnel spitz uplinks selftest" >&2; exit 2 ;;
+	*) echo "verbs: status set-sched set-hold set-lanes set-caps restart-tunnel spitz uplinks units selftest" >&2; exit 2 ;;
 esac

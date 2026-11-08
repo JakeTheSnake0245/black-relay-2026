@@ -2,7 +2,7 @@
 
 Mermaid sources for how the site box, its modems and the hub connect and work.
 They render on GitHub and in VS Code. Companion to
-`../Black-Relay-Site-Architecture.pdf` and `../controller/README.md`.
+`../../cwwk/docs/Black-Relay-Site-Architecture.pdf` and `../../cwwk/controller/README.md`.
 
 ## 1. End to end: every modem, its own carrier, one hub
 
