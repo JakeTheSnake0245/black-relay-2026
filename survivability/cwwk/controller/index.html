@@ -804,7 +804,7 @@ V.help = () => `
       <li><b>Run self-test, Blink port:</b> always safe.</li>
       <li><b>Restart tunnel:</b> traffic pauses ~5–10 s, then resumes.</li>
       <li><b>Start a container:</b> safe. The three core containers can't be stopped from here on purpose.</li>
-      <li><b>Tuning changes:</b> safe to try; defaults are random mix, 400 ms hold, 6 connections, ISP 100/150, Starlink 10/150, Spitz 5/20 (downloads split evenly between ISP and Starlink).</li></ul>
+      <li><b>Tuning changes:</b> safe to try on the Multipath page: a slider per connection (upload / download), a bar showing each modem's share, Reset to defaults. Defaults: random mix, 400 ms hold, 6 connections, ISP 100/150, Starlink 10/150, Spitz 5/20 Mbit. Lower a connection's caps to send it less of the traffic.</li></ul>
       <h3>Addresses (on the site network)</h3><ul>
       <li><span class="kbd">https://controller.lan</span>: this page · <span class="kbd">https://status.lan</span>: simple status, no login</li>
       <li><span class="kbd">https://router.lan</span>: router admin (LuCI)</li>

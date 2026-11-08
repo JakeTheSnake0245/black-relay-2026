@@ -39,4 +39,7 @@ Afterwards: `scripts/snapshot-cwwk.sh` so `as-built/` matches.
 ## Current state (2026-11-08)
 
 Ports: nic0 Starlink, nic1 empty, nic2 ISP (travel router), nic3 Spitz (Wi-Fi + cellular).
-18 lanes. Exit IP 89.167.30.202.
+18 lanes. Exit IP 89.167.30.202. Wi-Fi: BR2026_2 / BR2026_5. Starts locked (USB key or
+admin + vault passphrase). Every port also carries VLAN 41 (services) for a switch; the
+controller's Network page follows a marked switch. Speed caps: sliders on the Multipath page.
+Randomness and no-plaintext-on-any-carrier verified live: `multipath/docs/live-randomness.md`.

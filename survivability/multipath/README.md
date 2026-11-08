@@ -21,7 +21,7 @@ day to day: the CWWK site box is `../cwwk/`, BR2026 itself is `../identity-stack
 | `edge/` | Site-edge tools (installed on a site's `br-edge` container): `br-uplinks` (recognises the modem in each port, re-checks every minute), `carriers.conf` (modem kinds and speed caps), `br-ctl` (the controller's only commands), `br-selftest`, `br-lane-nurse`, firewall (`nftables.conf`), networkd files. |
 | `dist/` | Built packages and hub images, with `SHA256SUMS`. |
 | `docs/` | `diagrams.md` (Mermaid; rendered to `../docs/Black-Relay-Diagrams.pdf` by `scripts/render-diagrams.py`), `lab-results.md` (measurements behind the defaults). |
-| `gt-lab/`, `analysis/` | Three-lane netns lab and capture-analysis tools used to tune the tunnel. |
+| `gt-lab/`, `analysis/` | Three-lane netns lab and capture-analysis tools; live checks at both ends (lane randomness, known-stream wire search): report in `docs/live-randomness.md`. |
 | `scripts/deploy-test.sh` | Push the fork + lab to a throwaway VPS and run the self-tests (never production). |
 
 The hub side on BR2026 is Ansible: `survivability/identity-stack/ansible/roles/black_relay_hub`

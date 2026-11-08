@@ -51,7 +51,7 @@ Password sign-in and the status page are refused there. Pocket ID client: callba
 
 | file | setting |
 |---|---|
-| `/etc/black-relay/carriers.conf` | modem kinds, how they're recognised, caps (TX/RX Mbit): ISP 100/150, Starlink 10/150, Spitz 5/20 |
+| `/etc/black-relay/carriers.conf` | modem kinds, how they're recognised, caps (up/down Mbit): ISP 100/150, Starlink 10/150, Spitz 5/20 (set with the sliders on the Multipath page) |
 | `/etc/black-relay/br0.conf` | `TRANSPORT=wss`, `WSS_LANES=6`; `UPLINKS` is written by `br-uplinks` before every tunnel start |
 | `/etc/black-relay/black-relay.env` | `GT_SCHED=random`, `GT_RESEQ_MS=400`, `GT_FEC=0`, `GT_KEEPALIVE_MS=200` |
 | tunnel helper | `GT_MTU=1400` for WebSocket lanes (fork patch 0003) |
