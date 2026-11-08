@@ -54,6 +54,12 @@ backup_restic_exclude_patterns:
   - /srv/sf-dev/disk/system/var/cache
   - /srv/sf-dev/disk/system/var/tmp
   - /srv/sf-dev/disk/home/*/.cache
+  # sf-dev's Docker: keep volumes (team data), skip rebuildable layers/caches
+  - /srv/sf-dev/disk/docker/overlay2
+  - /srv/sf-dev/disk/docker/image
+  - /srv/sf-dev/disk/docker/buildkit
+  - /srv/sf-dev/disk/docker/containerd
+  - /srv/sf-dev/disk/docker/tmp
 backup_restic_sqlite_roots:
   - /srv
 backup_restic_sqlite_globs:

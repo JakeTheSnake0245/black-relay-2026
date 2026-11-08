@@ -1,7 +1,8 @@
 ---
-# sf-dev: Sensor Fusion development container, reached only over the tailnet.
-# State that survives rebuilds lives on the 20 GB disk: /home and the
-# Tailscale node identity. Packages installed inside the container do not.
+# sf-dev: the Sensor Fusion box. A Sysbox system container (systemd + its own
+# Docker inside, own user namespace), reached only over the tailnet. Its whole
+# system, Docker data, /home and tailnet identity live on its own disk, so
+# restarts, recreates and image rebuilds keep everything.
 
 - name: Require the tags sf-dev joins with to be declared in the policy
   ansible.builtin.assert:
@@ -14,6 +15,65 @@
     sf_dev_policy_file: "{{ role_path }}/../identity_stack/files/headscale-policy.hujson"
     sf_dev_tag_owner_line: '"{{ item }}": ["group:survivability"]'
 
+# ---------------------------------------------------------------- Sysbox
+# Docker must already know the network settings Sysbox wants, or its installer
+# restarts Docker (every service on this host). bip keeps today's docker0.
+- name: Docker settings Sysbox needs (no Docker restart)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    python3 - <<'PY'
+    import json, os
+    p = "/etc/docker/daemon.json"
+    c = json.load(open(p))
+    before = json.dumps(c, sort_keys=True)
+    c.setdefault("bip", "{{ sf_dev_docker_bip }}")
+    if not c.get("default-address-pools"):
+        c["default-address-pools"] = [{"base": "{{ sf_dev_docker_pool }}", "size": 24}]
+    c.setdefault("runtimes", {}).setdefault("sysbox-runc", {"path": "/usr/bin/sysbox-runc"})
+    if json.dumps(c, sort_keys=True) != before:
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(c, f, indent=2)
+        os.replace(tmp, p)
+        print("changed")
+    PY
+  args:
+    executable: /bin/bash
+  register: sf_dev_daemon_json
+  changed_when: "'changed' in sf_dev_daemon_json.stdout"
+
+- name: Sysbox package
+  ansible.builtin.get_url:
+    url: "{{ sf_dev_sysbox_url }}"
+    dest: "/root/sysbox-ce_{{ sf_dev_sysbox_version }}.deb"
+    checksum: "sha256:{{ sf_dev_sysbox_sha256 }}"
+    mode: "0600"
+
+- name: Install Sysbox
+  ansible.builtin.apt:
+    deb: "/root/sysbox-ce_{{ sf_dev_sysbox_version }}.deb"
+
+# Runtimes are a reloadable Docker setting: SIGHUP, never a restart.
+- name: Make Docker load the Sysbox runtime
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if ! docker info --format '{{ '{{' }}json .Runtimes{{ '}}' }}' | grep -q sysbox-runc; then
+      kill -HUP "$(pidof dockerd)"; sleep 2
+      echo reloaded
+    fi
+    docker info --format '{{ '{{' }}json .Runtimes{{ '}}' }}' | grep -q sysbox-runc
+  args:
+    executable: /bin/bash
+  register: sf_dev_runtime
+  changed_when: "'reloaded' in sf_dev_runtime.stdout"
+
+- name: Sysbox running
+  ansible.builtin.systemd_service:
+    name: sysbox
+    enabled: true
+    state: started
+
+# ---------------------------------------------------------------- disk
 - name: Create the sf-dev directories
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -26,7 +86,7 @@
     - {path: "{{ sf_dev_dir }}/build", mode: "0700"}
     - {path: "{{ sf_dev_dir }}/disk", mode: "0755"}
 
-- name: 20 GB disk image
+- name: Disk image
   ansible.builtin.shell: >-
     fallocate -l {{ sf_dev_disk_size }} {{ sf_dev_dir }}/disk.img &&
     mkfs.ext4 -q -L sf-dev {{ sf_dev_dir }}/disk.img
@@ -45,7 +105,26 @@
     passno: "2"
     state: mounted
 
-- name: Home and Tailscale state on the disk
+# Grows only, online (ext4 under its loop device). Never shrinks.
+- name: Grow the disk to its size
+  ansible.builtin.shell: |
+    set -euo pipefail
+    img={{ sf_dev_dir }}/disk.img
+    want=$(numfmt --from=iec {{ sf_dev_disk_size }})
+    have=$(stat -c %s "$img")
+    if [ "$have" -lt "$want" ]; then
+      fallocate -l {{ sf_dev_disk_size }} "$img"
+      dev=$(losetup -j "$img" | cut -d: -f1 | head -n1)
+      losetup -c "$dev"
+      resize2fs -f "$dev" >/dev/null
+      echo grown
+    fi
+  args:
+    executable: /bin/bash
+  register: sf_dev_grow
+  changed_when: "'grown' in sf_dev_grow.stdout"
+
+- name: Home, Docker data and tailnet identity on the disk
   ansible.builtin.file:
     path: "{{ item.path }}"
     state: directory
@@ -54,27 +133,19 @@
     mode: "{{ item.mode }}"
   loop:
     - {path: "{{ sf_dev_dir }}/disk/home", mode: "0755"}
+    - {path: "{{ sf_dev_dir }}/disk/docker", mode: "0710"}
     - {path: "{{ sf_dev_dir }}/disk/tailscale", mode: "0700"}
 
-# The image only seeds a new box's system; after that the system lives on the
-# disk and a rebuilt image changes nothing users installed.
+# ---------------------------------------------------------------- image + system
 - name: Image build context
   ansible.builtin.template:
-    src: Dockerfile.j2
-    dest: "{{ sf_dev_dir }}/build/Dockerfile"
+    src: "{{ item.src }}"
+    dest: "{{ sf_dev_dir }}/build/{{ item.dest }}"
     owner: root
     group: root
     mode: "0644"
+  loop: "{{ sf_dev_box_files + [{'src': 'Dockerfile.j2', 'dest': 'Dockerfile'}] }}"
   register: sf_dev_build_context
-
-- name: Entrypoint (mounted into the container)
-  ansible.builtin.template:
-    src: entrypoint.sh.j2
-    dest: "{{ sf_dev_dir }}/entrypoint.sh"
-    owner: root
-    group: root
-    mode: "0755"
-  register: sf_dev_entrypoint
 
 - name: Check whether the sf-dev image exists
   ansible.builtin.command: docker image inspect {{ sf_dev_image }}
@@ -87,12 +158,48 @@
   when: sf_dev_image_check.rc != 0 or sf_dev_build_context is changed
   changed_when: true
 
-- name: Create the sf-dev network
-  community.docker.docker_network:
-    name: "{{ sf_dev_network }}"
-    driver: bridge
-    ipam_config:
-      - subnet: "{{ sf_dev_subnet }}"
+- name: Read the system generation on the disk
+  ansible.builtin.slurp:
+    src: "{{ sf_dev_dir }}/disk/system/.seeded"
+  register: sf_dev_seeded
+  failed_when: false
+
+# Only when the generation goes up (first time, or a deliberate re-seed): the
+# old container goes, the old system is kept aside, the new one is copied out
+# of the image. /home, Docker data and the tailnet identity are separate and
+# stay.
+- name: Seed the system from the image
+  when: >-
+    (sf_dev_seeded.content | default('') | b64decode | trim or '0') | int
+    < sf_dev_system_generation
+  ansible.builtin.shell: |
+    set -euo pipefail
+    S={{ sf_dev_dir }}/disk/system
+    docker rm -f {{ sf_dev_container }} >/dev/null 2>&1 || true
+    [ -d "$S" ] && mv "$S" "{{ sf_dev_dir }}/disk/system.before-$(date +%Y%m%d-%H%M%S)"
+    T=$(mktemp -d {{ sf_dev_dir }}/disk/.seed.XXXXXX)
+    cid=$(docker create {{ sf_dev_image }})
+    docker export "$cid" | tar -x --numeric-owner -p -C "$T"
+    docker rm "$cid" >/dev/null
+    mkdir -p "$S"
+    for d in {{ sf_dev_system_dirs | join(' ') }}; do mv "$T/$d" "$S/$d"; done
+    rm -rf "$T"
+    echo {{ sf_dev_system_generation }} > "$S/.seeded"
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+# The box's own units and guide are kept current in the persisted system too,
+# so a change here reaches a running box (picked up at its next start).
+- name: The box's own units and guide
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ sf_dev_dir }}/disk/system/{{ item.path }}"
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop: "{{ sf_dev_box_files }}"
+  register: sf_dev_box_units
 
 - name: Egress guard unit
   ansible.builtin.template:
@@ -110,6 +217,13 @@
     state: started
     daemon_reload: true
 
+- name: Create the sf-dev network
+  community.docker.docker_network:
+    name: "{{ sf_dev_network }}"
+    driver: bridge
+    ipam_config:
+      - subnet: "{{ sf_dev_subnet }}"
+
 - name: Compose file
   ansible.builtin.template:
     src: compose.yml.j2
@@ -118,68 +232,22 @@
     group: root
     mode: "0644"
 
-- name: Check whether the system already lives on the disk
-  ansible.builtin.stat:
-    path: "{{ sf_dev_dir }}/disk/system/.seeded"
-  register: sf_dev_seeded
-
-# Once per box: copy the system out of the existing container (so whatever
-# users installed comes along) or, for a new box, out of the image. From then
-# on /usr /etc /var /opt /root /srv are bind-mounted from the disk.
-- name: Move the system onto the disk (once)
-  when: not sf_dev_seeded.stat.exists
-  ansible.builtin.shell: |
-    set -euo pipefail
-    S={{ sf_dev_dir }}/disk/system
-    T=$(mktemp -d {{ sf_dev_dir }}/disk/.seed.XXXXXX)
-    if docker inspect {{ sf_dev_container }} >/dev/null 2>&1; then
-      docker stop -t 30 {{ sf_dev_container }} >/dev/null
-      docker export {{ sf_dev_container }} | tar -x --numeric-owner -p -C "$T"
-    else
-      cid=$(docker create {{ sf_dev_image }})
-      docker export "$cid" | tar -x --numeric-owner -p -C "$T"
-      docker rm "$cid" >/dev/null
-    fi
-    mkdir -p "$S"
-    for d in {{ sf_dev_system_dirs | join(' ') }}; do rm -rf "${S:?}/$d"; mv "$T/$d" "$S/$d"; done
-    rm -rf "$T"
-    touch "$S/.seeded"
-  args:
-    executable: /bin/bash
-  changed_when: true
-
-# The first sf-dev was started by hand (ops script). Hand it to compose once;
-# its system is on the disk by now, so nothing is lost.
-- name: Inspect an existing sf-dev container
-  ansible.builtin.command: >-
-    docker inspect {{ sf_dev_container }}
-    --format '{{ '{{' }} index .Config.Labels "com.docker.compose.project" {{ '}}' }}'
-  register: sf_dev_existing
-  changed_when: false
-  failed_when: false
-
-- name: Replace a hand-started sf-dev with the compose-managed one
-  ansible.builtin.command: docker rm -f {{ sf_dev_container }}
-  when: sf_dev_existing.rc == 0 and sf_dev_existing.stdout | trim != 'sf-dev'
-  changed_when: true
-
-- name: Join key file (empty unless a first join is pending)
+- name: Join key folder in the box
   ansible.builtin.file:
-    path: "{{ sf_dev_dir }}/authkey"
-    state: touch
+    path: "{{ sf_dev_dir }}/disk/system/etc/sf-dev"
+    state: directory
     owner: root
     group: root
-    mode: "0600"
-    access_time: preserve
-    modification_time: preserve
+    mode: "0700"
 
+# ---------------------------------------------------------------- tailnet join
 - name: Check for an existing tailnet identity
   ansible.builtin.stat:
     path: "{{ sf_dev_dir }}/disk/tailscale/tailscaled.state"
   register: sf_dev_state
 
 # Only when the node has never joined: a single-use, one-hour key carrying the
-# sf-dev tags. It is written to the bind-mounted file and emptied after the join.
+# sf-dev tags, written into the box's /etc/sf-dev and emptied after the join.
 - name: Issue a one-time join key
   when: not sf_dev_state.stat.exists
   block:
@@ -191,22 +259,20 @@
       changed_when: true
       no_log: true
 
-    - name: Hand the join key to the container
+    - name: Hand the join key to the box
       ansible.builtin.copy:
         content: "{{ sf_dev_key.stdout_lines | last | trim }}"
-        dest: "{{ sf_dev_dir }}/authkey"
+        dest: "{{ sf_dev_dir }}/disk/system/etc/sf-dev/ts-authkey"
         owner: root
         group: root
         mode: "0600"
       no_log: true
       diff: false
 
-# A new entrypoint is a new file (inode) behind a single-file bind mount, so it
-# needs a recreate; that is harmless now that the whole system is on the disk.
 - name: Start sf-dev
   ansible.builtin.command: >-
     docker compose -f {{ sf_dev_dir }}/compose.yml up -d
-    {{ '--force-recreate' if sf_dev_entrypoint is changed else '' }}
+    {{ '--force-recreate' if sf_dev_box_units is changed else '' }}
   register: sf_dev_up
   changed_when: "'Started' in sf_dev_up.stderr or 'Recreated' in sf_dev_up.stderr"
 
@@ -214,14 +280,14 @@
   ansible.builtin.command: docker exec {{ sf_dev_container }} tailscale ip -4
   register: sf_dev_ip
   until: sf_dev_ip.rc == 0 and sf_dev_ip.stdout | length > 0
-  retries: 45
-  delay: 2
+  retries: 60
+  delay: 3
   changed_when: false
 
-- name: Empty the join key file
+- name: Empty the join key
   ansible.builtin.copy:
     content: ""
-    dest: "{{ sf_dev_dir }}/authkey"
+    dest: "{{ sf_dev_dir }}/disk/system/etc/sf-dev/ts-authkey"
     owner: root
     group: root
     mode: "0600"

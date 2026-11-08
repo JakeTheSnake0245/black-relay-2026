@@ -136,10 +136,13 @@ policy; the LLDAP `tak` and `detection` groups do not feed it.
   On the device: `sudo tailscale up --login-server https://REPLACE_WITH_HEADSCALE_FQDN
   --auth-key <key> --hostname <unique-name>`. Expire the key
   (`headscale preauthkeys expire --id <id>`) once the devices are on.
-- **sf-dev** (role `sf_dev`): the team's Ubuntu dev container. Members connect with
-  `ssh dev@sf-dev` (Tailscale SSH; their Pocket ID identity is the login) or VS Code
-  Remote-SSH. One shared `dev` account with sudo inside the container only; work lives under
-  `~` on its 20 GB disk.
+- **sf-dev** (role `sf_dev`): the teams' box. Members connect with `ssh dev@sf-dev`
+  (Tailscale SSH; their Pocket ID identity is the login) or VS Code Remote-SSH, and build
+  and run their containers there with Docker and `docker compose` (shared network
+  `fusion`; services under `/srv/sensor-fusion/`; guide in `~/README`). Anything they
+  publish on a port is reachable at `sf-dev:<port>` by every Sensor Fusion member and
+  device, never from the internet. One shared `dev` account; everything on the box
+  survives restarts and rebuilds and is backed up nightly.
 
 ## Verify denial paths
 

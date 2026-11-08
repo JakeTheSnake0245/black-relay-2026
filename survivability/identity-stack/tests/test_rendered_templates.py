@@ -779,31 +779,38 @@ class BlackRelayHubTests(unittest.TestCase):
 
 
 class SensorFusionDevTests(unittest.TestCase):
-    """sf-dev: the Sensor Fusion development container."""
+    """sf-dev: the Sensor Fusion box (Sysbox system container)."""
 
-    def test_sf_dev_publishes_nothing_and_stays_off_the_identity_networks(self):
-        compose = yaml.safe_load(render.render_template("sf_dev", "compose.yml.j2"))
-        dev = compose["services"]["sf-dev"]
+    def compose(self):
+        return yaml.safe_load(render.render_template("sf_dev", "compose.yml.j2"))["services"]["sf-dev"]
+
+    def test_sf_dev_is_isolated_without_privilege(self):
+        dev = self.compose()
         self.assertNotIn("ports", dev)
         self.assertNotIn("privileged", dev)
+        self.assertNotIn("cap_add", dev)
+        # Sysbox: systemd and Docker inside, root inside is not root on the host.
+        self.assertEqual(dev["runtime"], "sysbox-runc")
         self.assertEqual(set(dev["networks"]), {"sf_dev"})
-        self.assertEqual(sorted(dev["cap_add"]), ["NET_ADMIN", "NET_RAW"])
-        # The join key is mounted read-only and the state lives on the disk.
-        mounts = {v.split(":")[1]: v for v in dev["volumes"]}
-        self.assertTrue(mounts["/run/secrets/ts-authkey"].endswith(":ro"))
-        self.assertTrue(mounts["/var/lib/tailscale"].startswith("/srv/sf-dev/disk/"))
-        self.assertTrue(mounts["/home"].startswith("/srv/sf-dev/disk/"))
+        self.assertNotIn("/var/run/docker.sock", " ".join(dev["volumes"]))
 
-    def test_sf_dev_system_lives_on_its_disk(self):
-        # Users' packages and settings must survive a rebuilt or recreated
-        # container: every writable top-level directory comes from the disk.
-        compose = yaml.safe_load(render.render_template("sf_dev", "compose.yml.j2"))
-        dev = compose["services"]["sf-dev"]
-        mounts = {v.split(":")[1]: v.split(":")[0] for v in dev["volumes"]}
-        for d in ("/usr", "/etc", "/var", "/opt", "/root", "/srv", "/home"):
+    def test_sf_dev_keeps_everything_on_its_disk(self):
+        # Users' packages, Docker images and volumes, files and the node
+        # identity must survive a rebuilt or recreated container.
+        mounts = {v.split(":")[1]: v.split(":")[0] for v in self.compose()["volumes"]}
+        for d in ("/usr", "/etc", "/var", "/opt", "/root", "/srv", "/home",
+                  "/var/lib/docker", "/var/lib/tailscale"):
             self.assertTrue(mounts[d].startswith("/srv/sf-dev/disk/"), d)
-        self.assertEqual(dev["entrypoint"][-1], "/sf-dev/entrypoint.sh")
-        self.assertIn("/sf-dev/entrypoint.sh", mounts)
+
+    def test_sf_dev_box_units_render(self):
+        join = render.render_template("sf_dev", "sf-dev-join.service.j2")
+        self.assertIn("--login-server=https://hs.example.test", join)
+        self.assertIn("--ssh", join)
+        self.assertIn("/etc/sf-dev/ts-authkey", join)
+        setup = render.render_template("sf_dev", "sf-dev-setup.j2")
+        result = subprocess.run(["bash", "-n"], input=setup, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("docker network create fusion", setup)
 
     def test_backup_takes_sf_dev_files_not_its_raw_image(self):
         script = render.render_template("backup_restic", "survivability-backup.sh.j2")
@@ -811,6 +818,8 @@ class SensorFusionDevTests(unittest.TestCase):
         paths = paths[:paths.index(")")].split()
         self.assertIn("/srv/sf-dev/disk", paths)
         self.assertIn("--exclude '/srv/sf-dev/disk.img'", script)
+        self.assertIn("--exclude '/srv/sf-dev/disk/docker/overlay2'", script)
+        self.assertNotIn("--exclude '/srv/sf-dev/disk/docker/volumes'", script)
 
     def test_sf_dev_guard_blocks_metadata(self):
         unit = render.render_template("sf_dev", "sf-dev-guard.service.j2")
@@ -821,7 +830,6 @@ class SensorFusionDevTests(unittest.TestCase):
         defaults = yaml.safe_load((ROLES / "sf_dev" / "defaults" / "main.yml").read_text())
         for tag in defaults["sf_dev_tags"]:
             self.assertEqual(policy["tagOwners"].get(tag), ["group:survivability"])
-        # The ssh rule is scoped to the sf-dev tag, which only this container carries.
         self.assertIn(
             {"action": "accept", "src": ["group:sensor_fusion", "group:survivability"],
              "dst": ["tag:sf-dev"], "users": ["dev"]},

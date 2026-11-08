@@ -1,0 +1,16 @@
+# Managed by Ansible (sf_dev role). Local edits are overwritten.
+[Unit]
+Description=sf-dev: join the tailnet (Tailscale SSH as dev)
+After=tailscaled.service network-online.target
+Wants=tailscaled.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The join key is only present before the first join (written by the host, emptied after).
+ExecStart=/bin/sh -c 'AK=""; [ -s /etc/sf-dev/ts-authkey ] && AK="--auth-key=file:/etc/sf-dev/ts-authkey"; exec tailscale up --login-server={{ sf_dev_login_server }} --hostname={{ sf_dev_hostname }} --ssh $AK'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

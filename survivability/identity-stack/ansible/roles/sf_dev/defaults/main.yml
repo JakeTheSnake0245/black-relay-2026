@@ -1,25 +1,48 @@
 ---
-# sf-dev: Ubuntu 24.04 development container for the Sensor Fusion team.
+# sf-dev: the Sensor Fusion box (Sysbox system container: systemd + Docker inside).
 sf_dev_dir: /srv/sf-dev
-sf_dev_disk_size: 20G
+sf_dev_disk_size: 80G
 sf_dev_base_image: >-
   ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 # Seeds a new box only. A running box keeps its system on its disk; update
 # it with apt inside. Bump the tag to rebuild the seed.
-sf_dev_image: "sf-dev:1"
+sf_dev_image: "sf-dev:2"
 sf_dev_container: sf-dev
 sf_dev_hostname: sf-dev
-# The whole system lives on the 20 GB disk, not in the image: these top-level
-# directories are seeded once (from the running container, or the image for a
-# new box) and bind-mounted from the disk from then on. Ubuntu 24.04 merges
-# /bin, /sbin and /lib into /usr. Packages, /etc changes and everything users
-# install survive restarts, recreates and image rebuilds.
+# The whole system lives on the disk, not in the image: these top-level
+# directories are seeded once from the image and bind-mounted from the disk
+# from then on (Ubuntu 24.04 merges /bin, /sbin and /lib into /usr). Packages,
+# /etc changes and everything users install survive restarts, recreates and
+# image rebuilds. Docker's data (/var/lib/docker) has its own directory.
 sf_dev_system_dirs: [usr, etc, var, opt, root, srv]
+# Raising this re-seeds the system from the image (home, Docker data and the
+# tailnet identity are kept; anything installed system-wide is not). 1 was the
+# plain container; 2 is the Sysbox system container.
+sf_dev_system_generation: 2
+# Sysbox: runs sf-dev as a system container (systemd + Docker inside, own user
+# namespace) without --privileged. Pinned release and checksum.
+sf_dev_sysbox_version: "0.7.1"
+sf_dev_sysbox_url: >-
+  https://github.com/nestybox/sysbox/releases/download/v0.7.1/sysbox-ce_0.7.1.linux_amd64.deb
+sf_dev_sysbox_sha256: 9d6d5484f980d0a17f86c492c1262015c2afb66280bdb97215b79fde6a0261c5
+# Docker settings Sysbox needs present (else its installer restarts Docker).
+# bip keeps today's docker0; the pool is outside every network on this host.
+sf_dev_docker_bip: 172.17.0.1/16
+sf_dev_docker_pool: 172.20.0.0/16
+# The box's own units and guide: baked into the image (for a new box) and kept
+# current in the persisted system (dest = build context, path = in the system).
+sf_dev_box_files:
+  - {src: sf-dev-join.service.j2, dest: sf-dev-join.service,
+     path: etc/systemd/system/sf-dev-join.service, mode: "0644"}
+  - {src: sf-dev-setup.service.j2, dest: sf-dev-setup.service,
+     path: etc/systemd/system/sf-dev-setup.service, mode: "0644"}
+  - {src: sf-dev-setup.j2, dest: sf-dev-setup,
+     path: usr/local/sbin/sf-dev-setup, mode: "0755"}
 sf_dev_network: sf_dev
 sf_dev_subnet: 172.30.0.0/24
 sf_dev_cpus: "2.00"
-sf_dev_memory: 2G
-sf_dev_pids_limit: 2048
+sf_dev_memory: 4G
+sf_dev_pids_limit: 8192
 # Tags carried by the join key. Both must be declared in the committed policy:
 # tag:sensor-fusion puts it in the mesh, tag:sf-dev scopes the ssh rule.
 sf_dev_tags:

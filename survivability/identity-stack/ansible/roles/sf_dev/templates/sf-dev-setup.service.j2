@@ -1,0 +1,13 @@
+# Managed by Ansible (sf_dev role). Local edits are overwritten.
+[Unit]
+Description=sf-dev: shared Docker network "fusion" and the team guide
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/sf-dev-setup
+
+[Install]
+WantedBy=multi-user.target

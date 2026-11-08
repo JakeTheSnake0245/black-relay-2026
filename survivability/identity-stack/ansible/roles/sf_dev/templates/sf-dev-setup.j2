@@ -1,0 +1,52 @@
+#!/bin/bash
+# Managed by Ansible (sf_dev role). Local edits are overwritten.
+# Every boot, idempotent: home, the shared "fusion" network, the team guide.
+set -e
+if [ ! -d /home/dev ]; then
+  mkdir -p /home/dev && cp -rT /etc/skel /home/dev && chown -R dev:dev /home/dev
+fi
+install -d -o dev -g dev -m 2775 /srv/sensor-fusion
+docker network inspect fusion >/dev/null 2>&1 || docker network create fusion >/dev/null
+[ -f /srv/sensor-fusion/PORTS.md ] || cat > /srv/sensor-fusion/PORTS.md <<'PORTS'
+# Ports on sf-dev (claim one before you publish it)
+
+| port | service | team | who |
+|---|---|---|---|
+| 1883 | MQTT broker (planned) | | |
+PORTS
+chown dev:dev /srv/sensor-fusion/PORTS.md
+cat > /home/dev/README <<'GUIDE'
+sf-dev: the Sensor Fusion box (TAK + Detection)
+================================================
+A small Ubuntu 24.04 machine on the tailnet with its own Docker. Build and run
+your team's containers here; everything stays when the box restarts or is
+rebuilt (system, Docker images and volumes, your files), backed up nightly.
+
+Where things go
+  ~/                      your scratch space (shared login: everyone is "dev")
+  /srv/sensor-fusion/     the teams' services: one folder per team / service
+  /srv/sensor-fusion/PORTS.md   claim a port before you publish it
+
+Run a service
+  cd /srv/sensor-fusion/<team>/<service>
+  docker compose up -d --build        (add restart: unless-stopped to keep it up)
+  docker compose logs -f              docker ps
+
+Talk to each other
+  - Containers on the shared network "fusion" reach each other by name:
+      networks: { fusion: { external: true } }   ->  mqtt://mqtt:1883
+  - Anyone in Sensor Fusion (laptops, phones with ATAK/iTAK, Pis, sensors)
+    reaches a published port on sf-dev at  sf-dev:<port>  (tailnet IP: tailscale ip -4):
+      ports: ["1883:1883"]
+  - Not reachable from the internet; only the tailnet.
+
+Keep data
+  Named Docker volumes or files under /srv/sensor-fusion are kept and backed up.
+
+Long-running things
+  Use restart: unless-stopped in compose, or a systemd unit (systemctl works).
+
+Limits (shared by everyone): {{ sf_dev_cpus | float | int }} CPUs, {{ sf_dev_memory }} RAM, {{ sf_dev_disk_size }} disk.
+Admins: Survivability (Jake, Marcel).
+GUIDE
+chown dev:dev /home/dev/README
