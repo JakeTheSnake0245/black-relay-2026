@@ -10,14 +10,16 @@ or switch goes in any port.
 | Host shell | `ssh root@100.64.0.11` (tailnet), then `pct enter 101/102/103` |
 | Field card | `docs/Black-Relay-Field-Card.pdf` (print one page; source `docs/field-card.html`) |
 | Runbook | `controller/README.md`: layout, ports, remote access, self-healing, hardening, host tools |
+| Another site box | `install/README.md`: kit + installer, site N on its own addresses, ~30 min |
 | Rebuild from bare metal | `as-built/cwwk01/README.md` |
 
 ## Folders
 
 | path | what |
 |---|---|
-| `controller/` | Controller app (`app.py`, `index.html`, `status.html`) and the host tools (`br-hostinfo`, `br-port-roles`, `br-port-layout`, `br-rotate-secrets`, `br-controller-oidc`) |
+| `controller/` | Controller app (`app.py`, `index.html`, `status.html`) and the host tools (`br-hostinfo`, `br-port-roles`, `br-port-layout`, `br-rotate-secrets`, `br-controller-oidc`, `br-lockd`, `br-vault-init`, `br-port-lock`) |
 | `as-built/cwwk01/` | Redacted copy of the box's live configuration (host, edge, router, controller) |
+| `install/` | Quick install for another CWWK: `make-kit.sh` (Mac), `hub-add-site.sh` / `hub-publish-site.sh` (BR2026), `cwwk-install.sh` (new box), `spitz-setup.sh` |
 | `scripts/` | `snapshot-cwwk.sh` (refresh `as-built/`), `capture-cold-start.sh` (logs after a power-off test) |
 | `docs/` | Field card and site architecture HTML sources (with their PDFs), cold-start test |
 
@@ -43,3 +45,5 @@ Ports: nic0 Starlink, nic1 empty, nic2 ISP (travel router), nic3 Spitz (Wi-Fi + 
 admin + vault passphrase). Every port also carries VLAN 41 (services) for a switch; the
 controller's Network page follows a marked switch. Speed caps: sliders on the Multipath page.
 Randomness and no-plaintext-on-any-carrier verified live: `multipath/docs/live-randomness.md`.
+Port lock built and tested (Setup → 4 · Lock the ports); currently unlocked. Second site:
+install kit ready (`install/`), cwwk02 = 10.47 / 10.48 / 10.49, not installed yet.
