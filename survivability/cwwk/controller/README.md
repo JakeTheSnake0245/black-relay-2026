@@ -77,7 +77,8 @@ Change caps, mixing, hold and lanes on the controller's Multipath page. Hub side
   `/usr/local/sbin/br-ctl` (`restrict`; verbs status, set-sched, set-hold, set-lanes, set-caps,
   restart-tunnel, spitz, uplinks, units, selftest). Containers 101–103 can't be stopped from the UI.
 - br-edge: nothing but the lanes (TLS 443 to the hub, each pinned to its modem), DHCP and modem
-  admin pages (site LAN only, private addresses only) may use a modem; routes pushed by modems are
+  admin pages (site LAN only, private addresses only; plus the Starlink dish's own API, 9200 for
+  the Starlink app and 9201 for the dish page, only once the dish is recognised) may use a modem; routes pushed by modems are
   ignored; site destinations always route via br-router. Dashboard and hub overlay: controller only.
 - Host: bridge guard drops DHCP/DHCPv6 replies and IPv6 router adverts from any port except toward
   br-edge; spanning-tree root protection on ports. SSH key-only on the host and controller.
