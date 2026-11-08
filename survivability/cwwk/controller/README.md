@@ -86,6 +86,23 @@ Change caps, mixing, hold and lanes on the controller's Multipath page. Hub side
 - Rotate the controller's Proxmox token and the router root password: `br-rotate-secrets` on the host
   (never prints secrets).
 
+## Switches and the services VLAN
+
+Every port carries three things: its own untagged VLAN (a modem → br-edge), **VLAN 40**
+tagged (site LAN / Wi-Fi) and **VLAN 41** tagged (services). The router bridges VLAN 41 into
+its `svc` interface (`br-svc` = `eth2` on vmbr3 + `eth5` on vmbr10 tag 41), so service
+containers on the CWWK and devices behind a switch share 10.41.0.0/24 (DHCP .100–.199,
+same firewall: LAN → services allowed, services → LAN blocked, internet via the tunnel).
+
+A **switch** goes in any free port; the port becomes a client port (its untagged traffic is the
+site LAN). On the switch: ports untagged / VLAN 40 = site LAN, ports on VLAN 41 = services
+(cameras, sensors), uplink to the CWWK carries 40 and 41 tagged (or untagged = site LAN).
+Controller → Network → **Devices by port** lists what the CWWK sees behind each port (from the
+host's bridge, named by DHCP leases); **This is the switch** marks one, and the controller then
+shows its port, address, admin page, devices behind it and a Blink button, and adds it to the
+Health page (a missing switch is a fix-it item). Changing the switch's own settings from the
+controller depends on the model and is not built yet.
+
 ## Site lock
 
 The box **starts locked at every power-on** (and after Lock, or a reboot). Locked:
@@ -150,7 +167,7 @@ health. LAN → services is allowed; services → LAN is not; services → inter
 |---|---|
 | `br-port-layout status\|unify\|confirm\|rollback` | the any-port bridge (with 15-min auto-rollback) |
 | `br-port-roles` (service) | client-device detection, rogue-DHCP guard |
-| `br-hostinfo` (service, 10.40.0.2:8091, controller only) | port links, temperatures, Blink port, host service states |
+| `br-hostinfo` (service, 10.40.0.2:8091, controller only) | port links, temperatures, Blink port, host service states, devices behind each port |
 | `br-controller-oidc` | store the Pocket ID client for the controller |
 | `br-rotate-secrets` | new Proxmox token + router root password |
 | `br-lockd` (service, 10.40.0.2:8092 TLS, controller only) | the site lock: vault, edge gate, tailnet, gated containers, USB key |

@@ -244,7 +244,7 @@ li { margin: 2px 0; font-size: 9pt; }
     <text x="802" y="262" font-size="13" font-weight="700">Site LAN 10.40.0.0/24 (vmbr1)</text>
     <g font-size="10.5">
       <text x="802" y="282">router .1 · controller .10 · Proxmox host .2</text>
-      <text x="802" y="300">Wi-Fi devices (GL-X3000-0fd) · laptops</text>
+      <text x="802" y="300">Wi-Fi devices (BR2026_2 / _5) · laptops</text>
       <text x="802" y="318" fill="#52514e">all reach the internet only via the tunnel</text>
     </g>
     <line x1="730" y1="300" x2="790" y2="295" stroke="#52514e" stroke-width="1.6"/>
@@ -254,9 +254,9 @@ li { margin: 2px 0; font-size: 9pt; }
       <text x="802" y="390">service containers on the CWWK (several):</text>
       <text x="814" y="405" fill="#52514e">disks in the encrypted vault, start on unlock</text>
       <text x="802" y="424">devices behind an Ethernet switch</text>
-      <text x="814" y="439" fill="#52514e">(cameras, sensors) · VLAN 41 on the ports: planned</text>
+      <text x="814" y="439" fill="#52514e">(cameras, sensors) · VLAN 41 tagged on every port</text>
       <text x="802" y="458">switch: address + VLANs from the router,</text>
-      <text x="814" y="473" fill="#52514e">status + admin link in the controller (planned)</text>
+      <text x="814" y="473" fill="#52514e">status, admin link, devices behind: Network page</text>
     </g>
     <line x1="730" y1="345" x2="790" y2="378" stroke="#52514e" stroke-width="1.6"/>
     <rect x="790" y="150" width="290" height="70" rx="10" fill="#fff" stroke="#0b0b0b" stroke-width="1.3"/>
@@ -274,7 +274,7 @@ li { margin: 2px 0; font-size: 9pt; }
       <text x="44" y="413">no modem for 45 s → client port: gets 10.40.0.x</text>
       <text x="32" y="431"><tspan font-weight="650">Cable out / a modem appears</tspan> → back to modem port</text>
       <text x="32" y="449"><tspan font-weight="650">Ethernet switch</tspan> → client port: its devices join the site LAN</text>
-      <text x="44" y="464" fill="#52514e">(trunk with the services VLAN 41: planned)</text>
+      <text x="44" y="464" fill="#52514e">(its VLAN 41 ports → services network 10.41.0.x)</text>
       <text x="32" y="482" fill="#52514e">Same box in two ports: spanning tree blocks the loop</text>
     </g>
   </svg>

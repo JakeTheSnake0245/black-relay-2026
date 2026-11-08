@@ -477,6 +477,60 @@ def site_lock(who):
     return obj
 
 
+# ---------------------------------------------------------------- wired devices + switches
+# The host reports which MAC addresses sit behind each port on the site LAN (40)
+# and services (41) VLANs; leases give them names and addresses. An admin marks
+# one as a switch; the controller then follows it: which port, its address,
+# whether its admin page answers, how many devices are behind it.
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+MAX_SWITCHES = 8
+
+
+def admin_url(ip):
+    """The switch's web admin page, if it has one (https preferred)."""
+    for port, scheme in ((443, "https"), (80, "http")):
+        try:
+            socket.create_connection((ip, port), 2).close()
+            return f"{scheme}://{ip}/"
+        except OSError:
+            continue
+    return ""
+
+
+def wired_view(snap):
+    fdb = snap.get("fdb") or {}
+    leases = {(l.get("macaddr") or "").lower(): l for l in ((snap.get("network") or {}).get("leases") or [])}
+    with CONF_LOCK:
+        sws = [dict(s) for s in CONF.get("switches", [])]
+    swmacs = {s["mac"] for s in sws}
+    ports = {}
+    for nic, ents in fdb.items():
+        seen, devs = set(), []
+        for e in ents:
+            mac = e.get("mac", "")
+            if mac in seen:
+                continue
+            seen.add(mac)
+            ls = leases.get(mac) or {}
+            devs.append({"mac": mac, "vlan": e.get("vlan"), "net": e.get("net"), "ip": ls.get("ipaddr"),
+                         "name": ls.get("hostname"), "switch": mac in swmacs})
+        ports[nic] = devs
+    switches = []
+    for s in sws:
+        port = next((n for n, d in ports.items() if any(x["mac"] == s["mac"] for x in d)), None)
+        ip = (leases.get(s["mac"]) or {}).get("ipaddr")
+        url = cached("sw:" + s["mac"], 30, lambda ip=ip: admin_url(ip)) if ip else ""
+        if port and ip:
+            lv, detail = "good", f"on {port} · {ip}" + ("" if url else " · no web admin page")
+        elif port:
+            lv, detail = "warning", f"on {port} · no address from the router yet"
+        else:
+            lv, detail = "warning", "not seen on any port"
+        switches.append({"mac": s["mac"], "name": s["name"], "port": port, "ip": ip, "admin": url or None,
+                         "behind": max(0, len(ports.get(port, [])) - 1) if port else 0, "level": lv, "detail": detail})
+    return {"ports": ports, "switches": switches}
+
+
 # ---------------------------------------------------------------- inventory
 # Everything that lives on the CWWK, each with a live state, for the health
 # page. Built from the same sources as the tiles plus three read-only lists:
@@ -599,6 +653,10 @@ def inventory(snap, router, subs):
             ("unlocked" + (f" by {lk.get('by')}" if lk.get("by") else "")) if lk["state"] == "unlocked" else "LOCKED")
         if lk.get("usb_inserted") and lk["state"] == "unlocked":
             add(w, None, "USB key", "Should be with a person, not in the box", "warning", "still plugged in: pull it out")
+
+    for s in (snap.get("wired") or {}).get("switches", []):
+        add("Network · switches", "network", s["name"], "Ethernet switch (site LAN + services VLANs)",
+            s["level"], s["detail"] + (f" · {s['behind']} devices behind" if s["port"] else ""))
 
     # Wi-Fi
     sp = snap.get("wifi")
@@ -747,6 +805,12 @@ def poll_once(pve, router):
     subs["services"] = {"level": worst(*[s["level"] for s in dep]) if dep else "good",
                         "detail": f"{len(dep)} deployed · {len(svcs) - len(dep)} planned"}
 
+    snap["fdb"] = cached("fdb", 10, lambda: host_info("/fdb")) or {}
+    try:
+        snap["wired"] = wired_view(snap)
+    except Exception as e:
+        snap["wired"] = {"ports": {}, "switches": []}
+        event("warning", f"wired view: {e}"[:160])
     try:
         snap["inventory"] = inventory(snap, router, subs)
     except Exception as e:
@@ -1114,6 +1178,12 @@ def problems(snap, subs):
             "Open Compute and start 102 br-router if it is stopped.",
             "Devices that already have an address keep working for a while.",
             "Still down: reboot the CWWK."])
+    for s in (snap.get("wired") or {}).get("switches", []):
+        if not s["port"]:
+            add("warning", f"Switch '{s['name']}' is not seen on any CWWK port", [
+                "Check its power and the cable to the CWWK (any port).",
+                "Give it a minute after power-on; then Network shows it on its port.",
+                "Replaced the switch? Remove the old one on the Network page and mark the new one."])
     t = (snap.get("temps") or {}).get("cpu")
     if t is not None and t >= 85:
         add("critical" if t >= 95 else "warning", f"CWWK is hot ({t:.0f} C)", [
@@ -1243,6 +1313,27 @@ def do_action(body):
                 store([x for x in CONF.get("services", []) if x.get("id") != sid])
             return "deleted"
         raise ValueError("bad services action")
+    if area == "network" and action in ("switch-add", "switch-remove"):
+        mac = str(body.get("mac", "")).strip().lower()
+        if not MAC_RE.match(mac):
+            raise ValueError("bad MAC address")
+        with CONF_LOCK:
+            old = [dict(s) for s in CONF.get("switches", [])]
+            new = [s for s in old if s["mac"] != mac]
+            if action == "switch-add":
+                name = re.sub(r"[^A-Za-z0-9 ._()-]", "", str(body.get("name", "")))[:40].strip() or "Switch"
+                if len(new) >= MAX_SWITCHES:
+                    raise ValueError(f"at most {MAX_SWITCHES} switches")
+                new.append({"mac": mac, "name": name})
+            CONF["switches"] = new
+            try:
+                save_conf(CONF)
+            except Exception:
+                CONF["switches"] = old
+                raise
+        INV_CACHE.pop("sw:" + mac, None)
+        event("good", f"switch {'marked' if action == 'switch-add' else 'removed'}: {mac}")
+        return "saved"
     if area == "settings" and action == "password":
         new = str(body.get("new", ""))
         with LOGIN_SEM:

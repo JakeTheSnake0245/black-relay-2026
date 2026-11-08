@@ -503,8 +503,45 @@ V.network = () => {
       <div class="card"><h2>Router</h2><dl class="kv num"><dt>Uptime</dt><dd>${dur(i.uptime)}</dd><dt>Load</dt><dd>${i.load ? (i.load[0] / 65536).toFixed(2) : "–"}</dd><dt>Memory free</dt><dd>${i.memory ? (i.memory.free / 1048576).toFixed(0) + " MB" : "–"}</dd><dt>LAN</dt><dd>10.40.0.0/24</dd><dt>Services</dt><dd>10.41.0.0/24</dd><dt>Uplink</dt><dd>10.39.0.2 → multipath</dd></dl></div>
       <div class="card" style="grid-column:span 2"><h2>Interfaces</h2><table><tr><th>Name</th><th>State</th><th>Address</th><th>Device</th><th>Up for</th></tr>${ifr}</table></div>
     </div>
+    ${switchesCard()}
+    ${portDevicesCard()}
     <div class="card"><h2>DHCP clients <span>· wired and Wi-Fi</span></h2><table><tr><th>Host</th><th>Address</th><th>MAC</th><th>Lease left</th></tr>${lr}</table>
       <div class="help">Static reservations, DNS names and firewall rules: router admin (LuCI) → Network.</div></div>`;
+};
+
+/* ---------- switches and wired devices ---------- */
+function switchesCard() {
+  const sws = (S.wired || {}).switches || [], admin = ME.role === "admin";
+  const rows = sws.map((s) => `<div class="svcrow">${ICON[s.level] || ICON.unknown}<div><div style="font-weight:600">${esc(s.name)}</div>
+      <div class="k">${esc(s.detail)}${s.port ? " · " + s.behind + " devices behind it" : ""} · ${esc(s.mac)}</div></div>
+      <div class="row" style="gap:6px;flex-wrap:wrap">${s.admin ? `<a class="btn" href="${esc(s.admin)}" target="_blank" rel="noopener">Admin page</a>` : ""}${s.port ? `<button class="btn" data-nic="${esc(s.port)}" onclick="blink(this.dataset.nic)">Blink port</button>` : ""}${admin ? `<button class="btn" data-mac="${esc(s.mac)}" onclick="swRemove(this.dataset.mac)">Remove</button>` : ""}</div></div>`).join("");
+  return `<div class="card" style="margin-bottom:12px"><h2>Switches <span>· plug one into any free CWWK port</span></h2>
+    ${rows || `<div class="help" style="margin:0">No switch marked yet. Plug it into any free CWWK port, give it a minute, then press <b>This is the switch</b> next to it under Devices by port.</div>`}
+    <div class="help">On the switch: ports left untagged (or VLAN 40) are the site LAN, 10.40.0.x; ports set to VLAN 41 are the services network, 10.41.0.x (cameras, sensors). The admin page opens from a device on site.</div></div>`;
+}
+function portDevicesCard() {
+  const P = (S.wired || {}).ports || {}, admin = ME.role === "admin";
+  const blocks = Object.keys(P).sort().map((nic) => {
+    const devs = P[nic];
+    if (!devs.length) return "";
+    const p = (S.ports || []).find((x) => x.nic === nic) || {};
+    const what = p.wifi ? "access point" : p.mode === "client" ? "client port" : "port";
+    return `<h3 style="margin:10px 0 4px;font-size:13px">${esc(nic)} <span class="help" style="margin:0">· ${esc(what)} · ${devs.length} device${devs.length > 1 ? "s" : ""}</span></h3>
+      <table><tr><th>Device</th><th>Address</th><th>Network</th><th>MAC</th><th></th></tr>` +
+      devs.map((d) => `<tr><td>${esc(d.name || "–")}${d.switch ? " <b>(switch)</b>" : ""}</td><td class="num">${esc(d.ip || "–")}</td><td>${esc(d.net || "")}</td><td class="num">${esc(d.mac)}</td>
+        <td>${admin && !d.switch ? `<button class="btn" data-mac="${esc(d.mac)}" data-name="${esc(d.name || "")}" onclick="swAdd(this.dataset.mac, this.dataset.name)">This is the switch</button>` : ""}</td></tr>`).join("") + `</table>`;
+  }).join("");
+  return `<div class="card" style="margin-bottom:12px"><h2>Devices by port <span>· what the CWWK sees on the site LAN and services networks</span></h2>
+    ${blocks || '<div class="help" style="margin:0">Nothing seen on the site LAN or services networks yet.</div>'}</div>`;
+}
+window.swAdd = async (mac, name) => {
+  const n = prompt("Name for this switch", name || "Switch");
+  if (n === null) return;
+  await act({ area: "network", action: "switch-add", mac, name: n }, "switch marked");
+};
+window.swRemove = async (mac) => {
+  if (!confirm("Stop following this switch?")) return;
+  await act({ area: "network", action: "switch-remove", mac }, "switch removed");
 };
 
 V.wifi = () => {
@@ -514,7 +551,7 @@ V.wifi = () => {
     <header class="page"><h1>Wi-Fi</h1><span class="sub">Spitz (GL-X3000) as access point</span></header>
     <div class="grid g2">
       <div class="card"><h2>Access point</h2>${st(sub.level || "unknown", sub.detail)}
-        <dl class="kv" style="margin-top:12px"><dt>Networks</dt><dd>GL-X3000-0fd · GL-X3000-0fd-5G</dd><dt>Addressing</dt><dd>from the CWWK router (10.40.0.x)</dd><dt>Port</dt><dd>${esc(w.port || ((S.ports || []).find((p) => p.wifi) || {}).nic || "?")} (any port works)</dd><dt>Path</dt><dd>Wi-Fi → VLAN 40 → router → multipath tunnel</dd><dt>Spitz uplink</dt><dd>192.168.9.0/24 (untagged) → multipath lane "Spitz 4G"</dd></dl>
+        <dl class="kv" style="margin-top:12px"><dt>Networks</dt><dd>BR2026_2 · BR2026_5</dd><dt>Addressing</dt><dd>from the CWWK router (10.40.0.x)</dd><dt>Port</dt><dd>${esc(w.port || ((S.ports || []).find((p) => p.wifi) || {}).nic || "?")} (any port works)</dd><dt>Path</dt><dd>Wi-Fi → VLAN 40 → router → multipath tunnel</dd><dt>Spitz uplink</dt><dd>192.168.9.0/24 (untagged) → multipath lane "Spitz 4G"</dd></dl>
         <div class="help">SSID, password and radio settings live on the <a href="https://192.168.9.1" target="_blank" rel="noopener">Spitz admin page</a> (192.168.9.1; also under Setup, Quick links). Wi-Fi clients never route through the Spitz's own WAN.</div></div>
       <div class="card"><h2>Clients</h2><div style="font-size:28px;font-weight:650" class="num">${(n.leases || []).length}</div><div class="help">devices with a site-LAN lease (wired + Wi-Fi), see Network for the list</div></div>
     </div>`;
@@ -616,7 +653,7 @@ V.setup = () => {
       <li><b>Then the CWWK.</b> About 2 minutes after power-on it is up but <b>locked</b>: Wi-Fi and this page work, no internet yet.</li>
       <li><b>Unlock:</b> plug the USB key (<span class="kbd">BRKEY</span>) into the CWWK, wait 10 s, then pull it out and keep it. Or an admin enters the vault passphrase here.</li>
       <li><b>Wait for green:</b> Health turns green when at least one modem carries the tunnel.</li>
-      <li><b>Join Wi-Fi:</b> <span class="kbd">GL-X3000-0fd</span> (or <span class="kbd">-5G</span>), or plug a laptop into a free port; devices get a 10.40.0.x address.</li>
+      <li><b>Join Wi-Fi:</b> <span class="kbd">BR2026_2</span> (or <span class="kbd">BR2026_5</span>), or plug a laptop into a free port; devices get a 10.40.0.x address.</li>
       <li><b>Run the self-test</b> (right) and fix anything red before relying on the kit.</li></ol></div>
     <div class="card"><h2>3 · Self-test <span>· about 15 s, safe to run any time</span></h2>
       <button class="btn primary" id="stbtn" onclick="runSelftest()" ${SELFTEST_BUSY ? "disabled" : ""}>${SELFTEST_BUSY ? "Testing…" : "Run self-test"}</button>

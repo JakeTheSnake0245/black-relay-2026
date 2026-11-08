@@ -15,7 +15,7 @@
 set -euo pipefail
 B=/root/black-relay/port-layout-backup-unify
 IF=/etc/network/interfaces
-EDGE=101 ROUTER=102 BR=vmbr10 WIFI=40 BASE=100
+EDGE=101 ROUTER=102 BR=vmbr10 WIFI=40 SVC=41 BASE=100
 log() { echo "br-port-layout: $*"; logger -t br-port-layout "$*"; }
 
 phys() { for d in /sys/class/net/*/device; do n=${d%/device}; n=${n##*/}; [ -e /sys/class/net/$n/wireless ] || echo $n; done | sort -V; }
@@ -41,9 +41,9 @@ unify() {
 	mapfile -t P < <(phys)
 	# 0. the config this ends in (validated shape: boots straight into the same state)
 	cp -p $B/interfaces $B/interfaces.new
-	python3 - "$B/interfaces.new" "$BR" "$WIFI" "$BASE" "${P[@]}" <<'PY'
+	python3 - "$B/interfaces.new" "$BR" "$WIFI" "$SVC" "$BASE" "${P[@]}" <<'PY'
 import re, sys
-p, br, wifi, base, ports = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5:]
+p, br, wifi, svc, base, ports = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6:]
 s = open(p).read()
 blocks, cur = [], []
 for line in s.splitlines():
@@ -72,15 +72,16 @@ for b in blocks:
     keep.append("\n".join(b).rstrip("\n"))
 out = "\n".join(keep).rstrip("\n")
 out = re.sub(r"(iface vmbr1 inet static\n(?:\t.*\n)*?\tbridge-ports )\S+", r"\1none", out + "\n")
-add = ["", "# Every physical port: its own untagged VLAN (a modem -> br-edge up<i>) and the",
-       "# Wi-Fi VLAN tagged (an access point -> br-router). br-port-roles moves a port's",
-       "# untagged VLAN to the site LAN when a client device is plugged in."]
+add = ["", "# Every physical port: its own untagged VLAN (a modem -> br-edge up<i>), the",
+       "# Wi-Fi / site LAN VLAN and the services VLAN tagged (an access point or a switch",
+       "# -> br-router). br-port-roles moves a port's untagged VLAN to the site LAN when a",
+       "# client device or a switch is plugged in."]
 for i, n in enumerate(ports):
-    add += [f"iface {n} inet manual", f"\tbridge-pvid {base + i}", f"\tbridge-vids {wifi}", ""]
+    add += [f"iface {n} inet manual", f"\tbridge-pvid {base + i}", f"\tbridge-vids {wifi} {svc}", ""]
 add += [f"auto {br}", f"iface {br} inet manual",
         "\tpost-up echo 1 > /proc/sys/net/ipv6/conf/$IFACE/disable_ipv6",
         f"\tbridge-ports {' '.join(ports)}", "\tbridge-stp on", "\tbridge-bridgeprio 0", "\tbridge-maxage 6", "\tbridge-fd 4",
-        "\tbridge-vlan-aware yes", f"\tbridge-vids {wifi} {base}-{base + len(ports) - 1}", ""]
+        "\tbridge-vlan-aware yes", f"\tbridge-vids {wifi} {svc} {base}-{base + len(ports) - 1}", ""]
 open(p, "w").write(out.rstrip("\n") + "\n" + "\n".join(add))
 PY
 	old=$(for n in "${P[@]}"; do m=$(readlink /sys/class/net/$n/master 2>/dev/null) && basename "$m"; done | sort -u | grep -vx vmbr1 || true)
@@ -114,6 +115,7 @@ PY
 		bridge vlan del dev $n vid 1 2>/dev/null || true
 		bridge vlan add dev $n vid $((BASE + i)) pvid untagged
 		bridge vlan add dev $n vid $WIFI
+		bridge vlan add dev $n vid $SVC
 		i=$((i + 1))
 	done
 	# 5. the old per-port bridges are empty now

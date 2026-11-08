@@ -7,6 +7,7 @@ Listens on the host's LAN address only and answers only the controller
   GET  /nics    physical ports: link (cable), speed, role
   GET  /temps   CPU package / board / NVMe temperatures (C)
   GET  /units   the host's own services, the port guard and the tailnet (health page)
+  GET  /fdb     devices seen behind each port on the site LAN / services VLANs
   POST /blink   {"nic": "nic2"}  flash that port's LED for 15 s (ethtool -p)
 """
 import json
@@ -95,6 +96,27 @@ def units():
     return out
 
 
+LAN_VLANS = {40: "site LAN", 41: "services"}
+
+
+def fdb():
+    """MAC addresses the port bridge has learned behind each physical port, on the
+    site LAN (40) and services (41) VLANs: a switch and the devices behind it,
+    Wi-Fi clients of an access point, a laptop. Modem VLANs are left out."""
+    ports = set(phys_nics())
+    try:
+        entries = json.loads(run("bridge", "-j", "fdb", "show", "br", "vmbr10") or "[]")
+    except ValueError:
+        entries = []
+    out = {n: [] for n in sorted(ports)}
+    for e in entries:
+        dev, vlan = e.get("ifname"), e.get("vlan")
+        if dev not in ports or vlan not in LAN_VLANS or e.get("state") == "permanent" or "self" in (e.get("flags") or []):
+            continue
+        out[dev].append({"mac": e.get("mac", "").lower(), "vlan": vlan, "net": LAN_VLANS[vlan]})
+    return out
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "br-hostinfo"
     sys_version = ""
@@ -125,6 +147,8 @@ class H(BaseHTTPRequestHandler):
             self.out(200, temps())
         elif self.path == "/units":
             self.out(200, units())
+        elif self.path == "/fdb":
+            self.out(200, fdb())
         else:
             self.out(404, {"error": "not found"})
 

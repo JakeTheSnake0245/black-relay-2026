@@ -85,5 +85,6 @@
     "port": 8092,
     "cafile": "/etc/br-controller/lockd.pem",
     "token": "<REDACTED>"
-  }
+  },
+  "switches": []
 }

@@ -246,13 +246,13 @@ flowchart LR
   TS -- "sf-dev:port" --> TAKP
 ```
 
-## 13. Site services and the Ethernet switch (switch and VLAN 41: planned)
+## 13. Site services and the Ethernet switch
 
 ```mermaid
 flowchart LR
   subgraph CWWK["CWWK site box"]
     direction TB
-    CTL["br-controller<br/>Services page: cards + health<br/>switch status + admin link (planned)"]
+    CTL["br-controller<br/>Services: cards + health<br/>Network: devices by port,<br/>switch status + admin link"]
     RT["br-router (OpenWrt)<br/>DHCP · DNS · firewall<br/>lan 10.40.0.1 · svc 10.41.0.1"]
     subgraph SVC["Services 10.41.0.0/24"]
       direction LR
@@ -267,10 +267,10 @@ flowchart LR
     CTL -. "health" .-> SVC
   end
   SW["Ethernet switch<br/>plugged into any CWWK port"]
-  RT == "VLAN 40 + 41 (41 planned)" ==> SW
+  RT == "VLAN 40 site LAN + VLAN 41 services<br/>(tagged on every port)" ==> SW
   SW --> D1["laptops · site devices<br/>10.40.0.x"]
-  SW --> D2["cameras · sensors<br/>10.41.0.x (planned)"]
+  SW --> D2["cameras · sensors<br/>switch ports on VLAN 41 → 10.41.0.x"]
   RT -. "its address (DHCP)" .-> SW
-  CTL -. "status · admin (planned)" .-> SW
+  CTL -. "status · admin page · blink port<br/>(changing its settings: later, per model)" .-> SW
 ```
 

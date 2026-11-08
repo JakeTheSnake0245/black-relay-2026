@@ -31,9 +31,15 @@ config interface 'wan'
 	option ipv6 '0'
 
 config interface 'svc'
-	option device 'eth2'
+	option device 'br-svc'
 	option proto 'static'
 	option ipaddr '10.41.0.1'
 	option netmask '255.255.255.0'
 	option ipv6 '0'
+
+config device 'br_svc'
+	option type 'bridge'
+	option name 'br-svc'
+	list ports 'eth2'
+	list ports 'eth5'
 
