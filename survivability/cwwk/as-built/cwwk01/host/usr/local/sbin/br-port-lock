@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""br-port-lock: lock the CWWK's physical ports once the site is set up.
+
+Locked:
+  - an empty port is dead: nothing plugged in later gets through;
+  - a modem, laptop or switch port accepts frames only from the devices that were
+    on it at lock time (their MAC addresses, from the port bridge);
+  - the Wi-Fi access point's port also lets new Wi-Fi clients through on the site
+    LAN VLAN (the Wi-Fi password guards that), nothing else new;
+  - br-port-roles stops re-classifying ports;
+  - anything blocked is remembered for an hour (which port, which device), so the
+    controller can show it and an admin can allow it.
+The lock survives reboots (/etc/br-port-lock.json) until unlocked.
+
+  br-port-lock status            JSON
+  br-port-lock plan              what a lock would allow, without locking
+  br-port-lock lock [SECONDS]    lock; undo by itself after SECONDS (default 120) unless confirmed
+  br-port-lock confirm           keep the lock
+  br-port-lock unlock
+  br-port-lock allow NIC MAC     let one more device through on a locked port
+  br-port-lock apply             re-apply the saved lock (boot)
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+BR = "vmbr10"
+WIFI_VLAN = 40
+CONF = "/etc/br-port-lock.json"
+ROLES = "/run/br-port-roles.json"
+TABLE = "br_port_lock"
+TIMER = "br-port-lock-revert"
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def run(*a, inp=None):
+    return subprocess.run(a, input=inp, capture_output=True, text=True, timeout=30)
+
+
+def log(msg):
+    subprocess.run(["logger", "-t", "br-port-lock", msg])
+
+
+def phys_ports():
+    out = run("bridge", "-j", "link", "show").stdout
+    try:
+        links = json.loads(out or "[]")
+    except ValueError:
+        links = []
+    return sorted(l["ifname"] for l in links if l.get("master") == BR and re.fullmatch(r"(nic|en|eth)\w*", l["ifname"]))
+
+
+def carrier(nic):
+    try:
+        return open(f"/sys/class/net/{nic}/carrier").read().strip() == "1"
+    except OSError:
+        return False
+
+
+def edge_kinds():
+    """{nicN: kind} from the multipath box's modem detection (the Spitz is the AP)."""
+    p = run("pct", "exec", "101", "--", "cat", "/run/black-relay/uplinks.json")
+    try:
+        return {u["port"]: u.get("kind") for u in json.loads(p.stdout)["uplinks"] if u.get("ip")}
+    except (ValueError, KeyError):
+        return {}
+
+
+def plan():
+    kinds = edge_kinds()
+    roles = {}
+    try:
+        roles = json.load(open(ROLES))
+    except (OSError, ValueError):
+        pass
+    try:
+        fdb = json.loads(run("bridge", "-j", "fdb", "show", "br", BR).stdout or "[]")
+    except ValueError:
+        fdb = []
+    ports = {}
+    for nic in phys_ports():
+        macs = sorted({e["mac"].lower() for e in fdb
+                       if e.get("ifname") == nic and e.get("state") != "permanent" and "self" not in (e.get("flags") or [])})
+        r = roles.get(nic, {})
+        wifi_seen = any(e.get("ifname") == nic and e.get("vlan") == WIFI_VLAN and e.get("state") != "permanent"
+                        for e in fdb)
+        if not macs and not carrier(nic):
+            role = "empty"
+        elif r.get("wifi") or kinds.get(nic) == "spitz" or (wifi_seen and r.get("mode") != "client"):
+            role = "access point"
+        elif r.get("mode") == "client":
+            role = "client / switch"
+        else:
+            role = "modem"
+        ports[nic] = {"role": role, "allow": [] if role == "empty" else macs,
+                      "wifi_clients": role == "access point"}
+    return ports
+
+
+def ruleset(ports):
+    sets, rules = [], []
+    for nic, p in ports.items():
+        s = "allow_" + re.sub(r"\W", "_", nic)
+        elems = ", ".join(p["allow"])
+        sets.append(f"\tset {s} {{ type ether_addr; {('elements = { ' + elems + ' }; ') if elems else ''}}}")
+        if p.get("wifi_clients"):
+            rules.append(f'\t\tiifname "{nic}" vlan id {WIFI_VLAN} accept')
+        rules.append(f'\t\tiifname "{nic}" ether saddr @{s} accept')
+        rules.append(f'\t\tiifname "{nic}" update @blocked {{ iifname . ether saddr timeout 1h }} counter drop')
+    return (f"table bridge {TABLE} {{}}\nflush table bridge {TABLE}\n"
+            f"table bridge {TABLE} {{\n" + "\n".join(sets) + "\n"
+            "\tset blocked { type ifname . ether_addr; flags timeout; }\n"
+            "\tchain pre {\n\t\ttype filter hook prerouting priority -300; policy accept;\n"
+            + "\n".join(rules) + "\n\t}\n}\n")
+
+
+def apply(ports):
+    p = run("nft", "-f", "-", inp=ruleset(ports))
+    if p.returncode:
+        raise RuntimeError(p.stderr.strip()[:300])
+
+
+def save(ports, by):
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"since": time.time(), "by": by, "ports": ports}, f, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONF)
+
+
+def load():
+    try:
+        return json.load(open(CONF))
+    except (OSError, ValueError):
+        return None
+
+
+def blocked():
+    out = run("nft", "-j", "list", "set", "bridge", TABLE, "blocked").stdout
+    res = {}
+    try:
+        for item in json.loads(out)["nftables"]:
+            for e in (item.get("set", {}).get("elem") or []):
+                v = e.get("elem", {}).get("val", e) if isinstance(e, dict) else e
+                cc = v.get("concat") if isinstance(v, dict) else None
+                if cc and len(cc) == 2:
+                    res.setdefault(cc[0], []).append(cc[1])
+    except (ValueError, KeyError, TypeError):
+        pass
+    return res
+
+
+def counters():
+    out = run("nft", "list", "chain", "bridge", TABLE, "pre").stdout
+    res = {}
+    for m in re.finditer(r'iifname "(\S+)" update @blocked .* counter packets (\d+)', out):
+        res[m.group(1)] = int(m.group(2))
+    return res
+
+
+def status():
+    c = load()
+    pending = run("systemctl", "is-active", TIMER + ".timer").stdout.strip() == "active"
+    if not c:
+        return {"locked": False, "pending_revert": False, "plan": plan()}
+    b, k = blocked(), counters()
+    for nic, p in c["ports"].items():
+        p["blocked_devices"] = sorted(set(b.get(nic, [])))
+        p["blocked_frames"] = k.get(nic, 0)
+    return {"locked": True, "since": c["since"], "by": c.get("by"), "pending_revert": pending, "ports": c["ports"]}
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "status":
+        print(json.dumps(status()))
+    elif cmd == "plan":
+        print(json.dumps(plan(), indent=1))
+    elif cmd == "lock":
+        secs = int(sys.argv[2]) if len(sys.argv) > 2 else 120
+        by = sys.argv[3] if len(sys.argv) > 3 else "console"
+        ports = plan()
+        apply(ports)
+        save(ports, by)
+        run("systemctl", "stop", TIMER + ".timer")
+        if secs > 0:
+            run("systemd-run", f"--unit={TIMER}", f"--on-active={secs}", "--timer-property=AccuracySec=1s",
+                "/usr/local/sbin/br-port-lock", "unlock", "auto-revert")
+        log(f"ports LOCKED by {by} (auto-revert in {secs}s unless confirmed): " +
+            ", ".join(f"{n}={p['role']}/{len(p['allow'])}" for n, p in ports.items()))
+        print(json.dumps(status()))
+    elif cmd == "confirm":
+        run("systemctl", "stop", TIMER + ".timer")
+        log("port lock confirmed")
+        print(json.dumps(status()))
+    elif cmd == "unlock":
+        run("systemctl", "stop", TIMER + ".timer")
+        run("nft", "delete", "table", "bridge", TABLE)
+        try:
+            os.remove(CONF)
+        except FileNotFoundError:
+            pass
+        log(f"ports UNLOCKED ({sys.argv[2] if len(sys.argv) > 2 else 'console'})")
+        print(json.dumps(status()))
+    elif cmd == "allow":
+        nic, mac = sys.argv[2], sys.argv[3].lower()
+        c = load()
+        if not c or nic not in c["ports"] or not MAC_RE.match(mac):
+            sys.exit("not locked, unknown port, or bad MAC")
+        p = c["ports"][nic]
+        if mac not in p["allow"]:
+            p["allow"].append(mac)
+        if p["role"] == "empty":
+            p["role"] = "client / switch"
+        apply(c["ports"])
+        save(c["ports"], c.get("by", "console"))
+        run("nft", "delete", "element", "bridge", TABLE, "blocked", f"{{ {nic} . {mac} }}")
+        log(f"allowed {mac} on {nic}")
+        print(json.dumps(status()))
+    elif cmd == "apply":
+        c = load()
+        if c:
+            apply(c["ports"])
+            log("port lock re-applied at boot")
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

@@ -724,7 +724,43 @@ V.setup = () => {
     <div class="card"><h2>3 · Self-test <span>· about 15 s, safe to run any time</span></h2>
       <button class="btn primary" id="stbtn" onclick="runSelftest()" ${SELFTEST_BUSY ? "disabled" : ""}>${SELFTEST_BUSY ? "Testing…" : "Run self-test"}</button>
       <div id="stres" style="margin-top:10px">${selftestView()}</div></div>
-  </div>`;
+  </div>
+  ${portLockCard()}`;
+};
+/* ---------- port lock-up ---------- */
+function portLockCard() {
+  const P = S.portlock || {}, admin = ME.role === "admin";
+  if (P.error) return `<div class="card" style="margin-top:12px"><h2>4 · Lock the ports</h2><div class="help" style="margin:0">Port lock unavailable: ${esc(P.error)}</div></div>`;
+  if (!("locked" in P)) return "";
+  const ports = P.locked ? P.ports || {} : P.plan || {};
+  const rows = Object.keys(ports).sort().map((nic) => {
+    const p = ports[nic], bl = p.blocked_devices || [];
+    const what = p.role === "empty" ? "nothing (port dead while locked)" :
+      `${p.allow.length} device${p.allow.length === 1 ? "" : "s"}${p.wifi_clients ? " + any Wi-Fi client" : ""}`;
+    return `<tr><td><b>${esc(nic)}</b></td><td>${esc(p.role)}</td><td>${esc(what)}<div class="help" style="margin:0">${esc((p.allow || []).join(" · "))}</div></td>
+      <td>${bl.map((m) => `<div>${ICON.warning} ${esc(m)} ${admin ? `<button class="btn" data-nic="${esc(nic)}" data-mac="${esc(m)}" onclick="portAllow(this.dataset.nic, this.dataset.mac)">Allow</button>` : ""}</div>`).join("") || (P.locked ? `<span class="help" style="margin:0">${p.blocked_frames ? p.blocked_frames + " frames blocked" : "nothing blocked"}</span>` : "")}</td></tr>`;
+  }).join("");
+  const head = P.locked
+    ? `${st(P.pending_revert ? "warning" : "good", P.pending_revert ? "Locked, waiting for Keep locked (undoes itself in 2 minutes)" : "Ports locked")}<div class="help" style="margin:2px 0 8px">since ${P.since ? hhmm(P.since) : "?"}${P.by ? " · by " + esc(P.by) : ""}. Empty ports are dead; each port accepts only its own devices. Survives reboots.</div>`
+    : `<div class="help" style="margin:0 0 8px">When everything works, lock the ports: empty ports go dead and every port accepts only the devices on it now, so nothing plugged in later can get onto the network. Undoes itself in 2 minutes unless you press Keep locked, in case it cuts you off.</div>`;
+  const btns = !admin ? "" : P.locked
+    ? `${P.pending_revert ? `<button class="btn primary" onclick="portAct('confirm')">Keep locked</button>` : ""}<button class="btn" onclick="portAct('unlock')">Unlock the ports</button>`
+    : `<button class="btn primary" onclick="portAct('lock')">Lock the ports</button>`;
+  return `<div class="card" style="margin-top:12px"><h2>4 · Lock the ports <span>· once the site is set up</span></h2>${head}
+    <table><tr><th>Port</th><th>Role</th><th>${P.locked ? "Allowed" : "Would allow"}</th><th>${P.locked ? "Blocked" : ""}</th></tr>${rows}</table>
+    <div class="row" style="gap:8px;margin-top:10px">${btns}</div></div>`;
+}
+window.portAct = async (action) => {
+  const msg = { lock: "Lock the ports now?\n\nEmpty ports go dead and each port accepts only the devices on it now. If this cuts you off, it undoes itself in 2 minutes; otherwise press Keep locked.",
+    unlock: "Unlock the ports? Any device in any port will work again.", confirm: null }[action];
+  if (msg && !confirm(msg)) return;
+  try { const j = await api("api/ports", { action }); S.portlock = j.portlock; toast({ lock: "ports locked: press Keep locked", unlock: "ports unlocked", confirm: "lock kept" }[action]); render(true); }
+  catch (e) { toast(e.message, true); }
+};
+window.portAllow = async (nic, mac) => {
+  if (!confirm(`Allow ${mac} on ${nic}?`)) return;
+  try { const j = await api("api/ports", { action: "allow", nic, mac }); S.portlock = j.portlock; toast("allowed"); render(true); }
+  catch (e) { toast(e.message, true); }
 };
 function quickLinks() {
   const L = [];

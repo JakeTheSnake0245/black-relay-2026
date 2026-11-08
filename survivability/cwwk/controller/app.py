@@ -469,6 +469,27 @@ def site_unlock(ip, who, passphrase):
     return obj
 
 
+def port_lock_state():
+    def get():
+        code, obj = lockd("GET", "/ports", timeout=40)
+        return obj if code == 200 else {"error": obj.get("error")}
+    try:
+        return cached("portlock", 15, get) or {}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
+def port_lock(action, who, nic=None, mac=None):
+    if action not in ("lock", "confirm", "unlock", "allow"):
+        raise ValueError("bad port action")
+    code, obj = lockd("POST", "/ports", {"action": action, "who": who, "nic": nic, "mac": mac}, timeout=90)
+    if code != 200:
+        raise RuntimeError(obj.get("error") or "port lock failed")
+    INV_CACHE.pop("portlock", None)
+    event("warning" if action in ("lock", "unlock") else "good", f"ports {action}{' ' + str(mac) + ' on ' + str(nic) if action == 'allow' else ''} by {who}")
+    return obj
+
+
 def site_lock(who):
     code, obj = lockd("POST", "/lock", {"who": who}, timeout=240)
     if code != 200:
@@ -651,6 +672,13 @@ def inventory(snap, router, subs):
         add(w, None, "Site lock", "The box starts locked; USB key or admin + vault passphrase opens it",
             "good" if lk["state"] == "unlocked" else "unknown",
             ("unlocked" + (f" by {lk.get('by')}" if lk.get("by") else "")) if lk["state"] == "unlocked" else "LOCKED")
+        pl = snap.get("portlock") or {}
+        if "locked" in pl:
+            nb = sum(len(p.get("blocked_devices") or []) for p in (pl.get("ports") or {}).values())
+            add(w, None, "Port lock", "Once set up, ports accept only the devices on them",
+                ("warning" if nb or pl.get("pending_revert") else "good") if pl["locked"] else "unknown",
+                ("locked" + (f" · {nb} blocked device(s)" if nb else "") + (" · waiting for Keep locked" if pl.get("pending_revert") else ""))
+                if pl["locked"] else "open (any device in any port)")
         if lk.get("usb_inserted") and lk["state"] == "unlocked":
             add(w, None, "USB key", "Should be with a person, not in the box", "warning", "still plugged in: pull it out")
 
@@ -806,6 +834,7 @@ def poll_once(pve, router):
                         "detail": f"{len(dep)} deployed · {len(svcs) - len(dep)} planned"}
 
     snap["fdb"] = cached("fdb", 10, lambda: host_info("/fdb")) or {}
+    snap["portlock"] = port_lock_state()
     try:
         snap["wired"] = wired_view(snap)
     except Exception as e:
@@ -1178,6 +1207,13 @@ def problems(snap, subs):
             "Open Compute and start 102 br-router if it is stopped.",
             "Devices that already have an address keep working for a while.",
             "Still down: reboot the CWWK."])
+    pl = snap.get("portlock") or {}
+    for nic, p in (pl.get("ports") or {}).items():
+        if pl.get("locked") and p.get("blocked_devices"):
+            add("warning", f"{nic}: something new was plugged in while the ports are locked (blocked)", [
+                f"Blocked device(s): {', '.join(p['blocked_devices'][:4])}.",
+                "Expected (a replaced modem, a new laptop)? Setup → Port lock → Allow, or Unlock the ports.",
+                "Not expected? Unplug it and check the CWWK."])
     for s in (snap.get("wired") or {}).get("switches", []):
         if not s["port"]:
             add("warning", f"Switch '{s['name']}' is not seen on any CWWK port", [
@@ -1720,6 +1756,17 @@ class H(BaseHTTPRequestHandler):
                 with LOCK:
                     SESSIONS.pop(tok or "", None)
                 self.json(200, {"ok": True}, {"Set-Cookie": "brc=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"})
+                return
+            if path == "/api/ports":
+                if s.get("role") != "admin":
+                    self.json(403, {"error": "only an admin can lock or unlock the ports"})
+                    return
+                b = self.body()
+                who = f"{s.get('user') or 'admin'} via {s.get('via') or 'controller'}"
+                out = port_lock(b.get("action"), who, b.get("nic"), b.get("mac"))
+                with LOCK:
+                    STATE["portlock"] = out
+                self.json(200, {"ok": True, "portlock": out})
                 return
             if path in ("/api/unlock", "/api/lock"):
                 if s.get("role") != "admin":

@@ -40,6 +40,7 @@ import time
 
 INTERFACES = "/etc/network/interfaces"
 STATE = "/run/br-port-roles.json"
+PORT_LOCK = "/etc/br-port-lock.json"   # br-port-lock: while it exists, roles are frozen
 LOCAL_OUI = "bc:24:11"     # Proxmox-generated MACs: our own containers, never "a device"
 DECIDE = 8                 # s of unanswered untagged client DHCP before switching
 SETTLE = 45                # s after the cable goes in before a port may become a client port
@@ -177,6 +178,7 @@ def main():
     while True:
         r, _, _ = select.select(list(socks), [], [], 1.0)
         now = time.time()
+        frozen = os.path.exists(PORT_LOCK)
         if now - leased_at > 10:
             leased, leased_at = edge_leases(), now
         for fd in r:
@@ -204,7 +206,7 @@ def main():
                 continue
             if kind == "server":
                 p["server"] = now
-                if p["mode"] == "client":
+                if p["mode"] == "client" and not frozen:
                     set_mode(nic, "modem", ports[nic], wifi)
                     p.update(mode="modem", since=None, client_mac=None)
                     log(f"{nic}: a DHCP server appeared (a modem): back to modem mode")
@@ -214,6 +216,8 @@ def main():
         for nic, p in st.items():
             if not carrier(nic):
                 p["link_since"] = now
+                if frozen:
+                    continue                  # ports locked: roles stay as they are
                 if p["mode"] == "client":
                     set_mode(nic, "modem", ports[nic], wifi)
                     log(f"{nic}: cable unplugged: back to modem mode")
@@ -223,7 +227,7 @@ def main():
             if p["mode"] == "modem" and p["since"]:
                 if leased is None or nic in leased or p["server"] >= p["link_since"]:
                     p.update(since=None, client_mac=None)       # a modem is (or was) answering: uplink
-                elif now - p["link_since"] >= SETTLE and now - p["since"] >= DECIDE:
+                elif not frozen and now - p["link_since"] >= SETTLE and now - p["since"] >= DECIDE:
                     p["mode"] = "client"
                     set_mode(nic, "client", ports[nic], wifi)
                     log(f"{nic}: client device {p['client_mac']} and no modem: joined the site LAN")

@@ -24,10 +24,13 @@ Every key is checked by the vault itself: a key that cannot open it opens nothin
 
 API for the controller only (TLS on the host's LAN address, bearer token):
   GET /state   POST /unlock {"passphrase", "who"}   POST /lock {"who"}
+  GET /ports   POST /ports {"action": lock|confirm|unlock|allow, "nic", "mac", "who"}
+               (physical port lock-up, see br-port-lock)
 """
 import hmac
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -294,6 +297,30 @@ def reconcile():
         time.sleep(3)
 
 
+# ------------------------------------------------------------------ port lock-up
+PORT_LOCK = "/usr/local/sbin/br-port-lock"
+
+
+def ports(action=None, nic=None, mac=None, who="controller"):
+    if action is None:
+        args = ["status"]
+    elif action == "lock":
+        args = ["lock", "120", who]
+    elif action in ("confirm", "unlock"):
+        args = [action] + ([who] if action == "unlock" else [])
+    elif action == "allow":
+        if not (isinstance(nic, str) and re.fullmatch(r"[a-z0-9]{2,15}", nic)
+                and isinstance(mac, str) and re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac.lower())):
+            raise ValueError("bad port or MAC")
+        args = ["allow", nic, mac.lower()]
+    else:
+        raise ValueError("unknown port action")
+    p = run(PORT_LOCK, *args, timeout=60)
+    if p.returncode:
+        raise RuntimeError(p.stderr.decode(errors="replace").strip()[:200] or "port lock failed")
+    return json.loads(p.stdout.decode() or "{}")
+
+
 # ------------------------------------------------------------------ API
 class H(BaseHTTPRequestHandler):
     server_version = "br-lockd"
@@ -331,6 +358,11 @@ class H(BaseHTTPRequestHandler):
             return
         if self.path == "/state":
             return self.out(200, status())
+        if self.path == "/ports":
+            try:
+                return self.out(200, ports())
+            except Exception as e:
+                return self.out(500, {"error": str(e)[:200]})
         self.out(404, {"error": "not found"})
 
     def do_POST(self):
@@ -349,6 +381,8 @@ class H(BaseHTTPRequestHandler):
                 return self.out(200, unlock(pw.encode(), who, "passphrase"))
             if self.path == "/lock":
                 return self.out(200, lock(who))
+            if self.path == "/ports":
+                return self.out(200, ports(body.get("action"), body.get("nic"), body.get("mac"), who))
             self.out(404, {"error": "not found"})
         except PermissionError as e:
             self.out(403, {"error": str(e)})

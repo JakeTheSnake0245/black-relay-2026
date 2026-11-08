@@ -51,7 +51,7 @@ Password sign-in and the status page are refused there. Pocket ID client: callba
 
 | file | setting |
 |---|---|
-| `/etc/black-relay/carriers.conf` | modem kinds, how they're recognised, caps (up/down Mbit): ISP 100/150, Starlink 10/150, Spitz 5/20 (set with the sliders on the Multipath page) |
+| `/etc/black-relay/carriers.conf` | modem kinds, how they're recognised, caps (up/down Mbit), set with the sliders on the Multipath page; since 2026-11-08 ISP 5/5 (least trusted), Starlink and Spitz 1000/1000 |
 | `/etc/black-relay/br0.conf` | `TRANSPORT=wss`, `WSS_LANES=6`; `UPLINKS` is written by `br-uplinks` before every tunnel start |
 | `/etc/black-relay/black-relay.env` | `GT_SCHED=random`, `GT_RESEQ_MS=400`, `GT_FEC=0`, `GT_KEEPALIVE_MS=200` |
 | tunnel helper | `GT_MTU=1400` for WebSocket lanes (fork patch 0003) |
@@ -145,6 +145,30 @@ them down on lock.
 First-time setup: `br-vault-init` on the host (creates the vault, shows the passphrase once,
 writes the USB key, moves the tailnet identity and secrets in).
 
+## Port lock
+
+Once the site is cabled and working, **Setup → 4 · Lock the ports** closes the ports to anything
+new (admins; on site or remote):
+
+- an empty port goes dead: whatever is plugged in later gets nothing through;
+- a modem, laptop or switch port only passes frames from the devices that were on it when it
+  was locked (their MAC addresses, from the port bridge);
+- the Wi-Fi access point's port also lets new Wi-Fi clients onto the site LAN (VLAN 40; the
+  Wi-Fi password guards that), nothing else new;
+- ports stop changing roles (`br-port-roles` holds still while locked).
+
+The card shows what each port would allow before locking. **Lock** applies it and undoes it by
+itself after 2 minutes unless **Keep locked** is pressed, so a lock that cuts you off reverts.
+The lock survives reboots. A blocked device is listed for an hour (port, MAC, frames dropped)
+with an **Allow** button; blocked devices also show on the Health page. **Unlock** before
+re-cabling or swapping a modem.
+
+Owner: `br-port-lock` on the host (`status | plan | lock [SECONDS] | confirm | unlock |
+allow NIC MAC`), nft table `bridge br_port_lock`, saved in `/etc/br-port-lock.json`,
+re-applied at boot by `br-port-lock.service`. The controller reaches it through `br-lockd`.
+Tested live: all 18 lanes stayed up while locked; a modem removed from the allowed list was
+blocked (324 frames dropped, listed) and the tunnel moved off it; unlocking brought it back.
+
 ## Health page
 
 Top to bottom: overall state, **Services** (every service card, deployed first, with Open
@@ -177,6 +201,7 @@ health. LAN → services is allowed; services → LAN is not; services → inter
 | `br-rotate-secrets` | new Proxmox token + router root password |
 | `br-lockd` (service, 10.40.0.2:8092 TLS, controller only) | the site lock: vault, edge gate, tailnet, gated containers, USB key |
 | `br-vault-init` | one-time: create the vault and the USB key |
+| `br-port-lock` (+ boot service) | the port lock (above) |
 
 Snapshot of the whole box (redacted): `../scripts/snapshot-cwwk.sh` → `../as-built/cwwk01/`.
 After a power-off test: `../scripts/capture-cold-start.sh` (see `../docs/cold-start-test.md`).

@@ -1,0 +1,13 @@
+[Unit]
+Description=CWWK port lock-up: re-apply a saved lock at boot
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/br-port-lock.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/br-port-lock apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
