@@ -56,17 +56,25 @@
     - {path: "{{ sf_dev_dir }}/disk/home", mode: "0755"}
     - {path: "{{ sf_dev_dir }}/disk/tailscale", mode: "0700"}
 
+# The image only seeds a new box's system; after that the system lives on the
+# disk and a rebuilt image changes nothing users installed.
 - name: Image build context
   ansible.builtin.template:
-    src: "{{ item.src }}"
-    dest: "{{ sf_dev_dir }}/build/{{ item.dest }}"
+    src: Dockerfile.j2
+    dest: "{{ sf_dev_dir }}/build/Dockerfile"
     owner: root
     group: root
     mode: "0644"
-  loop:
-    - {src: Dockerfile.j2, dest: Dockerfile}
-    - {src: entrypoint.sh.j2, dest: entrypoint.sh}
   register: sf_dev_build_context
+
+- name: Entrypoint (mounted into the container)
+  ansible.builtin.template:
+    src: entrypoint.sh.j2
+    dest: "{{ sf_dev_dir }}/entrypoint.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  register: sf_dev_entrypoint
 
 - name: Check whether the sf-dev image exists
   ansible.builtin.command: docker image inspect {{ sf_dev_image }}
@@ -110,8 +118,38 @@
     group: root
     mode: "0644"
 
-# The first sf-dev was started by hand (deploy/br2026-sf-dev.sh). Hand it to
-# compose once; /home and the node identity are on the disk, so nothing is lost.
+- name: Check whether the system already lives on the disk
+  ansible.builtin.stat:
+    path: "{{ sf_dev_dir }}/disk/system/.seeded"
+  register: sf_dev_seeded
+
+# Once per box: copy the system out of the existing container (so whatever
+# users installed comes along) or, for a new box, out of the image. From then
+# on /usr /etc /var /opt /root /srv are bind-mounted from the disk.
+- name: Move the system onto the disk (once)
+  when: not sf_dev_seeded.stat.exists
+  ansible.builtin.shell: |
+    set -euo pipefail
+    S={{ sf_dev_dir }}/disk/system
+    T=$(mktemp -d {{ sf_dev_dir }}/disk/.seed.XXXXXX)
+    if docker inspect {{ sf_dev_container }} >/dev/null 2>&1; then
+      docker stop -t 30 {{ sf_dev_container }} >/dev/null
+      docker export {{ sf_dev_container }} | tar -x --numeric-owner -p -C "$T"
+    else
+      cid=$(docker create {{ sf_dev_image }})
+      docker export "$cid" | tar -x --numeric-owner -p -C "$T"
+      docker rm "$cid" >/dev/null
+    fi
+    mkdir -p "$S"
+    for d in {{ sf_dev_system_dirs | join(' ') }}; do rm -rf "${S:?}/$d"; mv "$T/$d" "$S/$d"; done
+    rm -rf "$T"
+    touch "$S/.seeded"
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+# The first sf-dev was started by hand (ops script). Hand it to compose once;
+# its system is on the disk by now, so nothing is lost.
 - name: Inspect an existing sf-dev container
   ansible.builtin.command: >-
     docker inspect {{ sf_dev_container }}
@@ -163,8 +201,12 @@
       no_log: true
       diff: false
 
+# A new entrypoint is a new file (inode) behind a single-file bind mount, so it
+# needs a recreate; that is harmless now that the whole system is on the disk.
 - name: Start sf-dev
-  ansible.builtin.command: docker compose -f {{ sf_dev_dir }}/compose.yml up -d
+  ansible.builtin.command: >-
+    docker compose -f {{ sf_dev_dir }}/compose.yml up -d
+    {{ '--force-recreate' if sf_dev_entrypoint is changed else '' }}
   register: sf_dev_up
   changed_when: "'Started' in sf_dev_up.stderr or 'Recreated' in sf_dev_up.stderr"
 

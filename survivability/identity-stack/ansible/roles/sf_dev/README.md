@@ -9,8 +9,14 @@ Ubuntu 24.04 development container for the Sensor Fusion team (TAK + Detection).
   person's Pocket ID identity; `group:sensor_fusion` and `group:survivability` may log in as the
   shared `dev` account (passwordless sudo inside the container only). No keys or passwords.
 - **Disk:** a 20 GB ext4 image (`/srv/sf-dev/disk.img`, loop-mounted at `/srv/sf-dev/disk`,
-  in `/etc/fstab`) holds `/home` and the Tailscale node identity. Packages installed inside the
-  container are lost on a rebuild; work belongs under `~`.
+  in `/etc/fstab`) holds the **whole system**: `/usr` (with `/bin`, `/lib`), `/etc`, `/var`, `/opt`,
+  `/root`, `/srv` under `disk/system/`, plus `/home` and the Tailscale node identity. It is a
+  container, not a VM (the host has no KVM), but it keeps everything like one: apt packages,
+  config and files survive restarts, recreates and image rebuilds. The image only seeds a new
+  box (copied onto the disk once, marker `disk/system/.seeded`); update a running box with
+  apt inside. No systemd: long-running programs go in tmux.
+- **Backup:** the nightly restic run takes `/srv/sf-dev/disk` (files, caches excluded), not the
+  raw image.
 - **Isolation:** own Docker network `sf_dev` (172.30.0.0/24), off the identity networks;
   `sf-dev-guard.service` drops traffic to the cloud metadata service and 10.0.0.0/8.
   2 CPUs, 2 GB RAM, 2048 processes.
@@ -22,7 +28,7 @@ Policy entries it depends on (in `identity_stack/files/headscale-policy.hujson`)
 `tag:sensor-fusion` and `tag:sf-dev` in `tagOwners`, the sf-dev TCP 22 grant, and the
 `dev` ssh rule. The role refuses to run if the tags are missing.
 
-Rebuild with newer packages: bump `sf_dev_image` (e.g. `sf-dev:2`) and converge with
-`--tags sf_dev`. The container restarts once; `/home` and the node identity are kept.
+A new image (`sf_dev_image`, e.g. `sf-dev:2`) only seeds new boxes; a running box keeps its
+system. Converging with `--tags sf_dev` may recreate the container; nothing on it is lost.
 Remove the node: `headscale nodes delete`, then delete `/srv/sf-dev/disk/tailscale/*` before
 converging, and a fresh key is issued.

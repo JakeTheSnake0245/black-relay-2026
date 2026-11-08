@@ -794,6 +794,24 @@ class SensorFusionDevTests(unittest.TestCase):
         self.assertTrue(mounts["/var/lib/tailscale"].startswith("/srv/sf-dev/disk/"))
         self.assertTrue(mounts["/home"].startswith("/srv/sf-dev/disk/"))
 
+    def test_sf_dev_system_lives_on_its_disk(self):
+        # Users' packages and settings must survive a rebuilt or recreated
+        # container: every writable top-level directory comes from the disk.
+        compose = yaml.safe_load(render.render_template("sf_dev", "compose.yml.j2"))
+        dev = compose["services"]["sf-dev"]
+        mounts = {v.split(":")[1]: v.split(":")[0] for v in dev["volumes"]}
+        for d in ("/usr", "/etc", "/var", "/opt", "/root", "/srv", "/home"):
+            self.assertTrue(mounts[d].startswith("/srv/sf-dev/disk/"), d)
+        self.assertEqual(dev["entrypoint"][-1], "/sf-dev/entrypoint.sh")
+        self.assertIn("/sf-dev/entrypoint.sh", mounts)
+
+    def test_backup_takes_sf_dev_files_not_its_raw_image(self):
+        script = render.render_template("backup_restic", "survivability-backup.sh.j2")
+        paths = script[script.index("BACKUP_PATHS=("):]
+        paths = paths[:paths.index(")")].split()
+        self.assertIn("/srv/sf-dev/disk", paths)
+        self.assertIn("--exclude '/srv/sf-dev/disk.img'", script)
+
     def test_sf_dev_guard_blocks_metadata(self):
         unit = render.render_template("sf_dev", "sf-dev-guard.service.j2")
         self.assertIn("-s 172.30.0.0/24 -d 169.254.0.0/16 -j DROP", unit)

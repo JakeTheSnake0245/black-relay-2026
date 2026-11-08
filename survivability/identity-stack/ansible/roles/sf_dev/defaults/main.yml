@@ -4,10 +4,17 @@ sf_dev_dir: /srv/sf-dev
 sf_dev_disk_size: 20G
 sf_dev_base_image: >-
   ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
-# Bump the tag to force a rebuild with newer packages.
+# Seeds a new box only. A running box keeps its system on its disk; update
+# it with apt inside. Bump the tag to rebuild the seed.
 sf_dev_image: "sf-dev:1"
 sf_dev_container: sf-dev
 sf_dev_hostname: sf-dev
+# The whole system lives on the 20 GB disk, not in the image: these top-level
+# directories are seeded once (from the running container, or the image for a
+# new box) and bind-mounted from the disk from then on. Ubuntu 24.04 merges
+# /bin, /sbin and /lib into /usr. Packages, /etc changes and everything users
+# install survive restarts, recreates and image rebuilds.
+sf_dev_system_dirs: [usr, etc, var, opt, root, srv]
 sf_dev_network: sf_dev
 sf_dev_subnet: 172.30.0.0/24
 sf_dev_cpus: "2.00"

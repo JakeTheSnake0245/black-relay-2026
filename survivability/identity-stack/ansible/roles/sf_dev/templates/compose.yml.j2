@@ -10,13 +10,21 @@ services:
     container_name: "{{ sf_dev_container }}"
     hostname: "{{ sf_dev_hostname }}"
     restart: unless-stopped
+    # The entrypoint is mounted from the host so it can change without
+    # touching the persisted system.
+    entrypoint: ["/usr/bin/tini", "--", "/sf-dev/entrypoint.sh"]
     # Kernel-mode Tailscale in the container's own network namespace.
     cap_add: [NET_ADMIN, NET_RAW]
     devices: ["/dev/net/tun:/dev/net/tun"]
     pids_limit: {{ sf_dev_pids_limit }}
     volumes:
+      # Everything a user can change is on the 20 GB disk.
+{% for d in sf_dev_system_dirs %}
+      - "{{ sf_dev_dir }}/disk/system/{{ d }}:/{{ d }}"
+{% endfor %}
       - "{{ sf_dev_dir }}/disk/home:/home"
       - "{{ sf_dev_dir }}/disk/tailscale:/var/lib/tailscale"
+      - "{{ sf_dev_dir }}/entrypoint.sh:/sf-dev/entrypoint.sh:ro"
       - "{{ sf_dev_dir }}/authkey:/run/secrets/ts-authkey:ro"
     networks:
       {{ sf_dev_network }}: {}

@@ -43,8 +43,17 @@ backup_restic_backup_paths:
   - /var/backups/survivability
   - /var/lib/survivability-backup
   - /var/lib/survivability-firewall
+  # sf-dev's own disk (users' work and the system they installed). It is a
+  # separate filesystem, so --one-file-system needs it named here; the raw
+  # image file under /srv is excluded instead (a live ext4 image does not
+  # restore reliably).
+  - /srv/sf-dev/disk
 backup_restic_exclude_patterns:
   - /root/.cache
+  - /srv/sf-dev/disk.img
+  - /srv/sf-dev/disk/system/var/cache
+  - /srv/sf-dev/disk/system/var/tmp
+  - /srv/sf-dev/disk/home/*/.cache
 backup_restic_sqlite_roots:
   - /srv
 backup_restic_sqlite_globs:

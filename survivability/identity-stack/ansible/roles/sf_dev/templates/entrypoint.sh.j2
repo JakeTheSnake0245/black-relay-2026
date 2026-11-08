@@ -3,9 +3,16 @@
 set -e
 if [ ! -d /home/dev ]; then
   mkdir -p /home/dev && cp -rT /etc/skel /home/dev
-  echo 'This is sf-dev (Sensor Fusion). Keep work under ~ (20 GB disk); packages installed with apt are lost when the container is rebuilt.' > /home/dev/README
   chown -R dev:dev /home/dev
 fi
+cat > /home/dev/README <<'EOF'
+This is sf-dev (Sensor Fusion): an Ubuntu 24.04 container on BR2026.
+Its whole system lives on its own 20 GB disk: your files, apt packages,
+/etc, /opt, /usr/local, /var and /root all survive restarts and rebuilds,
+and are backed up every night.
+Long-running programs: start them in tmux (there is no systemd here).
+EOF
+chown dev:dev /home/dev/README
 mkdir -p /run/tailscale
 tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock &
 for i in $(seq 1 30); do [ -S /run/tailscale/tailscaled.sock ] && break; sleep 1; done
