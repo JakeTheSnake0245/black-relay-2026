@@ -20,7 +20,7 @@ day to day: the CWWK site box is `../cwwk/`, BR2026 itself is `../identity-stack
 | `packaging/` | Builds the `black-relay` .deb / OpenWrt .ipk / hub container image (`build.sh` → `dist/`). `files/` holds the tunnel helper, watcher, live dashboard (`br-dash`) and hub tools. |
 | `edge/` | Site-edge tools (installed on a site's `br-edge` container): `br-uplinks` (recognises the modem in each port, re-checks every minute), `carriers.conf` (modem kinds and speed caps), `br-ctl` (the controller's only commands), `br-selftest`, `br-lane-nurse`, firewall (`nftables.conf`), networkd files. |
 | `dist/` | Built packages and hub images, with `SHA256SUMS`. |
-| `docs/` | `diagrams.md` (how each tunnel's far end reaches Hetzner), `lab-results.md` (measurements behind the defaults). |
+| `docs/` | `diagrams.md` (Mermaid; rendered to `../docs/Black-Relay-Diagrams.pdf` by `scripts/render-diagrams.py`), `lab-results.md` (measurements behind the defaults). |
 | `gt-lab/`, `analysis/` | Three-lane netns lab and capture-analysis tools used to tune the tunnel. |
 | `scripts/deploy-test.sh` | Push the fork + lab to a throwaway VPS and run the self-tests (never production). |
 

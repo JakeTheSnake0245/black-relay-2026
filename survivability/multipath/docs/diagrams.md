@@ -2,14 +2,14 @@
 
 Mermaid sources for how the site box, its modems and the hub connect and work.
 They render on GitHub and in VS Code. Companion to
-`../../cwwk/docs/Black-Relay-Site-Architecture.pdf` and `../../cwwk/controller/README.md`.
+`../../cwwk/docs/Black-Relay-Site-Architecture.pdf` (rendered: `Black-Relay-Diagrams.pdf`) and `../../cwwk/controller/README.md`.
 
 ## 1. End to end: every modem, its own carrier, one hub
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph SITE["CWWK site box"]
-    direction TB
+    direction LR
     PORTS["4 ports<br/>any cable, any port"] --> EDGE["br-edge<br/>names each modem · caps<br/>6 TLS lanes per modem<br/>glorytun bonding · leak guard"]
     LAN["br-router<br/>site LAN + Wi-Fi 10.40.0.x<br/>services 10.41.0.x"] --> EDGE
   end
@@ -20,11 +20,12 @@ flowchart LR
   POP --> NET
   CORE --> NET
   subgraph HUB["BR2026 · Hetzner Helsinki · 89.167.30.202"]
-    direction TB
+    direction LR
     FW["Hetzner firewall<br/>TCP 80/443 only"] --> CADDY["Caddy :443<br/>/multithread-* → hub lanes<br/>/cwwk/* → site controller<br/>else → Headscale"]
     CADDY --> WST["hub: wstunnel :8080<br/>unwraps each lane"] --> GT["glorytun hub 10.255.1.1<br/>decrypt · reorder (400 ms)"]
     GT --> NAT["NAT exit<br/>89.167.30.202"]
     ID["Headscale · Pocket ID · LLDAP"]
+    SF["sf-dev · Sensor Fusion box<br/>tailnet only"]
   end
   NET --> FW
   NAT --> OUT(["websites and services"])
@@ -62,7 +63,7 @@ flowchart LR
 flowchart TD
   P["Cable plugged in"] --> Q1{"br-edge gets an address<br/>(a DHCP server answers)?"}
   Q1 -- yes --> K{"carriers.conf"}
-  K -- "dish answers 192.168.100.1:9200<br/>or CGNAT address" --> SL["Starlink · caps 10/150"]
+  K -- "dish answers 192.168.100.1:9200<br/>or CGNAT address" --> SL["Starlink · caps 10/150<br/>dish page + app reachable (9200/9201)"]
   K -- "gateway 192.168.9.1" --> SP["Spitz · caps 5/20"]
   K -- "anything else" --> IS["ISP · caps 100/150"]
   SL & SP & IS --> L["6 lanes join the tunnel"]
@@ -70,6 +71,7 @@ flowchart TD
   W -- yes --> AP["Wi-Fi access point on this port<br/>(the Spitz) → site LAN"]
   Q1 -- "no, 45 s after link-up,<br/>and a device keeps asking" --> C["Client port<br/>untagged → VLAN 40 → 10.40.0.x"]
   C -- "a DHCP server appears<br/>or the cable is pulled" --> Q1
+  IS -. "every minute: its own check answers now<br/>(Starlink still booting at start)" .-> SL
 ```
 
 ## 4. Packet pipeline: deconstruct, spread, reconstruct
@@ -163,6 +165,8 @@ flowchart LR
   B["Some lanes of one modem stuck<br/>(Starlink warm-up)"] --> N["lane nurse: modem can reach the hub?<br/>re-dial just those lanes<br/>backoff 30 s → 5 min"]
   C["Lanes up but no data<br/>(hub stops answering)"] --> G["watchdog: 3 failed pings<br/>→ restart the tunnel"]
   E["Tunnel down"] --> F["fail closed:<br/>site traffic dropped, never sent raw"]
+  H["Modem recognised late<br/>(Starlink booting at tunnel start)"] --> R["re-check every minute:<br/>catch-all 'ISP' → real kind,<br/>restart once (max 1 per 5 min)"]
+  I["Cable pulled from a modem port<br/>(invisible behind the bridge)"] --> J["re-check ARPs the modem:<br/>2 misses → drop its old lease"]
 ```
 
 ## 9. Remote access to the site controller
@@ -194,3 +198,50 @@ flowchart LR
   W --> T2["glorytun site 2<br/>10.255.2.1 ⇄ .2"]
   T1 & T2 --> X["NAT exit 89.167.30.202<br/>sites never reach each other"]
 ```
+
+## 11. Site lock: power-on to unlocked
+
+```mermaid
+flowchart TD
+  ON["Power on / reboot / Lock"] --> LK["LOCKED<br/>Wi-Fi + LAN addresses, controller page<br/>vault closed · tailnet off · services stopped"]
+  LK --> OK1["Reachable while locked:<br/>sign-in at BR2026 (443) · router DNS<br/>modem + dish pages"]
+  LK --> U{"Unlock"}
+  U -- "USB key BRKEY<br/>plugged into the CWWK" --> V["vault opens<br/>(the key must open it)"]
+  U -- "admin password (on site) or Pocket ID (anywhere)<br/>+ vault passphrase" --> V
+  V --> OPEN["UNLOCKED<br/>edge gate open · tailnet on<br/>service containers (br-gated) start"]
+  OPEN -- "Lock site button" --> LK
+  OPEN -- "power cut / reboot" --> LK
+  X["5 wrong passphrases"] --> Y["wait 15 minutes"]
+```
+
+## 12. Sensor Fusion on BR2026
+
+```mermaid
+flowchart LR
+  subgraph TN["Tailnet: Sensor Fusion mesh"]
+    direction TB
+    TAKP["TAK team<br/>laptops · ATAK/iTAK phones"]
+    DETL["Detection team<br/>laptops"]
+    PIS["Pis / sensors<br/>tag:sensor-fusion"]
+  end
+  subgraph BR["BR2026 host"]
+    subgraph SFD["sf-dev · Sysbox system box · 80 GB disk (all kept, backed up)"]
+      direction TB
+      DK["its own Docker + compose"]
+      subgraph FUS["docker network fusion"]
+        MQ["MQTT broker<br/>(teams build)"]
+        TS["TAK server<br/>(TAK team builds)"]
+        DS["Detection services"]
+        BRG["bridges / fusion services"]
+      end
+      DK --> FUS
+    end
+  end
+  DETL -- "ssh dev@sf-dev · build + run" --> DK
+  TAKP -- "ssh dev@sf-dev" --> DK
+  DS -- "publish detections" --> MQ
+  MQ --> BRG --> TS
+  PIS -- "sf-dev:port" --> MQ
+  TS -- "sf-dev:port" --> TAKP
+```
+

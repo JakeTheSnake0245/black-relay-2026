@@ -2,7 +2,7 @@
 
 Modems (any port) ⇄ **br-edge** (multipath tunnel) ⇄ **br-router** (OpenWrt) ⇄ site LAN / Wi-Fi / services.
 One web UI for everything: **br-controller**. Field operators only need the field card
-(`../docs/field-card.html`) and the controller's Setup page.
+(`../docs/Black-Relay-Field-Card.pdf`) and the controller's Setup page.
 
 ## Layout (Proxmox host `pve`)
 

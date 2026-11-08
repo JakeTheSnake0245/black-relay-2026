@@ -293,6 +293,7 @@ li { margin: 2px 0; font-size: 9pt; }
         <tr><td>101</td><td>br-edge</td><td>modem detection, lanes, bonding, tunnel, leak guard, live dashboard</td></tr>
         <tr><td>102</td><td>br-router</td><td>OpenWrt: DHCP, DNS, firewall, LuCI</td></tr>
         <tr><td>103</td><td>br-controller</td><td>single web UI for the whole box</td></tr>
+        <tr><td>host</td><td>br-lockd</td><td>site lock: encrypted vault, edge gate, tailnet, gated services</td></tr>
       </table>
       <h2>Web interfaces</h2>
       <table>
@@ -308,8 +309,9 @@ li { margin: 2px 0; font-size: 9pt; }
     <div>
       <h2>Security controls</h2>
       <ul>
+        <li><b>Starts locked.</b> After every power-on, reboot or Lock: no internet, services or tailnet until the USB key or an admin + vault passphrase unlocks it. The tailnet identity, host secrets and service data sit in an encrypted vault.</li>
         <li><b>Fail closed.</b> Site traffic can only leave through the tunnel; if it is down, traffic is dropped, never sent out a raw modem.</li>
-        <li><b>Leak guard.</b> Only the encrypted lanes to the hub (TLS 443, each pinned to its modem), DHCP and modem admin pages may use a modem.</li>
+        <li><b>Leak guard.</b> Only the encrypted lanes to the hub (TLS 443, each pinned to its modem), DHCP and modem admin pages (plus a recognised Starlink dish's own app ports) may use a modem.</li>
         <li><b>Hostile modems can't steer traffic.</b> Routes a modem pushes are ignored, leases overlapping the site are refused, and site addresses always route via the router.</li>
         <li><b>Hub inside existing ports.</b> No new public ports on BR2026: lanes ride HTTPS 443 behind Caddy; a secret path plus the tunnel's own keys authenticate the site.</li>
         <li><b>Hub egress is public-only.</b> Site traffic can't reach the hub's internal networks or private ranges; the hub's own address only on 80/443.</li>
@@ -317,19 +319,18 @@ li { margin: 2px 0; font-size: 9pt; }
         <li><b>Remote control needs Pocket ID.</b> The controller's remote listener accepts only the hub, and every person signs in (admin or view-only by group).</li>
         <li><b>Least privilege.</b> Proxmox token: view + power only; multipath changes through fixed commands; the three core containers can't be stopped from the UI.</li>
         <li><b>No side doors.</b> SSH is key-only; no tailnet forwarders; the on-site password works on the site LAN only (break-glass).</li>
-        <li><b>Self-healing.</b> Moved cables, DHCP changes, stuck lanes and a wedged tunnel recover on their own; the CWWK is back about 2 min after power-on.</li>
+        <li><b>Self-healing.</b> Moved or pulled cables, late-booting modems, DHCP changes, stuck lanes and a wedged tunnel recover on their own; up about 2 min after power-on (locked).</li>
       </ul>
       <h2>Tuning (November 2026)</h2>
       <table>
         <tr><th>Setting</th><th>Value</th></tr>
         <tr><td>Mixing</td><td>per-packet random, weighted by each modem's speed caps</td></tr>
-        <tr><td>Speed caps (up/down Mbit)</td><td>ISP 100/150 · Starlink 10/150 · Spitz 5/20 · follow the modem, not the port</td></tr>
+        <tr><td>Speed caps (up/down Mbit)</td><td>ISP 100/150 · Starlink 10/150 · Spitz 5/20 · follow the modem; uploads lean on the ISP (Starlink ~9 up). Change on Multipath</td></tr>
         <tr><td>Lanes</td><td>6 HTTPS connections per modem</td></tr>
         <tr><td>Reorder hold</td><td>400 ms</td></tr>
         <tr><td>Tunnel MTU</td><td>1400 (fixed for HTTPS lanes)</td></tr>
         <tr><td>Round trip to hub</td><td>~110–130 ms</td></tr>
       </table>
-      <div class="note" style="margin-top:4px">Starlink's upload is ~9 Mbit raw, so uploads lean on the ISP by design. Change caps on the controller's Multipath page.</div>
     </div>
   </div>
 </section>
