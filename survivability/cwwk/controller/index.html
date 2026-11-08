@@ -455,38 +455,104 @@ function glance() {
 
 const CAPLABEL = { isp: "ISP", starlink: "Starlink", spitz: "Spitz" };
 const capKinds = () => ((S.multipath_conf || {}).caps || "").split(" ").filter(Boolean).map((x) => x.split(":")[0]).map((k) => [k, CAPLABEL[k] || k]);
+/* ---------- speed caps: one row per kind of connection, sliders on fixed steps ---------- */
+const CAP_STEPS = [1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 300, 500, 1000];
+const CAP_INFO = {
+  starlink: "Satellite. Typical 5–20 Mbit up, 50–250 down; drops out when the sky view is blocked.",
+  isp: "Wired / ISP router. Set to its plan, or lower to send it less of the traffic.",
+  spitz: "Cellular 4G/5G. Typical 5–30 up, 20–150 down; uses the SIM's data.",
+};
+const CAP_DEFAULTS = { starlink: [10, 150], isp: [100, 150], spitz: [5, 20] };
+const HOLD_STEPS = [100, 200, 300, 400, 600, 800, 1000, 1500];
+let CAP_EDIT = null;   // {kind: [tx, rx]} while the page is open
+const capParse = (s) => (s || "").split(" ").filter(Boolean).reduce((o, x) => { const [k, v] = x.split(":"); const [a, b] = (v || "").split("/").map(Number); if (k) o[k] = [a, b]; return o; }, {});
+const capString = (o) => capKinds().map(([k]) => `${k}:${o[k][0]}/${o[k][1]}`).join(" ");
+const stepIdx = (v) => CAP_STEPS.reduce((bi, s, i) => (Math.abs(s - v) < Math.abs(CAP_STEPS[bi] - v) ? i : bi), 0);
+const kindVar = (k) => (["starlink", "isp", "spitz"].includes(k) ? `var(--kind-${k})` : "var(--unknown)");
+function capPreview() {
+  // share of traffic each CONNECTED modem would carry, per direction
+  const ups = ((S.multipath || {}).uplinks || []).filter((u) => u.ip && u.kind && CAP_EDIT[u.kind]);
+  return [0, 1].map((d) => {
+    const tot = ups.reduce((a, u) => a + CAP_EDIT[u.kind][d], 0);
+    const segs = ups.map((u) => {
+      const pc = tot ? CAP_EDIT[u.kind][d] / tot * 100 : 0;
+      return `<div title="${esc((CAPLABEL[u.kind] || u.kind) + " on " + u.port)}: ${pc.toFixed(0)}%" style="flex-grow:${pc};background:${kindVar(u.kind)};color:#fff;font-size:12px;font-weight:600;padding:5px 6px;white-space:nowrap;overflow:hidden">${pc >= 9 ? esc(CAPLABEL[u.kind] || u.kind) + " " + pc.toFixed(0) + "%" : ""}</div>`;
+    }).join("");
+    return `<div style="margin-bottom:8px"><div class="help" style="margin:0 0 3px">${d ? "Download" : "Upload"}: share each connected modem would carry</div>
+      <div style="display:flex;border-radius:6px;overflow:hidden;min-height:26px;background:var(--surface-3)">${segs || '<div class="help" style="padding:5px">no modems connected</div>'}</div></div>`;
+  }).join("");
+}
+window.capMove = (el) => {
+  const v = CAP_STEPS[Number(el.value)];
+  CAP_EDIT[el.dataset.kind][Number(el.dataset.dir)] = v;
+  $(`#cv-${el.dataset.kind}-${el.dataset.dir}`).textContent = v + " Mbit";
+  $("#cap-preview").innerHTML = capPreview();
+};
+window.capReset = () => {
+  for (const [k] of capKinds()) if (CAP_DEFAULTS[k]) CAP_EDIT[k] = CAP_DEFAULTS[k].slice();
+  render(true);
+};
 V.multipath = () => {
   const cf = S.multipath_conf || {};
-  const caps = (cf.caps || "").split(" ").reduce((o, x) => { const [k, v] = x.split(":"); if (k) o[k] = v; return o; }, {});
-  const opt = (v, cur) => `<option ${v === cur ? "selected" : ""}>${v}</option>`;
+  if (!cf.caps) return `<header class="page"><h1>Multipath</h1></header><div class="card">${st("unknown", "Waiting for the multipath box to answer…")}</div>`;
+  const cur = capParse(cf.caps);
+  if (!CAP_EDIT) CAP_EDIT = JSON.parse(JSON.stringify(cur));
+  for (const [k] of capKinds()) if (!CAP_EDIT[k]) CAP_EDIT[k] = (cur[k] || CAP_DEFAULTS[k] || [5, 20]).slice();
+  const det = ((S.multipath || {}).uplinks || []).filter((u) => u.ip && u.kind);
+  const slider = (k, d) => `<div style="flex:1;min-width:180px"><div class="row" style="justify-content:space-between"><span class="help" style="margin:0">${d ? "Download" : "Upload"}</span><b id="cv-${esc(k)}-${d}" class="num">${CAP_EDIT[k][d]} Mbit</b></div>
+      <input type="range" min="0" max="${CAP_STEPS.length - 1}" step="1" value="${stepIdx(CAP_EDIT[k][d])}" data-kind="${esc(k)}" data-dir="${d}" oninput="capMove(this)" style="width:100%;accent-color:${kindVar(k)}"></div>`;
+  const ORDER = ["starlink", "isp", "spitz"];
+  const shown = capKinds().slice().sort((a, b) => ((ORDER.indexOf(a[0]) + 1) || 99) - ((ORDER.indexOf(b[0]) + 1) || 99));
+  const rows = shown.map(([k, label]) => {
+    const where = det.filter((u) => u.kind === k).map((u) => u.port);
+    return `<div style="display:grid;grid-template-columns:minmax(150px,220px) 1fr;gap:10px 18px;align-items:center;padding:10px 0;border-bottom:1px solid var(--grid)">
+      <div><div style="font-weight:650"><i class="kc" style="background:${kindVar(k)}"></i>${esc(label)}</div>
+        <div class="help" style="margin:2px 0 0">${where.length ? "connected on " + esc(where.join(", ")) : "not connected now"}</div>
+        <div class="help" style="margin:2px 0 0">${esc(CAP_INFO[k] || "")}</div></div>
+      <div class="row" style="gap:18px;flex-wrap:wrap">${slider(k, 0)}${slider(k, 1)}</div></div>`;
+  }).join("");
+  const opt = (v, c) => `<option ${String(v) === String(c) ? "selected" : ""}>${v}</option>`;
   return `
     <header class="page"><h1>Multipath</h1><span class="sub">Multithread · HTTPS 443 · ${esc(cf.lanes || "?")} connections per uplink</span><span class="spacer"></span>
       <button class="btn" onclick="if(confirm('Restart the tunnel? Traffic pauses for a few seconds.')) act({area:'multipath',action:'restart-tunnel'},'tunnel restarting')">Restart tunnel</button></header>
-    <div class="card" style="margin-bottom:12px"><h2>Tuning <span>· changes apply when the tunnel restarts</span></h2>
-      <div class="grid g4" style="margin:0">
-        <div><label>Mixing</label><select id="m-sched">${["random", "arrival", "scatter"].map((v) => opt(v, cf.sched)).join("")}</select>
-          <div class="help">random = per-packet mix weighted by caps · arrival = fastest lane first · scatter = strict round-robin</div></div>
-        <div><label>Reorder hold (ms)</label><input id="m-hold" type="number" min="50" max="2000" value="${esc(cf.hold || 400)}"></div>
-        <div><label>Connections per uplink</label><select id="m-lanes">${["1", "2", "3", "4", "5", "6"].map((v) => opt(v, cf.lanes)).join("")}</select></div>
-        <div><label>Speed caps per modem, Mbit up/down</label>
-          <div class="row">${capKinds().map(([k, t]) => `<input data-cap="${esc(k)}" value="${esc(caps[k] || "")}" title="${esc(t)}" style="width:${Math.floor(96 / Math.max(1, capKinds().length))}%">`).join("")}</div>
-          <div class="help">${esc(capKinds().map(([, t]) => t).join(" · "))}, as TX/RX. Follows the modem into whichever port it's in.</div></div>
-      </div>
-      <div class="row" style="margin-top:12px"><button class="btn primary" onclick="applyMp()">Apply and restart tunnel</button><span class="help">Current: ${esc(cf.sched)} · hold ${esc(cf.hold)} ms · FEC ${esc(cf.fec)} · ${esc(cf.transport)} · service ${esc(cf.service)}</span></div>
+    <span id="mp-ready" hidden></span>
+    <div class="card" style="margin-bottom:12px"><h2>Speed caps <span>· per kind of connection; a modem keeps its caps in any port</span></h2>
+      <div class="help" style="margin:0 0 6px">Each connection carries traffic in proportion to its caps, and never more than its cap. Lower a connection to send it less of the site's traffic.</div>
+      ${rows}
+      <div id="cap-preview" style="margin-top:12px">${capPreview()}</div>
     </div>
+    <div class="card" style="margin-bottom:12px"><h2>Tuning</h2>
+      <div class="grid g3" style="margin:0">
+        <div><label>Mixing</label><select id="m-sched">${["random", "arrival", "scatter"].map((v) => opt(v, cf.sched)).join("")}</select>
+          <div class="help">random = per-packet mix weighted by caps (recommended) · arrival = fastest lane first · scatter = strict round-robin</div></div>
+        <div><label>Reorder hold</label><select id="m-hold">${HOLD_STEPS.map((v) => `<option value="${v}" ${String(v) === String(cf.hold) ? "selected" : ""}>${v} ms</option>`).join("")}</select>
+          <div class="help">How long the far end waits for a late packet before moving on.</div></div>
+        <div><label>Connections per modem</label><select id="m-lanes">${["1", "2", "3", "4", "5", "6"].map((v) => opt(v, cf.lanes)).join("")}</select></div>
+      </div>
+    </div>
+    <div class="row" style="margin:0 0 12px;gap:8px"><button class="btn primary" onclick="applyMp()">Apply and restart tunnel</button><button class="btn" onclick="capReset()">Reset caps to defaults</button>
+      <span class="help" style="margin:0">Now: ${esc(cf.sched)} · hold ${esc(cf.hold)} ms · ${esc(cf.lanes)} per modem · caps ${esc(cf.caps)}</span></div>
     <iframe class="frame" src="mp/" title="Multipath live dashboard"></iframe>`;
 };
 window.applyMp = async () => {
-  const cf = S.multipath_conf || {}, steps = [];
+  const cf = S.multipath_conf || {}, steps = [], lines = [];
   const s = $("#m-sched").value, h = $("#m-hold").value, l = $("#m-lanes").value;
-  const caps = [...document.querySelectorAll("input[data-cap]")].map((el) => `${el.dataset.cap}:${el.value.trim()}`).join(" ");
-  if (s !== cf.sched) steps.push({ action: "set-sched", value: s });
-  if (String(h) !== String(cf.hold)) steps.push({ action: "set-hold", value: h });
-  if (String(l) !== String(cf.lanes)) steps.push({ action: "set-lanes", value: l });
-  if (caps !== cf.caps) steps.push({ action: "set-caps", value: caps });
+  const caps = capString(CAP_EDIT), cur = capParse(cf.caps);
+  if (s !== cf.sched) { steps.push({ action: "set-sched", value: s }); lines.push(`Mixing: ${cf.sched} → ${s}`); }
+  if (String(h) !== String(cf.hold)) { steps.push({ action: "set-hold", value: h }); lines.push(`Reorder hold: ${cf.hold} → ${h} ms`); }
+  if (String(l) !== String(cf.lanes)) { steps.push({ action: "set-lanes", value: l }); lines.push(`Connections per modem: ${cf.lanes} → ${l}`); }
+  if (caps !== cf.caps) {
+    steps.push({ action: "set-caps", value: caps });
+    for (const [k, label] of capKinds()) {
+      const a = cur[k] || [], b = CAP_EDIT[k];
+      if (a[0] !== b[0] || a[1] !== b[1]) lines.push(`${label}: up ${a[0]} → ${b[0]}, down ${a[1]} → ${b[1]} Mbit`);
+    }
+  }
   if (!steps.length) return toast("nothing changed");
+  if (!confirm("Apply these changes? The tunnel restarts (a few seconds without internet).\n\n" + lines.join("\n"))) return;
   for (const st of steps) { const r = await act({ area: "multipath", ...st }, st.action + " ok"); if (!r) return; }
   await act({ area: "multipath", action: "restart-tunnel" }, "applied — tunnel restarting");
+  CAP_EDIT = null;
 };
 
 V.network = () => {
@@ -790,7 +856,7 @@ function render(force) {
   if (LOCKED_SHOWN) { LOCKED_SHOWN = false; force = true; }
   // don't rebuild the page under the user's hands (forms, iframe)
   const busy = document.activeElement && ["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName);
-  if (!force && (busy || view === "multipath" || view === "settings" || view === "help" || (view === "setup" && SELFTEST_BUSY) || $("#svcdlg").open || $("#svcimp").open)) return;
+  if (!force && (busy || (view === "multipath" && $("#mp-ready")) || view === "settings" || view === "help" || (view === "setup" && SELFTEST_BUSY) || $("#svcdlg").open || $("#svcimp").open)) return;
   const fn = V[view] || V.health;
   $("#main").innerHTML = fn();
   lastView = view;

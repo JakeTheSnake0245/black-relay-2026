@@ -56,7 +56,12 @@ Password sign-in and the status page are refused there. Pocket ID client: callba
 | `/etc/black-relay/black-relay.env` | `GT_SCHED=random`, `GT_RESEQ_MS=400`, `GT_FEC=0`, `GT_KEEPALIVE_MS=200` |
 | tunnel helper | `GT_MTU=1400` for WebSocket lanes (fork patch 0003) |
 
-Change caps, mixing, hold and lanes on the controller's Multipath page. Hub side
+Change caps, mixing, hold and lanes on the controller's Multipath page: one row per kind of
+connection (Starlink, ISP, Spitz, and any kind added to `carriers.conf`) with upload and download
+sliders on fixed steps (1–1000 Mbit, no typing), a live bar of the share each connected modem
+would carry, Reset to defaults, and a before → after confirmation before the tunnel restarts.
+A connection's share is its cap over the sum of the connected ones' caps; lower a connection's
+caps to send it less of the site's traffic (e.g. a less trusted ISP). Hub side
 (`/srv/black-relay/etc/black-relay.env` on BR2026) mirrors scheduler/hold, `GT_PASSIVE_TIMEOUT_S=30`.
 
 ## Self-healing
