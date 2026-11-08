@@ -51,12 +51,50 @@ network. The edge's leak-guard drop counter did not move during the run.
 
 Reassembly: 0.19% of test pings lost (Starlink was dropping out every ~1.6 min that day).
 
+## Both ends (second run, same day)
+
+A second 60 s run captured the hub too (`hub-lane-capture.py`, from the BR2026 host inside the
+hub container's network, headers only) at the same time as the site. `lane-ends.py` matched
+every hub lane socket to its site lane (18 of 18, exact: a lane keeps its packet order and sizes
+end to end).
+
+**Hub scheduler, its true send order: every test passes.**
+
+| path | expected (caps) | measured |
+|---|---|---|
+| Starlink | 46.9% | 47.9% |
+| ISP | 46.9% | 45.7% |
+| Spitz | 6.25% | 6.4% |
+
+| test | result | verdict |
+|---|---|---|
+| share per path matches its caps | χ² = 3.89, p = 0.14 | pass |
+| lanes inside each path used equally | p = 0.60 / 0.31 / 0.48 | pass |
+| next path independent of the previous | χ² = 7.68, p = 0.10 | pass |
+| runs test | z = 0.66, p = 0.51 | pass |
+| autocorrelation, lags 1–10 | max r = 0.019 | pass |
+| no round-robin inside a path | 16.3% vs 16.7% random, p = 0.40 | pass |
+| longest streak on one lane | 3 (random ≈ 3) | pass |
+
+The site scheduler (upload) passed every test again in this run (shares 8.6 / 86.7 / 4.7% vs
+8.7 / 87.0 / 4.3%). So the download clustering seen at the site in the first run is the TCP
+lanes delivering in bursts, not the hub's choices.
+
+**End to end, per lane:** nothing lost on any lane (sent and received counts agree, apart from
+packets in flight when a capture window opened or closed). Delay spread inside a lane:
+Starlink ~8 ms typical / 30 ms at p95, ISP 1–5 ms, Spitz 2–6 ms. **One Spitz lane (19) stalled:**
+some of its packets arrived 6–9 s late, a cellular TCP retransmit stall. They were past the
+400 ms reorder hold, so they count as the tunnel's small loss (0.21% of test pings) instead of
+holding everything up.
+
+**On the wire:** 23.7% of neighbouring packets (in the hub's send order) arrive at the site
+swapped; the resequencer puts them back in order.
+
 ## Conclusion
 
-The site's scheduler picks lanes randomly and in proportion to the caps: no pattern, no
-memory, no round-robin, equal use of each modem's lanes. Downloads are split exactly as weighted;
-their arrival order clusters because the lanes are TCP, which the hub-side scheduler cannot
-change. An observer on any one carrier sees only that carrier's encrypted lanes and its random
+Both schedulers, the site's (upload) and the hub's (download, measured at the hub), pick lanes
+randomly and in proportion to the caps: no pattern, no memory, no round-robin, equal use of each
+modem's lanes. Arrival order at the far end clusters a little because each lane is TCP. An observer on any one carrier sees only that carrier's encrypted lanes and its random
 share of the traffic. This is statistical randomness of path choice; confidentiality rests on the
 tunnel's encryption, not on the randomness.
 
@@ -69,6 +107,13 @@ pct exec 101 -- sh -c 'python3 /root/lane-capture.py 72 /root/lanes.csv /root/le
   ping -q -i 0.003 -s 1000 -w 60 10.255.1.1; wait'
 # copy lanes.csv back, then
 python3 multipath/analysis/lane-randomness.py lanes.csv "$(grep ^UPLINKS /etc/black-relay/br0.conf)"
+
+# hub end at the same time (on BR2026):
+sudo nsenter -t "$(sudo docker inspect -f '{{.State.Pid}}' survivability-black-relay)" -n \
+  python3 hub-lane-capture.py 80 /tmp/hub-lanes.csv
+# then
+python3 multipath/analysis/lane-ends.py lanes.csv hub-lanes.csv hub-mapped.csv
+python3 multipath/analysis/lane-randomness.py hub-mapped.csv "<UPLINKS>" 6 hub
 ```
 
-Raw data of this run (timings, lanes, sizes only): `archive/lane-test-20261108/` (local).
+Raw data (timings, lanes, sizes only): `archive/lane-test-20261108/` and `.../both-ends/` (local).

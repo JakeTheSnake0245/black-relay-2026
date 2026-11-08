@@ -2,7 +2,10 @@
 """lane-randomness: statistical checks on which lane the scheduler picked, from a
 lane-capture.py CSV (time, direction, lane, length). Stdlib only.
 
-  python3 lane-randomness.py lanes.csv "up0:10/150 up1:100/150 up2:100/150 up3:5/20" [lanes-per-uplink]
+  python3 lane-randomness.py lanes.csv "up0:10/150 up1:100/150 up2:100/150 up3:5/20" [lanes-per-uplink] [hub]
+
+With "hub", the CSV is a hub capture mapped to site lanes (lane-ends.py): its
+download order is the hub scheduler's true order, and only that is tested.
 
 Upload order in the capture IS the site scheduler's order (packets leave glorytun
 in the order it picks lanes). Download order is the order packets ARRIVED, which
@@ -16,6 +19,7 @@ import sys
 
 CSV, SPEC = sys.argv[1], sys.argv[2]
 PER = int(sys.argv[3]) if len(sys.argv) > 3 else 6
+HUB_MODE = len(sys.argv) > 4 and sys.argv[4] == "hub"
 MIN_LEN = 500
 
 
@@ -100,7 +104,9 @@ def analyse(direction):
     exp_p = {m: caps[m] / tot for m in active}
     cnt = collections.Counter(mods)
     n = len(seq)
-    P(f"\n### {'Upload (site scheduler order)' if direction == 'up' else 'Download (arrival order at the site)'}: {n} data packets")
+    title = ("Upload (site scheduler order)" if direction == "up" else
+             "Download (hub scheduler order, captured at the hub)" if HUB_MODE else "Download (arrival order at the site)")
+    P(f"\n### {title}: {n} data packets")
     P("\n| path | caps weight | expected | measured | packets |\n|---|---|---|---|---|")
     for m in active:
         P(f"| {spec[m][0]} | {caps[m]} | {exp_p[m]*100:.1f}% | {cnt[m]/n*100:.1f}% | {cnt[m]} |")
@@ -165,12 +171,13 @@ def analyse(direction):
     P("\n| test | result | p | verdict |\n|---|---|---|---|")
     for name, res, p in results:
         P(f"| {name} | {res} | {p:.3f} | {verdict(p)} |")
-    if direction == "down":
+    if direction == "down" and not HUB_MODE:
         P("\nDownload order is arrival order (latency differences reorder packets), so its sequence tests are indicative only.")
 
 
 P("## Lane scheduler randomness")
 P(f"\nSource: `{CSV}` · uplinks `{SPEC}` · {PER} lanes per uplink · data packets ≥ {MIN_LEN} bytes · p < 0.01 = FAIL")
-analyse("up")
+if not HUB_MODE:
+    analyse("up")
 analyse("down")
 print("\n".join(out))

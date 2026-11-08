@@ -58,6 +58,8 @@ lane-stats shows per-lane rates correctly.
 - `lane-capture.py` (runs on br-edge): records which lane every tunnel packet uses (the lanes are
   local wstunnel clients `127.0.1.k:5001`) and classifies everything else crossing the modem
   ports. Headers only.
+- `hub-lane-capture.py` (runs on BR2026 in the hub's network namespace): the hub end, same idea.
+- `lane-ends.py`: matches hub lane sockets to site lanes, per-lane delivery and delay, reorder on the wire.
 - `lane-randomness.py`: share per path vs caps, equal lane use, independence, runs,
   autocorrelation, round-robin and streak tests. Report of the first live run:
   `../docs/live-randomness.md`.
