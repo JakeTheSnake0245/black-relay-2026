@@ -52,3 +52,13 @@ hardware. `sudo ./lab.sh up`, then run the tools inside the namespaces with
 Validated 2026-10-26 in a local Ubuntu VM: probe loss matches netem loss,
 jitter tracks netem jitter, reorder count/depth match netem reorder, and
 lane-stats shows per-lane rates correctly.
+
+## Live lane randomness (WSS lanes)
+
+- `lane-capture.py` (runs on br-edge): records which lane every tunnel packet uses (the lanes are
+  local wstunnel clients `127.0.1.k:5001`) and classifies everything else crossing the modem
+  ports. Headers only.
+- `lane-randomness.py`: share per path vs caps, equal lane use, independence, runs,
+  autocorrelation, round-robin and streak tests. Report of the first live run:
+  `../docs/live-randomness.md`.
+
