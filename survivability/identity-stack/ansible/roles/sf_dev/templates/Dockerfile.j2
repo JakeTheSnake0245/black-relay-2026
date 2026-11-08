@@ -5,7 +5,7 @@
 FROM {{ sf_dev_base_image }}
 ENV DEBIAN_FRONTEND=noninteractive container=docker
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      systemd systemd-sysv dbus ca-certificates curl gnupg sudo git vim nano tmux htop less jq unzip \
+      systemd systemd-sysv dbus libpam-systemd ca-certificates curl gnupg sudo git vim nano tmux htop less jq unzip \
       locales iproute2 iptables iputils-ping dnsutils openssh-client kmod \
       build-essential python3 python3-pip python3-venv mosquitto-clients \
  && install -m 0755 -d /etc/apt/keyrings \
