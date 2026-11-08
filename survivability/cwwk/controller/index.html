@@ -741,20 +741,29 @@ function portLockCard() {
       <td>${bl.map((m) => `<div>${ICON.warning} ${esc(m)} ${admin ? `<button class="btn" data-nic="${esc(nic)}" data-mac="${esc(m)}" onclick="portAllow(this.dataset.nic, this.dataset.mac)">Allow</button>` : ""}</div>`).join("") || (P.locked ? `<span class="help" style="margin:0">${p.blocked_frames ? p.blocked_frames + " frames blocked" : "nothing blocked"}</span>` : "")}</td></tr>`;
   }).join("");
   const head = P.locked
-    ? `${st(P.pending_revert ? "warning" : "good", P.pending_revert ? "Locked, waiting for Keep locked (undoes itself in 2 minutes)" : "Ports locked")}<div class="help" style="margin:2px 0 8px">since ${P.since ? hhmm(P.since) : "?"}${P.by ? " · by " + esc(P.by) : ""}. Empty ports are dead; each port accepts only its own devices. Survives reboots.</div>`
-    : `<div class="help" style="margin:0 0 8px">When everything works, lock the ports: empty ports go dead and every port accepts only the devices on it now, so nothing plugged in later can get onto the network. Undoes itself in 2 minutes unless you press Keep locked, in case it cuts you off.</div>`;
+    ? `${st(P.pending_revert ? "warning" : "good", P.pending_revert ? "Locked, waiting for Keep locked (undoes itself in 2 minutes)" : "Ports locked")}<div class="help" style="margin:2px 0 8px">since ${P.since ? hhmm(P.since) : "?"}${P.by ? " · by " + esc(P.by) : ""}. Empty ports are dead; each port accepts only its own devices; a new USB device gets nothing. Survives reboots.</div>`
+    : `<div class="help" style="margin:0 0 8px">When everything works, lock the ports: empty ports go dead and every port accepts only the devices on it now, so nothing plugged in later can get onto the network. The same for USB: a keyboard, network adapter or stick plugged in later gets nothing (the USB unlock key still works while the site is locked). Undoes itself in 2 minutes unless you press Keep locked, in case it cuts you off.</div>`;
   const btns = !admin ? "" : P.locked
     ? `${P.pending_revert ? `<button class="btn primary" onclick="portAct('confirm')">Keep locked</button>` : ""}<button class="btn" onclick="portAct('unlock')">Unlock the ports</button>`
     : `<button class="btn primary" onclick="portAct('lock')">Lock the ports</button>`;
+  const U = P.usb || {}, ul = (U.allow || U.plan || []);
+  const usbRow = `<tr><td><b>USB</b></td><td>all USB ports</td><td>${ul.length ? `${ul.length} device${ul.length === 1 ? "" : "s"} plugged in now` : "nothing new"}
+      <div class="help" style="margin:0">${esc(ul.map((d) => d.name).join(" · "))}${ul.length ? " · " : ""}new devices: nothing, except USB storage while the site is locked (the unlock key)</div></td>
+      <td>${(U.blocked || []).map((d) => `<div>${ICON.warning} ${esc(d.name)} <span class="help" style="margin:0">${esc(d.kinds.join(", "))}</span> ${admin ? `<button class="btn" data-usb="${esc(d.path)}" onclick="usbAllow(this.dataset.usb)">Allow</button>` : ""}</div>`).join("") || (P.locked ? `<span class="help" style="margin:0">nothing blocked</span>` : "")}</td></tr>`;
   return `<div class="card" style="margin-top:12px"><h2>4 · Lock the ports <span>· once the site is set up</span></h2>${head}
-    <table><tr><th>Port</th><th>Role</th><th>${P.locked ? "Allowed" : "Would allow"}</th><th>${P.locked ? "Blocked" : ""}</th></tr>${rows}</table>
+    <table><tr><th>Port</th><th>Role</th><th>${P.locked ? "Allowed" : "Would allow"}</th><th>${P.locked ? "Blocked" : ""}</th></tr>${rows}${P.locked && !P.usb ? "" : usbRow}</table>
     <div class="row" style="gap:8px;margin-top:10px">${btns}</div></div>`;
 }
 window.portAct = async (action) => {
-  const msg = { lock: "Lock the ports now?\n\nEmpty ports go dead and each port accepts only the devices on it now. If this cuts you off, it undoes itself in 2 minutes; otherwise press Keep locked.",
+  const msg = { lock: "Lock the ports now?\n\nEmpty ports go dead, each port accepts only the devices on it now, and a new USB device gets nothing. If this cuts you off, it undoes itself in 2 minutes; otherwise press Keep locked.",
     unlock: "Unlock the ports? Any device in any port will work again.", confirm: null }[action];
   if (msg && !confirm(msg)) return;
   try { const j = await api("api/ports", { action }); S.portlock = j.portlock; toast({ lock: "ports locked: press Keep locked", unlock: "ports unlocked", confirm: "lock kept" }[action]); render(true); }
+  catch (e) { toast(e.message, true); }
+};
+window.usbAllow = async (usb) => {
+  if (!confirm(`Allow the USB device at ${usb}? It will work until the ports are unlocked.`)) return;
+  try { const j = await api("api/ports", { action: "usb-allow", usb }); S.portlock = j.portlock; toast("allowed"); render(true); }
   catch (e) { toast(e.message, true); }
 };
 window.portAllow = async (nic, mac) => {

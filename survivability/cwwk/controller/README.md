@@ -155,7 +155,19 @@ new (admins; on site or remote):
   was locked (their MAC addresses, from the port bridge);
 - the Wi-Fi access point's port also lets new Wi-Fi clients onto the site LAN (VLAN 40; the
   Wi-Fi password guards that), nothing else new;
-- ports stop changing roles (`br-port-roles` holds still while locked).
+- ports stop changing roles (`br-port-roles` holds still while locked);
+- **USB:** devices plugged in at lock time keep working (cwwk01: its internal hub and SD
+  reader); anything new gets nothing: no keyboard, no USB network adapter, no storage. One
+  exception: USB storage works while the *site* is locked (vault closed), so the USB unlock key
+  still works. New hubs pass, so a key behind a hub works. Done in the kernel (USB interfaces
+  start switched off; a udev rule asks `br-port-lock usb-check`); blocked devices are listed
+  with Allow, like the network ones.
+
+What it can't stop: while the box is powered off or booting (BIOS, boot menu, GRUB), a
+keyboard still works, so someone with the box in hand can get into the firmware, boot a USB
+stick or the EFI shell, or edit the boot line. The vault stays encrypted either way; the rest
+of the disk does not. Close that on site: BIOS admin password, boot only from the internal
+drive, no USB boot, EFI shell off; then a GRUB password.
 
 The card shows what each port would allow before locking. **Lock** applies it and undoes it by
 itself after 2 minutes unless **Keep locked** is pressed, so a lock that cuts you off reverts.
@@ -164,10 +176,13 @@ with an **Allow** button; blocked devices also show on the Health page. **Unlock
 re-cabling or swapping a modem.
 
 Owner: `br-port-lock` on the host (`status | plan | lock [SECONDS] | confirm | unlock |
-allow NIC MAC`), nft table `bridge br_port_lock`, saved in `/etc/br-port-lock.json`,
+allow NIC MAC | usb-allow PATH | usb-lock`), nft table `bridge br_port_lock` + USB authorization,
+saved in `/etc/br-port-lock.json`,
 re-applied at boot by `br-port-lock.service`. The controller reaches it through `br-lockd`.
 Tested live: all 18 lanes stayed up while locked; a modem removed from the allowed list was
-blocked (324 frames dropped, listed) and the tunnel moved off it; unlocking brought it back.
+blocked (324 frames dropped, listed) and the tunnel moved off it; unlocking brought it back. USB
+(2026-11-08, on the internal SD reader as the "new" device): blocked while the site was
+unlocked; worked as storage with the site locked; Allow brought it back; lanes untouched.
 
 ## Health page
 

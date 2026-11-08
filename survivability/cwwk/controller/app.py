@@ -479,14 +479,15 @@ def port_lock_state():
         return {"error": str(e)[:120]}
 
 
-def port_lock(action, who, nic=None, mac=None):
-    if action not in ("lock", "confirm", "unlock", "allow"):
+def port_lock(action, who, nic=None, mac=None, usb=None):
+    if action not in ("lock", "confirm", "unlock", "allow", "usb-allow"):
         raise ValueError("bad port action")
-    code, obj = lockd("POST", "/ports", {"action": action, "who": who, "nic": nic, "mac": mac}, timeout=90)
+    code, obj = lockd("POST", "/ports", {"action": action, "who": who, "nic": nic, "mac": mac, "usb": usb}, timeout=90)
     if code != 200:
         raise RuntimeError(obj.get("error") or "port lock failed")
     INV_CACHE.pop("portlock", None)
-    event("warning" if action in ("lock", "unlock") else "good", f"ports {action}{' ' + str(mac) + ' on ' + str(nic) if action == 'allow' else ''} by {who}")
+    what = {"allow": f" {mac} on {nic}", "usb-allow": f" USB device at {usb}"}.get(action, "")
+    event("warning" if action in ("lock", "unlock") else "good", f"ports {action}{what} by {who}")
     return obj
 
 
@@ -674,8 +675,8 @@ def inventory(snap, router, subs):
             ("unlocked" + (f" by {lk.get('by')}" if lk.get("by") else "")) if lk["state"] == "unlocked" else "LOCKED")
         pl = snap.get("portlock") or {}
         if "locked" in pl:
-            nb = sum(len(p.get("blocked_devices") or []) for p in (pl.get("ports") or {}).values())
-            add(w, None, "Port lock", "Once set up, ports accept only the devices on them",
+            nb = sum(len(p.get("blocked_devices") or []) for p in (pl.get("ports") or {}).values()) + len((pl.get("usb") or {}).get("blocked") or [])
+            add(w, None, "Port lock", "Once set up, network and USB ports accept only the devices on them",
                 ("warning" if nb or pl.get("pending_revert") else "good") if pl["locked"] else "unknown",
                 ("locked" + (f" · {nb} blocked device(s)" if nb else "") + (" · waiting for Keep locked" if pl.get("pending_revert") else ""))
                 if pl["locked"] else "open (any device in any port)")
@@ -1214,6 +1215,11 @@ def problems(snap, subs):
                 f"Blocked device(s): {', '.join(p['blocked_devices'][:4])}.",
                 "Expected (a replaced modem, a new laptop)? Setup → Port lock → Allow, or Unlock the ports.",
                 "Not expected? Unplug it and check the CWWK."])
+    for d in ((pl.get("usb") or {}).get("blocked") or []) if pl.get("locked") else []:
+        add("warning", f"USB: '{d['name']}' was plugged in while the ports are locked (blocked)", [
+            f"USB port {d['path']}, {', '.join(d['kinds']) or 'unknown kind'} ({d['id']}).",
+            "A keyboard, network adapter or stick plugged into the CWWK gets nothing while locked.",
+            "Yours? Setup → Port lock → Allow. Not expected? Unplug it and check who had access to the box."])
     for s in (snap.get("wired") or {}).get("switches", []):
         if not s["port"]:
             add("warning", f"Switch '{s['name']}' is not seen on any CWWK port", [
@@ -1763,7 +1769,7 @@ class H(BaseHTTPRequestHandler):
                     return
                 b = self.body()
                 who = f"{s.get('user') or 'admin'} via {s.get('via') or 'controller'}"
-                out = port_lock(b.get("action"), who, b.get("nic"), b.get("mac"))
+                out = port_lock(b.get("action"), who, b.get("nic"), b.get("mac"), b.get("usb"))
                 with LOCK:
                     STATE["portlock"] = out
                 self.json(200, {"ok": True, "portlock": out})

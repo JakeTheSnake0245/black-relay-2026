@@ -8,6 +8,10 @@ Locked:
   - the Wi-Fi access point's port also lets new Wi-Fi clients through on the site
     LAN VLAN (the Wi-Fi password guards that), nothing else new;
   - br-port-roles stops re-classifying ports;
+  - USB: devices that were plugged in at lock time keep working; anything new
+    gets nothing (no keyboard, network adapter or storage), except USB storage
+    while the site itself is locked (vault closed), so the unlock key still
+    works. New hubs pass, so a key behind a hub works too;
   - anything blocked is remembered for an hour (which port, which device), so the
     controller can show it and an admin can allow it.
 The lock survives reboots (/etc/br-port-lock.json) until unlocked.
@@ -18,6 +22,9 @@ The lock survives reboots (/etc/br-port-lock.json) until unlocked.
   br-port-lock confirm           keep the lock
   br-port-lock unlock
   br-port-lock allow NIC MAC     let one more device through on a locked port
+  br-port-lock usb-allow PATH    let a blocked USB device work (PATH as in status, e.g. 1-2)
+  br-port-lock usb-lock          add USB to a lock made before USB was covered
+  br-port-lock usb-check IFACE   (udev) decide for a new USB interface while locked
   br-port-lock apply             re-apply the saved lock (boot)
 """
 import json
@@ -34,6 +41,13 @@ ROLES = "/run/br-port-roles.json"
 TABLE = "br_port_lock"
 TIMER = "br-port-lock-revert"
 MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+USB = "/sys/bus/usb/devices"
+USB_RE = re.compile(r"^\d+-\d+(\.\d+)*$")
+USB_RULE = "/etc/udev/rules.d/90-br-usb-lock.rules"
+VAULT_OPEN = "/dev/mapper/br-vault"      # present = site unlocked (br-lockd)
+HUB, STORAGE = "09", "08"
+USB_CLASS = {"01": "audio", "02": "network", "03": "keyboard/mouse (HID)", "06": "camera/imaging", "07": "printer",
+             "08": "storage", "09": "hub", "0a": "network", "0e": "video", "e0": "wireless", "ef": "misc", "ff": "vendor-specific"}
 
 
 def run(*a, inp=None):
@@ -123,10 +137,10 @@ def apply(ports):
         raise RuntimeError(p.stderr.strip()[:300])
 
 
-def save(ports, by):
+def save(ports, by, usb=None, since=None):
     tmp = CONF + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"since": time.time(), "by": by, "ports": ports}, f, indent=1)
+        json.dump({"since": since or time.time(), "by": by, "ports": ports, **({"usb": usb} if usb else {})}, f, indent=1)
     os.chmod(tmp, 0o600)
     os.replace(tmp, CONF)
 
@@ -161,16 +175,122 @@ def counters():
     return res
 
 
+# ------------------------------------------------------------------ USB
+def rd(path, default=""):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return default
+
+
+def wr(path, val):
+    try:
+        with open(path, "w") as f:
+            f.write(val)
+        return True
+    except OSError:
+        return False
+
+
+def usb_devices():
+    """Every USB device except the root hubs, with its interfaces."""
+    out = []
+    try:
+        names = sorted(os.listdir(USB))
+    except OSError:
+        return out
+    for d in names:
+        if not USB_RE.match(d):
+            continue
+        p = f"{USB}/{d}"
+        ifs = [{"name": i, "class": rd(f"{p}/{i}/bInterfaceClass"), "on": rd(f"{p}/{i}/authorized", "1") == "1"}
+               for i in sorted(os.listdir(p)) if i.startswith(d + ":")]
+        name = " ".join(x for x in (rd(f"{p}/manufacturer"), rd(f"{p}/product")) if x and x != "n/a")
+        out.append({"path": d, "id": f"{rd(f'{p}/idVendor')}:{rd(f'{p}/idProduct')}", "name": name or "unnamed device",
+                    "kinds": sorted({USB_CLASS.get(i["class"], "class " + i["class"]) for i in ifs}),
+                    "on": rd(f"{p}/authorized", "1") == "1", "ifaces": ifs})
+    return out
+
+
+def usb_key(dev):
+    return f"{dev['path']} {dev['id']}"
+
+
+def usb_wanted(dev, iface_class, allow):
+    """Should this interface work while the ports are locked?"""
+    if usb_key(dev) in allow:
+        return True
+    if iface_class == HUB:
+        return True
+    return iface_class == STORAGE and not os.path.exists(VAULT_OPEN)
+
+
+def usb_set(dev, iface, on):
+    p = f"{USB}/{dev['path']}/{iface['name']}"
+    if on and not iface["on"]:
+        wr(f"{p}/authorized", "1")
+        wr(f"{USB}/../drivers_probe", iface["name"])      # bind its driver now
+    elif not on and iface["on"]:
+        wr(f"{p}/authorized", "0")
+        log(f"USB blocked: {dev['name']} ({dev['id']}) at {dev['path']}, {USB_CLASS.get(iface['class'], iface['class'])}")
+
+
+def usb_roots(default):
+    for h in os.listdir(USB):
+        if h.startswith("usb"):
+            wr(f"{USB}/{h}/interface_authorized_default", default)
+
+
+def usb_lock(allow):
+    """New interfaces start off; udev asks usb-check about each; sweep what's here now."""
+    usb_roots("0")
+    rule = ("# br-port-lock: while the ports are locked, a new USB interface starts switched off\n"
+            "# and br-port-lock decides (allowed device, hub, or storage while the site is locked).\n"
+            'ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTR{authorized}=="0", '
+            'RUN+="/usr/local/sbin/br-port-lock usb-check %k"\n')
+    if rd(USB_RULE) != rule.strip():
+        with open(USB_RULE, "w") as f:
+            f.write(rule)
+        run("udevadm", "control", "--reload")
+    for dev in usb_devices():
+        for i in dev["ifaces"]:
+            usb_set(dev, i, usb_wanted(dev, i["class"], allow))
+
+
+def usb_unlock():
+    usb_roots("1")
+    if os.path.exists(USB_RULE):
+        os.remove(USB_RULE)
+        run("udevadm", "control", "--reload")
+    for dev in usb_devices():
+        for i in dev["ifaces"]:
+            usb_set(dev, i, True)
+
+
+def usb_status(allow=None):
+    devs = usb_devices()
+    if allow is None:     # not locked: what a lock would keep
+        return {"plan": [{k: d[k] for k in ("path", "id", "name", "kinds")} for d in devs]}
+    return {"allow": [{k: d[k] for k in ("path", "id", "name", "kinds")} for d in devs if usb_key(d) in allow]
+            + [{"path": a.split()[0], "id": a.split()[1], "name": "(not plugged in)", "kinds": []}
+               for a in allow if a not in {usb_key(d) for d in devs}],
+            "blocked": [{"path": d["path"], "id": d["id"], "name": d["name"],
+                         "kinds": sorted({USB_CLASS.get(i["class"], i["class"]) for i in d["ifaces"] if not i["on"]})}
+                        for d in devs if any(not i["on"] for i in d["ifaces"])],
+            "storage_open": not os.path.exists(VAULT_OPEN)}
+
+
 def status():
     c = load()
     pending = run("systemctl", "is-active", TIMER + ".timer").stdout.strip() == "active"
     if not c:
-        return {"locked": False, "pending_revert": False, "plan": plan()}
+        return {"locked": False, "pending_revert": False, "plan": plan(), "usb": usb_status()}
     b, k = blocked(), counters()
     for nic, p in c["ports"].items():
         p["blocked_devices"] = sorted(set(b.get(nic, [])))
         p["blocked_frames"] = k.get(nic, 0)
-    return {"locked": True, "since": c["since"], "by": c.get("by"), "pending_revert": pending, "ports": c["ports"]}
+    return {"locked": True, "since": c["since"], "by": c.get("by"), "pending_revert": pending, "ports": c["ports"],
+            "usb": usb_status(c["usb"]["allow"]) if "usb" in c else None}
 
 
 def main():
@@ -183,14 +303,16 @@ def main():
         secs = int(sys.argv[2]) if len(sys.argv) > 2 else 120
         by = sys.argv[3] if len(sys.argv) > 3 else "console"
         ports = plan()
+        usb = {"allow": [usb_key(d) for d in usb_devices() if all(i["on"] for i in d["ifaces"])]}
         apply(ports)
-        save(ports, by)
+        save(ports, by, usb)
+        usb_lock(usb["allow"])
         run("systemctl", "stop", TIMER + ".timer")
         if secs > 0:
             run("systemd-run", f"--unit={TIMER}", f"--on-active={secs}", "--timer-property=AccuracySec=1s",
                 "/usr/local/sbin/br-port-lock", "unlock", "auto-revert")
         log(f"ports LOCKED by {by} (auto-revert in {secs}s unless confirmed): " +
-            ", ".join(f"{n}={p['role']}/{len(p['allow'])}" for n, p in ports.items()))
+            ", ".join(f"{n}={p['role']}/{len(p['allow'])}" for n, p in ports.items()) + f", usb={len(usb['allow'])}")
         print(json.dumps(status()))
     elif cmd == "confirm":
         run("systemctl", "stop", TIMER + ".timer")
@@ -199,6 +321,7 @@ def main():
     elif cmd == "unlock":
         run("systemctl", "stop", TIMER + ".timer")
         run("nft", "delete", "table", "bridge", TABLE)
+        usb_unlock()
         try:
             os.remove(CONF)
         except FileNotFoundError:
@@ -216,7 +339,7 @@ def main():
         if p["role"] == "empty":
             p["role"] = "client / switch"
         apply(c["ports"])
-        save(c["ports"], c.get("by", "console"))
+        save(c["ports"], c.get("by", "console"), c.get("usb"), c.get("since"))
         run("nft", "delete", "element", "bridge", TABLE, "blocked", f"{{ {nic} . {mac} }}")
         log(f"allowed {mac} on {nic}")
         print(json.dumps(status()))
@@ -224,7 +347,45 @@ def main():
         c = load()
         if c:
             apply(c["ports"])
+            if "usb" in c:
+                usb_lock(c["usb"]["allow"])
             log("port lock re-applied at boot")
+    elif cmd == "usb-check":
+        k = sys.argv[2] if len(sys.argv) > 2 else ""
+        c = load()
+        dev = next((d for d in usb_devices() if k.startswith(d["path"] + ":")), None)
+        if not (c and "usb" in c and dev):
+            return
+        for i in dev["ifaces"]:
+            if i["name"] == k:
+                if usb_wanted(dev, i["class"], c["usb"]["allow"]):
+                    usb_set(dev, i, True)
+                else:
+                    log(f"USB blocked: {dev['name']} ({dev['id']}) at {dev['path']}, {USB_CLASS.get(i['class'], i['class'])}")
+    elif cmd == "usb-lock":
+        # add USB to a lock made before USB was covered (network rules untouched)
+        c = load()
+        if not c:
+            sys.exit("ports are not locked")
+        if "usb" not in c:
+            c["usb"] = {"allow": [usb_key(d) for d in usb_devices() if all(i["on"] for i in d["ifaces"])]}
+            save(c["ports"], c.get("by", "console"), c["usb"], c.get("since"))
+        usb_lock(c["usb"]["allow"])
+        log(f"USB added to the port lock: {len(c['usb']['allow'])} device(s) kept")
+        print(json.dumps(status()))
+    elif cmd == "usb-allow":
+        path = sys.argv[2] if len(sys.argv) > 2 else ""
+        c = load()
+        dev = next((d for d in usb_devices() if d["path"] == path), None)
+        if not (c and "usb" in c and USB_RE.match(path) and dev):
+            sys.exit("not locked, or no such USB device")
+        if usb_key(dev) not in c["usb"]["allow"]:
+            c["usb"]["allow"].append(usb_key(dev))
+        save(c["ports"], c.get("by", "console"), c["usb"], c.get("since"))
+        for i in dev["ifaces"]:
+            usb_set(dev, i, True)
+        log(f"allowed USB {dev['name']} ({dev['id']}) at {path}")
+        print(json.dumps(status()))
     else:
         print(__doc__)
         sys.exit(2)

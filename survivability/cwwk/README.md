@@ -45,5 +45,6 @@ Ports: nic0 Starlink, nic1 empty, nic2 ISP (travel router), nic3 Spitz (Wi-Fi + 
 admin + vault passphrase). Every port also carries VLAN 41 (services) for a switch; the
 controller's Network page follows a marked switch. Speed caps: sliders on the Multipath page.
 Randomness and no-plaintext-on-any-carrier verified live: `multipath/docs/live-randomness.md`.
-Port lock built and tested (Setup → 4 · Lock the ports); currently unlocked. Second site:
+Ports locked by Jake (10:23 HST), USB included since 10:30 (only the internal hub and SD reader work;
+new USB devices get nothing, except storage while the site is locked). Second site:
 install kit ready (`install/`), cwwk02 = 10.47 / 10.48 / 10.49, not installed yet.

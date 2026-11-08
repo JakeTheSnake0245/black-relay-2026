@@ -24,7 +24,7 @@ Every key is checked by the vault itself: a key that cannot open it opens nothin
 
 API for the controller only (TLS on the host's LAN address, bearer token):
   GET /state   POST /unlock {"passphrase", "who"}   POST /lock {"who"}
-  GET /ports   POST /ports {"action": lock|confirm|unlock|allow, "nic", "mac", "who"}
+  GET /ports   POST /ports {"action": lock|confirm|unlock|allow|usb-allow, "nic", "mac", "usb", "who"}
                (physical port lock-up, see br-port-lock)
 """
 import hmac
@@ -301,7 +301,7 @@ def reconcile():
 PORT_LOCK = "/usr/local/sbin/br-port-lock"
 
 
-def ports(action=None, nic=None, mac=None, who="controller"):
+def ports(action=None, nic=None, mac=None, who="controller", usb=None):
     if action is None:
         args = ["status"]
     elif action == "lock":
@@ -313,6 +313,10 @@ def ports(action=None, nic=None, mac=None, who="controller"):
                 and isinstance(mac, str) and re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac.lower())):
             raise ValueError("bad port or MAC")
         args = ["allow", nic, mac.lower()]
+    elif action == "usb-allow":
+        if not (isinstance(usb, str) and re.fullmatch(r"\d+-\d+(\.\d+)*", usb)):
+            raise ValueError("bad USB device")
+        args = ["usb-allow", usb]
     else:
         raise ValueError("unknown port action")
     p = run(PORT_LOCK, *args, timeout=60)
@@ -382,7 +386,7 @@ class H(BaseHTTPRequestHandler):
             if self.path == "/lock":
                 return self.out(200, lock(who))
             if self.path == "/ports":
-                return self.out(200, ports(body.get("action"), body.get("nic"), body.get("mac"), who))
+                return self.out(200, ports(body.get("action"), body.get("nic"), body.get("mac"), who, body.get("usb")))
             self.out(404, {"error": "not found"})
         except PermissionError as e:
             self.out(403, {"error": str(e)})
