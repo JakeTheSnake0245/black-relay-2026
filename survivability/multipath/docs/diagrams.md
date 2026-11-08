@@ -12,6 +12,7 @@ flowchart TB
     direction LR
     PORTS["4 ports<br/>any cable, any port"] --> EDGE["br-edge<br/>names each modem · caps<br/>6 TLS lanes per modem<br/>glorytun bonding · leak guard"]
     LAN["br-router<br/>site LAN + Wi-Fi 10.40.0.x<br/>services 10.41.0.x"] --> EDGE
+    SVCS["service containers<br/>(several, on the services network)"] --> LAN
   end
   EDGE == "6 lanes" ==> ISP["ISP router"] --> ISPN(["ISP network"])
   EDGE == "6 lanes" ==> SLR["Starlink router"] --> DISH["Dish"] -.-> SAT(["Satellite"]) -.-> POP["Ground station<br/>+ Starlink PoP"]
@@ -243,5 +244,33 @@ flowchart LR
   MQ --> BRG --> TS
   PIS -- "sf-dev:port" --> MQ
   TS -- "sf-dev:port" --> TAKP
+```
+
+## 13. Site services and the Ethernet switch (switch and VLAN 41: planned)
+
+```mermaid
+flowchart LR
+  subgraph CWWK["CWWK site box"]
+    direction TB
+    CTL["br-controller<br/>Services page: cards + health<br/>switch status + admin link (planned)"]
+    RT["br-router (OpenWrt)<br/>DHCP · DNS · firewall<br/>lan 10.40.0.1 · svc 10.41.0.1"]
+    subgraph SVC["Services 10.41.0.0/24"]
+      direction LR
+      S1["service<br/>container"]
+      S2["service<br/>container"]
+      S3["service<br/>container"]
+      FW["LAN → here: allowed<br/>here → LAN: blocked<br/>internet: tunnel only"]
+    end
+    V[("encrypted vault<br/>their disks · start on unlock")]
+    V -.-> SVC
+    RT --- SVC
+    CTL -. "health" .-> SVC
+  end
+  SW["Ethernet switch<br/>plugged into any CWWK port"]
+  RT == "VLAN 40 + 41 (41 planned)" ==> SW
+  SW --> D1["laptops · site devices<br/>10.40.0.x"]
+  SW --> D2["cameras · sensors<br/>10.41.0.x (planned)"]
+  RT -. "its address (DHCP)" .-> SW
+  CTL -. "status · admin (planned)" .-> SW
 ```
 
