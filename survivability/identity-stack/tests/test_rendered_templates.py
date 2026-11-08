@@ -762,6 +762,21 @@ class BlackRelayHubTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("unknown command", result.stderr)
 
+    def test_supervisor_runs_only_site_configs_as_tunnels(self):
+        # publish.conf once counted as a site: the supervisor kept starting a
+        # tunnel called "publish" and the health check reported it down.
+        source = (ROLES / "black_relay_hub" / "files" / "br-supervise").read_text()
+        start = source.index("tunnels() {")
+        func = source[start:source.index("\n}\n", start) + 3]
+        with tempfile.TemporaryDirectory() as etc:
+            for name in ("hub.conf", "publish.conf", "cwwk01.conf", "site2.conf"):
+                Path(etc, name).write_text("")
+            result = subprocess.run(
+                ["sh", "-c", f'ETC="{etc}"\n{func}\ntunnels'],
+                capture_output=True, text=True, timeout=10,
+            )
+        self.assertEqual(result.stdout.split(), ["cwwk01", "site2"])
+
 
 class SensorFusionDevTests(unittest.TestCase):
     """sf-dev: the Sensor Fusion development container."""

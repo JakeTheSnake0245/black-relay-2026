@@ -51,7 +51,8 @@ tunnels() {
 	for c in "$ETC"/*.conf; do
 		[ -e "$c" ] || continue
 		n=${c##*/}; n=${n%.conf}
-		[ "$n" = hub ] && continue
+		# hub.conf and publish.conf are settings, not site tunnels
+		case "$n" in hub|publish) continue ;; esac
 		echo "$n"
 	done
 }
