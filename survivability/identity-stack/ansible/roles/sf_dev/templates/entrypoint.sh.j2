@@ -1,0 +1,15 @@
+#!/bin/bash
+# Managed by Ansible (sf_dev role). Local edits are overwritten.
+set -e
+if [ ! -d /home/dev ]; then
+  mkdir -p /home/dev && cp -rT /etc/skel /home/dev
+  echo 'This is sf-dev (Sensor Fusion). Keep work under ~ (20 GB disk); packages installed with apt are lost when the container is rebuilt.' > /home/dev/README
+  chown -R dev:dev /home/dev
+fi
+mkdir -p /run/tailscale
+tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock &
+for i in $(seq 1 30); do [ -S /run/tailscale/tailscaled.sock ] && break; sleep 1; done
+# The join key is only present for the first start; afterwards the state file logs in.
+AK=""; [ -s /run/secrets/ts-authkey ] && AK="--auth-key=file:/run/secrets/ts-authkey"
+tailscale up --login-server={{ sf_dev_login_server }} --hostname={{ sf_dev_hostname }} --ssh $AK || true
+wait

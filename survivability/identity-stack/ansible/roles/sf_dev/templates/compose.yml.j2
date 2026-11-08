@@ -1,0 +1,30 @@
+# Managed by Ansible (sf_dev role). Local edits are overwritten.
+# Sensor Fusion dev container. No published ports: it is reached only over the
+# tailnet (Tailscale SSH as `dev`). Its own network keeps it off the identity
+# stack; sf-dev-guard.service blocks metadata and private ranges.
+name: sf-dev
+services:
+  sf-dev:
+    image: "{{ sf_dev_image }}"
+    pull_policy: never
+    container_name: "{{ sf_dev_container }}"
+    hostname: "{{ sf_dev_hostname }}"
+    restart: unless-stopped
+    # Kernel-mode Tailscale in the container's own network namespace.
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    pids_limit: {{ sf_dev_pids_limit }}
+    volumes:
+      - "{{ sf_dev_dir }}/disk/home:/home"
+      - "{{ sf_dev_dir }}/disk/tailscale:/var/lib/tailscale"
+      - "{{ sf_dev_dir }}/authkey:/run/secrets/ts-authkey:ro"
+    networks:
+      {{ sf_dev_network }}: {}
+    deploy:
+      resources:
+        limits: {memory: "{{ sf_dev_memory }}", cpus: "{{ sf_dev_cpus }}"}
+
+networks:
+  {{ sf_dev_network }}:
+    external: true
+    name: "{{ sf_dev_network }}"

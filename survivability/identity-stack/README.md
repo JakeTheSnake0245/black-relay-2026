@@ -102,6 +102,7 @@ rebuild, or before recording that a change is deployed.
 | `identity-policy` | The Headscale policy and configuration only: install, validate with `configtest`, then restart Headscale |
 | `identity-lldap` | The LLDAP groups, bind user, and group memberships, the read-only proof, and the service convergence |
 | `black_relay` | `black_relay_hub`: the Multithread hub container, its published site services, socket-buffer sysctls, and the identity snapshot exporter. Recreating the container drops site tunnels for ~40 s |
+| `sf_dev` | `sf_dev`: the Sensor Fusion dev container (Ubuntu 24.04, 20 GB disk, Tailscale SSH as `dev`), its network and egress guard. The first converge after a hand-made sf-dev replaces that container once; `/home` and the node identity are kept |
 | `tailnet` | `tailnet_node`: the pinned Tailscale client, its declared preferences, and the proof that this host is enrolled under its tag |
 
 Every identity selection first decrypts the SOPS store and revalidates the

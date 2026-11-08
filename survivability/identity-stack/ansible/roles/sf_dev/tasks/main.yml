@@ -1,0 +1,187 @@
+---
+# sf-dev: Sensor Fusion development container, reached only over the tailnet.
+# State that survives rebuilds lives on the 20 GB disk: /home and the
+# Tailscale node identity. Packages installed inside the container do not.
+
+- name: Require the tags sf-dev joins with to be declared in the policy
+  ansible.builtin.assert:
+    that:
+      - sf_dev_tag_owner_line in lookup('ansible.builtin.file', sf_dev_policy_file)
+    fail_msg: "{{ item }} must be in tagOwners of headscale-policy.hujson before sf-dev can join."
+    quiet: true
+  loop: "{{ sf_dev_tags }}"
+  vars:
+    sf_dev_policy_file: "{{ role_path }}/../identity_stack/files/headscale-policy.hujson"
+    sf_dev_tag_owner_line: '"{{ item }}": ["group:survivability"]'
+
+- name: Create the sf-dev directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: "{{ sf_dev_dir }}", mode: "0700"}
+    - {path: "{{ sf_dev_dir }}/build", mode: "0700"}
+    - {path: "{{ sf_dev_dir }}/disk", mode: "0755"}
+
+- name: 20 GB disk image
+  ansible.builtin.shell: >-
+    fallocate -l {{ sf_dev_disk_size }} {{ sf_dev_dir }}/disk.img &&
+    mkfs.ext4 -q -L sf-dev {{ sf_dev_dir }}/disk.img
+  args:
+    creates: "{{ sf_dev_dir }}/disk.img"
+
+# Mounted before Docker starts, so the container never writes into the empty
+# mount point on the root disk.
+- name: Disk mounted (and at boot)
+  ansible.posix.mount:
+    path: "{{ sf_dev_dir }}/disk"
+    src: "{{ sf_dev_dir }}/disk.img"
+    fstype: ext4
+    opts: loop,nofail,x-systemd.before=docker.service
+    dump: "0"
+    passno: "2"
+    state: mounted
+
+- name: Home and Tailscale state on the disk
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: "{{ sf_dev_dir }}/disk/home", mode: "0755"}
+    - {path: "{{ sf_dev_dir }}/disk/tailscale", mode: "0700"}
+
+- name: Image build context
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ sf_dev_dir }}/build/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - {src: Dockerfile.j2, dest: Dockerfile}
+    - {src: entrypoint.sh.j2, dest: entrypoint.sh}
+  register: sf_dev_build_context
+
+- name: Check whether the sf-dev image exists
+  ansible.builtin.command: docker image inspect {{ sf_dev_image }}
+  register: sf_dev_image_check
+  changed_when: false
+  failed_when: false
+
+- name: Build the sf-dev image
+  ansible.builtin.command: docker build -q -t {{ sf_dev_image }} {{ sf_dev_dir }}/build
+  when: sf_dev_image_check.rc != 0 or sf_dev_build_context is changed
+  changed_when: true
+
+- name: Create the sf-dev network
+  community.docker.docker_network:
+    name: "{{ sf_dev_network }}"
+    driver: bridge
+    ipam_config:
+      - subnet: "{{ sf_dev_subnet }}"
+
+- name: Egress guard unit
+  ansible.builtin.template:
+    src: sf-dev-guard.service.j2
+    dest: /etc/systemd/system/sf-dev-guard.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart sf-dev guard
+
+- name: Egress guard enabled
+  ansible.builtin.systemd_service:
+    name: sf-dev-guard.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Compose file
+  ansible.builtin.template:
+    src: compose.yml.j2
+    dest: "{{ sf_dev_dir }}/compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+# The first sf-dev was started by hand (deploy/br2026-sf-dev.sh). Hand it to
+# compose once; /home and the node identity are on the disk, so nothing is lost.
+- name: Inspect an existing sf-dev container
+  ansible.builtin.command: >-
+    docker inspect {{ sf_dev_container }}
+    --format '{{ '{{' }} index .Config.Labels "com.docker.compose.project" {{ '}}' }}'
+  register: sf_dev_existing
+  changed_when: false
+  failed_when: false
+
+- name: Replace a hand-started sf-dev with the compose-managed one
+  ansible.builtin.command: docker rm -f {{ sf_dev_container }}
+  when: sf_dev_existing.rc == 0 and sf_dev_existing.stdout | trim != 'sf-dev'
+  changed_when: true
+
+- name: Join key file (empty unless a first join is pending)
+  ansible.builtin.file:
+    path: "{{ sf_dev_dir }}/authkey"
+    state: touch
+    owner: root
+    group: root
+    mode: "0600"
+    access_time: preserve
+    modification_time: preserve
+
+- name: Check for an existing tailnet identity
+  ansible.builtin.stat:
+    path: "{{ sf_dev_dir }}/disk/tailscale/tailscaled.state"
+  register: sf_dev_state
+
+# Only when the node has never joined: a single-use, one-hour key carrying the
+# sf-dev tags. It is written to the bind-mounted file and emptied after the join.
+- name: Issue a one-time join key
+  when: not sf_dev_state.stat.exists
+  block:
+    - name: Create the join key
+      ansible.builtin.command: >-
+        docker exec {{ sf_dev_headscale_container }} headscale preauthkeys create
+        --tags {{ sf_dev_tags | join(',') }} --expiration 1h
+      register: sf_dev_key
+      changed_when: true
+      no_log: true
+
+    - name: Hand the join key to the container
+      ansible.builtin.copy:
+        content: "{{ sf_dev_key.stdout_lines | last | trim }}"
+        dest: "{{ sf_dev_dir }}/authkey"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      diff: false
+
+- name: Start sf-dev
+  ansible.builtin.command: docker compose -f {{ sf_dev_dir }}/compose.yml up -d
+  register: sf_dev_up
+  changed_when: "'Started' in sf_dev_up.stderr or 'Recreated' in sf_dev_up.stderr"
+
+- name: Wait for sf-dev on the tailnet
+  ansible.builtin.command: docker exec {{ sf_dev_container }} tailscale ip -4
+  register: sf_dev_ip
+  until: sf_dev_ip.rc == 0 and sf_dev_ip.stdout | length > 0
+  retries: 45
+  delay: 2
+  changed_when: false
+
+- name: Empty the join key file
+  ansible.builtin.copy:
+    content: ""
+    dest: "{{ sf_dev_dir }}/authkey"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  diff: false

@@ -538,7 +538,14 @@ class OperatorAccessTests(unittest.TestCase):
     def test_committed_tailnet_accounts_have_matching_policy_rules(self):
         production = yaml.safe_load(PRODUCTION_VARS.read_text(encoding="utf-8"))
         policy = load_policy()
-        policy_users = [user for rule in policy["ssh"] for user in rule["users"]]
+        # Only rules into the VPS name host accounts; other tagged destinations
+        # (the sf-dev container) have their own accounts.
+        policy_users = [
+            user
+            for rule in policy["ssh"]
+            if "tag:blackrelay-vps" in rule["dst"]
+            for user in rule["users"]
+        ]
         managed_users = [production["operator_access_user"]] + [
             item["name"] for item in production["operator_access_tailnet_operators"]
         ]
@@ -546,6 +553,18 @@ class OperatorAccessTests(unittest.TestCase):
         self.assertFalse(
             set(managed_users) & set(production["operator_access_removed_users"])
         )
+
+    def test_shared_dev_account_never_reaches_the_vps(self):
+        # sf-dev's shared `dev` login is for the container only. A group rule
+        # into the VPS would hand every team member a host account.
+        for rule in load_policy()["ssh"]:
+            if "dev" in rule["users"]:
+                self.assertEqual(rule["dst"], ["tag:sf-dev"])
+            if "tag:blackrelay-vps" in rule["dst"]:
+                self.assertFalse(
+                    any(src.startswith("group:") for src in rule["src"]),
+                    "VPS logins are granted per person, never per group",
+                )
 
     def test_public_ssh_admits_only_the_break_glass_operator(self):
         config = self.sshd_config(
@@ -742,6 +761,39 @@ class BlackRelayHubTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("unknown command", result.stderr)
+
+
+class SensorFusionDevTests(unittest.TestCase):
+    """sf-dev: the Sensor Fusion development container."""
+
+    def test_sf_dev_publishes_nothing_and_stays_off_the_identity_networks(self):
+        compose = yaml.safe_load(render.render_template("sf_dev", "compose.yml.j2"))
+        dev = compose["services"]["sf-dev"]
+        self.assertNotIn("ports", dev)
+        self.assertNotIn("privileged", dev)
+        self.assertEqual(set(dev["networks"]), {"sf_dev"})
+        self.assertEqual(sorted(dev["cap_add"]), ["NET_ADMIN", "NET_RAW"])
+        # The join key is mounted read-only and the state lives on the disk.
+        mounts = {v.split(":")[1]: v for v in dev["volumes"]}
+        self.assertTrue(mounts["/run/secrets/ts-authkey"].endswith(":ro"))
+        self.assertTrue(mounts["/var/lib/tailscale"].startswith("/srv/sf-dev/disk/"))
+        self.assertTrue(mounts["/home"].startswith("/srv/sf-dev/disk/"))
+
+    def test_sf_dev_guard_blocks_metadata(self):
+        unit = render.render_template("sf_dev", "sf-dev-guard.service.j2")
+        self.assertIn("-s 172.30.0.0/24 -d 169.254.0.0/16 -j DROP", unit)
+
+    def test_sf_dev_join_tags_are_owned_in_the_policy(self):
+        policy = load_policy()
+        defaults = yaml.safe_load((ROLES / "sf_dev" / "defaults" / "main.yml").read_text())
+        for tag in defaults["sf_dev_tags"]:
+            self.assertEqual(policy["tagOwners"].get(tag), ["group:survivability"])
+        # The ssh rule is scoped to the sf-dev tag, which only this container carries.
+        self.assertIn(
+            {"action": "accept", "src": ["group:sensor_fusion", "group:survivability"],
+             "dst": ["tag:sf-dev"], "users": ["dev"]},
+            policy["ssh"],
+        )
 
 
 if __name__ == "__main__":

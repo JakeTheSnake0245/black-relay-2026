@@ -1,0 +1,26 @@
+---
+# sf-dev: Ubuntu 24.04 development container for the Sensor Fusion team.
+sf_dev_dir: /srv/sf-dev
+sf_dev_disk_size: 20G
+sf_dev_base_image: >-
+  ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+# Bump the tag to force a rebuild with newer packages.
+sf_dev_image: "sf-dev:1"
+sf_dev_container: sf-dev
+sf_dev_hostname: sf-dev
+sf_dev_network: sf_dev
+sf_dev_subnet: 172.30.0.0/24
+sf_dev_cpus: "2.00"
+sf_dev_memory: 2G
+sf_dev_pids_limit: 2048
+# Tags carried by the join key. Both must be declared in the committed policy:
+# tag:sensor-fusion puts it in the mesh, tag:sf-dev scopes the ssh rule.
+sf_dev_tags:
+  - tag:sensor-fusion
+  - tag:sf-dev
+sf_dev_headscale_container: survivability-headscale
+sf_dev_login_server: "https://{{ headscale_domain }}"
+# Egress the container must never reach: cloud metadata and private ranges.
+sf_dev_blocked_destinations:
+  - 169.254.0.0/16
+  - 10.0.0.0/8

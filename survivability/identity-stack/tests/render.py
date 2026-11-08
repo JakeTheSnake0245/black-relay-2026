@@ -71,6 +71,9 @@ FIXTURES = {
         "headscale_domain": "hs.example.test",
         "black_relay_hub_ws_prefix": "multithread-" + "0" * 32,
     },
+    "sf_dev": {
+        "headscale_domain": "hs.example.test",
+    },
     "host_firewall": {
         "inventory_hostname": "identity.example.test",
     },

@@ -17,18 +17,48 @@
       "robert@litts.me",
       "jake.blackrelay@arrowheadresearch.org",
       "marcel.blackrelay@arrowheadresearch.org"
+    ],
+
+    // Detection members who may reach VLAN 200. Add verified identities only.
+    // LLDAP team membership does not populate this policy group.
+    "group:detection": [
+      "john.blackrelay@arrowheadresearch.org"
+    ],
+
+    // Sensor Fusion: TAK + Detection on one plane. Every member's devices and every
+    // tag:sensor-fusion device reach each other. Add new TAK/Detection people here.
+    "group:sensor_fusion": [
+      "alec.blackrelay@arrowheadresearch.org",
+      "casey.blackrelay@arrowheadresearch.org",
+      "jake.lee.blackrelay@arrowheadresearch.org",
+      "nico.blackrelay@arrowheadresearch.org",
+      "ray.blackrelay@arrowheadresearch.org",
+      "bryan.blackrelay@arrowheadresearch.org",
+      "dmitri.blackrelay@arrowheadresearch.org",
+      "george.blackrelay@arrowheadresearch.org",
+      "john.blackrelay@arrowheadresearch.org"
     ]
   },
 
   "hosts": {
-    // The RFC1918 range the Proxmox subnet router advertises.
-    "proxmox-lan": "10.73.66.0/24"
+    // The existing Proxmox subnet router advertises this range. It is not part
+    // of the VyOS Detection path and remains unchanged.
+    "proxmox-lan": "10.73.66.0/24",
+
+    // The dedicated Detection subnet-router LXC advertises only this range.
+    "detection-vlan": "10.73.200.0/24"
   },
 
   "tagOwners": {
     // Survivability owns every declared tag. Application teams receive their
     // own scoped `tag:<team>-<role>` tags only when added deliberately.
     "tag:proxmox-subnet-router": ["group:survivability"],
+    "tag:detection-subnet-router": ["group:survivability"],
+    // Shared Sensor Fusion devices (TAK Pis, sensors), joined with a preauth key
+    // carrying this tag. Tagged nodes do not expire, so headless devices stay on.
+    "tag:sensor-fusion": ["group:survivability"],
+    // sf-dev: the Sensor Fusion development container on BR2026.
+    "tag:sf-dev": ["group:survivability"],
 
     // The VPS itself, enrolled as blackrelay-vps with a short-lived
     // preauthorized key carrying this tag and no owning user. The tag owns the
@@ -44,7 +74,8 @@
     // approval stored only in Headscale's database, so a rebuilt or restored
     // subnet router does not need its route re-approving by hand.
     "routes": {
-      "10.73.66.0/24": ["tag:proxmox-subnet-router"]
+      "10.73.66.0/24": ["tag:proxmox-subnet-router"],
+      "10.73.200.0/24": ["tag:detection-subnet-router"]
     }
   },
 
@@ -58,11 +89,48 @@
       "ip": ["*"]
     },
 
+    // Infrastructure owners retain full access to every tagged resource,
+    // including tags introduced later. Routed subnets are covered separately
+    // because an advertised route is not the tagged router node itself.
+    {
+      "src": ["group:survivability"],
+      "dst": ["autogroup:tagged"],
+      "ip": ["*"]
+    },
+
     // The Proxmox subnet behind the subnet router.
     {
       "src": ["group:survivability"],
       "dst": ["proxmox-lan"],
       "ip": ["*"]
+    },
+
+    // Detection members receive every IP protocol and port, but only inside
+    // VLAN 200. Survivability retains access as the infrastructure owner; every
+    // shared host or subnet added to this policy must include that group. The
+    // dedicated subnet router disables SNAT, so VyOS and targets retain each
+    // client's 100.64.0.0/10 source address.
+    {
+      "src": ["group:detection", "group:survivability"],
+      "dst": ["detection-vlan"],
+      "ip": ["*"]
+    },
+
+    // Sensor Fusion mesh: TAK and Detection members and shared sensor devices
+    // reach each other on every port. Survivability reaches the tagged devices
+    // through its autogroup:tagged grant above.
+    {
+      "src": ["group:sensor_fusion", "tag:sensor-fusion"],
+      "dst": ["group:sensor_fusion", "tag:sensor-fusion"],
+      "ip": ["*"]
+    },
+
+    // sf-dev: Tailscale SSH transport for the people its ssh rule admits. The
+    // container also carries tag:sensor-fusion, so the mesh grant covers the rest.
+    {
+      "src": ["group:sensor_fusion", "group:survivability"],
+      "dst": ["tag:sf-dev"],
+      "ip": ["tcp:22"]
     },
 
     // Tailscale SSH needs both this transport grant and the `ssh` rule below;
@@ -107,6 +175,14 @@
       "src": ["marcel.blackrelay@arrowheadresearch.org"],
       "dst": ["tag:blackrelay-vps"],
       "users": ["marcel"]
+    },
+    // sf-dev: one shared `dev` account (sudo inside the container only) for the
+    // Sensor Fusion team and Survivability. Transport: the sf-dev grant above.
+    {
+      "action": "accept",
+      "src": ["group:sensor_fusion", "group:survivability"],
+      "dst": ["tag:sf-dev"],
+      "users": ["dev"]
     }
   ]
 }

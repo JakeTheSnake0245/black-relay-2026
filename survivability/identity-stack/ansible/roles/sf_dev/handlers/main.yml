@@ -1,0 +1,6 @@
+---
+- name: Restart sf-dev guard
+  ansible.builtin.systemd_service:
+    name: sf-dev-guard.service
+    state: restarted
+    daemon_reload: true

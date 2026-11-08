@@ -1,0 +1,13 @@
+# Managed by Ansible (sf_dev role). Local edits are overwritten.
+[Unit]
+Description=sf-dev container egress guard
+After=docker.service
+Requires=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+{% for dest in sf_dev_blocked_destinations %}
+ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -s {{ sf_dev_subnet }} -d {{ dest }} -j DROP 2>/dev/null || iptables -I DOCKER-USER -s {{ sf_dev_subnet }} -d {{ dest }} -j DROP'
+{% endfor %}
+[Install]
+WantedBy=multi-user.target

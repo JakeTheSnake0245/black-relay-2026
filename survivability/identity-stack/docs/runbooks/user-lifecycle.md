@@ -113,6 +113,34 @@ the failure presents as "user does not exist" rather than as a denial. Add
    change so the authorization is reviewable, and converge. See "Policy
    changes" in `service-deployment.md`.
 
+## Sensor Fusion (TAK + Detection)
+
+`group:sensor_fusion` in `headscale-policy.hujson` is one network plane for the TAK and
+Detection teams: every member's devices and every `tag:sensor-fusion` device (Pis, sensors,
+`sf-dev`) reach each other on every port. It is a list of Pocket ID email addresses in the
+policy; the LLDAP `tak` and `detection` groups do not feed it.
+
+- **New TAK or Detection member:** after onboarding them above, add their email to
+  `group:sensor_fusion`, commit, and converge with `--tags identity-policy`. A member may be
+  listed before their first tailnet login.
+- **Shared devices (Pis, sensors):** they join under `tag:sensor-fusion` with a key, so they
+  never expire and survive anyone's offboarding. Issue the key just in time and send it only
+  over a direct channel:
+
+  ```bash
+  ssh "REPLACE_WITH_OPERATOR@REPLACE_WITH_PRODUCTION_HOST" sudo docker exec survivability-headscale \
+    headscale preauthkeys create \
+    --reusable --expiration 24h --tags tag:sensor-fusion
+  ```
+
+  On the device: `sudo tailscale up --login-server https://REPLACE_WITH_HEADSCALE_FQDN
+  --auth-key <key> --hostname <unique-name>`. Expire the key
+  (`headscale preauthkeys expire --id <id>`) once the devices are on.
+- **sf-dev** (role `sf_dev`): the team's Ubuntu dev container. Members connect with
+  `ssh dev@sf-dev` (Tailscale SSH; their Pocket ID identity is the login) or VS Code
+  Remote-SSH. One shared `dev` account with sudo inside the container only; work lives under
+  `~` on its 20 GB disk.
+
 ## Verify denial paths
 
 Use a disposable test identity and test node, never a production operator:
