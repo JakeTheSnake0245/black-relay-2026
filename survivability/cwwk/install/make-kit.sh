@@ -22,7 +22,7 @@ K=$(mktemp -d)/cwwk-kit; mkdir -p "$K"/{templates,pkgs,host,controller,edge}
 trap 'rm -rf "$(dirname "$K")"' EXIT
 AB=$CW/as-built/cwwk01
 CT=$CW/controller
-DEB=black-relay-glorytun_0.3.4+br6_amd64.deb WST=wstunnel_11.1.0_linux_amd64.tar.gz
+DEB=black-relay-glorytun_0.3.4+br7_amd64.deb WST=wstunnel_11.1.0_linux_amd64.tar.gz
 TPL=debian-13-standard_13.6-1_amd64.tar.zst
 
 echo "== sources"

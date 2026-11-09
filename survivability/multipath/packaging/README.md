@@ -6,11 +6,11 @@ Ubuntu and OpenWrt with no library dependencies.
 
 | file (in `../dist/`) | install on |
 |---|---|
-| `black-relay-glorytun_0.3.4+br6_amd64.deb` | site edges (CWWK `br-edge`), any x86_64 Debian/Ubuntu |
-| `black-relay-glorytun_0.3.4+br6_arm64.deb` | arm64 Debian/Ubuntu (Hetzner CAX, lab VMs) |
-| `black-relay-glorytun_0.3.4-br6_x86_64.ipk` | OpenWrt x86_64 |
-| `black-relay-debug_0.3.4+br6_all.deb` | test/debug: per-interface capture + verification (see `debug/README.md`) |
-| `black-relay-debug-0.3.4+br6.tar.gz` | `br-verify` + Wireshark dissector for the Mac |
+| `black-relay-glorytun_0.3.4+br7_amd64.deb` | site edges (CWWK `br-edge`), any x86_64 Debian/Ubuntu |
+| `black-relay-glorytun_0.3.4+br7_arm64.deb` | arm64 Debian/Ubuntu (Hetzner CAX, lab VMs) |
+| `black-relay-glorytun_0.3.4-br7_x86_64.ipk` | OpenWrt x86_64 |
+| `black-relay-debug_0.3.4+br7_all.deb` | test/debug: per-interface capture + verification (see `debug/README.md`) |
+| `black-relay-debug-0.3.4+br7.tar.gz` | `br-verify` + Wireshark dissector for the Mac |
 | `black-relay-image_*.tar.gz` | the BR2026 hub container (`survivability/identity-stack/ansible/roles/black_relay_hub`) |
 
 Production today: the hub runs as a container on BR2026 behind Caddy (HTTPS 443 only); sites run
@@ -54,7 +54,7 @@ codec self-test, and writes `dist/` + `SHA256SUMS`.
 
 A throwaway VPS, both ends in network namespaces. No second host, no firewall change:
 
-    sudo apt install ./black-relay-glorytun_0.3.4+br6_amd64.deb
+    sudo apt install ./black-relay-glorytun_0.3.4+br7_amd64.deb
     sudo black-relay-lab up
     sudo black-relay-lab probe 10          # report: recv/lost/ooo/depth/latency
     sudo black-relay-lab spike on; sudo black-relay-lab probe 10; sudo black-relay-lab spike off
@@ -69,9 +69,9 @@ Check the CPU type on each box first: `dpkg --print-architecture` gives `amd64` 
 
 **Hetzner (server):**
 
-    scp dist/black-relay-glorytun_0.3.4+br6_amd64.deb root@HETZNER:/tmp/
+    scp dist/black-relay-glorytun_0.3.4+br7_amd64.deb root@HETZNER:/tmp/
     ssh root@HETZNER
-    apt install /tmp/black-relay-glorytun_0.3.4+br6_amd64.deb
+    apt install /tmp/black-relay-glorytun_0.3.4+br7_amd64.deb
     black-relay-setup server            # key + /etc/black-relay/br0.conf + starts black-relay@br0
 
 Then open **UDP 5000 inbound** yourself (Hetzner Cloud firewall and/or
@@ -80,7 +80,7 @@ Then open **UDP 5000 inbound** yourself (Hetzner Cloud firewall and/or
 **Local box (client):** run `ip -br addr` to get the uplink interface names, then:
 
     scp root@HETZNER:/etc/black-relay/br0.key ./br0.key
-    sudo apt install ./black-relay-glorytun_0.3.4+br6_amd64.deb
+    sudo apt install ./black-relay-glorytun_0.3.4+br7_amd64.deb
     sudo black-relay-setup client --server HETZNER_IPV4 --key ./br0.key \
          --uplink enp2s0:300 --uplink enp3s0:150 --uplink wwan0:40
     ping 10.255.0.2
@@ -184,14 +184,14 @@ Phases 5/5b have passed.
 
 OMR server VM (Hetzner):
 
-    sudo apt install ./black-relay-glorytun_0.3.4+br6_amd64.deb
+    sudo apt install ./black-relay-glorytun_0.3.4+br7_amd64.deb
     sudo black-relay-switch status                 # finds OMR's glorytun-udp
     sudo black-relay-switch fork                   # stock kept as <path>.stock
     systemctl list-units 'glorytun*'               # restart the one(s) shown
 
 OMR router VM (Node 01, then Node 02 standby):
 
-    opkg install /tmp/black-relay-glorytun_0.3.4-br6_x86_64.ipk
+    opkg install /tmp/black-relay-glorytun_0.3.4-br7_x86_64.ipk
     black-relay-switch fork
     /etc/init.d/glorytun-udp restart
 

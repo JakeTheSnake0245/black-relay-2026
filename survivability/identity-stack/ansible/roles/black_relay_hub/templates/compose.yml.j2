@@ -34,6 +34,10 @@ services:
     volumes:
       - "{{ black_relay_hub_dir }}/etc:/etc/black-relay"
       - "{{ black_relay_hub_dir }}/br-supervise:/usr/sbin/br-supervise:ro"
+{% if black_relay_hub_glorytun_bin | length > 0 %}
+      # fixed tunnel binary 0.3.4+br7 (hourly key rotation), until the next image build
+      - "{{ black_relay_hub_dir }}/glorytun:/usr/lib/black-relay/glorytun:ro"
+{% endif %}
     networks:
       black_relay: {}
       {{ edge_proxy_network }}:

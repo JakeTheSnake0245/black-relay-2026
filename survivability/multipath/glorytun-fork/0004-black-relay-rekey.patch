@@ -1,0 +1,55 @@
+--- a/mud/mud.c
++++ b/mud/mud.c
+@@ -156,6 +156,7 @@
+     unsigned char local[MUD_PUBKEY_SIZE];
+     struct mud_crypto_key private, last, next, current;
+     int use_next;
++    int wait_peer;      /* Black Relay: rotated here, peer not yet on the new key */
+     int aes;
+ };
+ 
+@@ -1000,6 +1001,23 @@
+     } while (crypto_scalarmult(tmp, test, kx->local));
+ 
+     sodium_memzero(tmp, sizeof(tmp));
++
++    /* Black Relay: a rotation must also re-derive "next" from the new secret
++     * and the peer's (unchanged) public key. Without it the peer derives the
++     * new key from our new public key and switches to it, while this side
++     * still holds the old "next": nothing the peer sends decrypts any more
++     * until a watchdog restarts the tunnel (cwwk01: every 60 min after the
++     * hub process started). Until a packet under the new key arrives, keep
++     * sending under the current key, so the peer is never ahead of itself. */
++    if (!sodium_is_zero(kx->remote, sizeof(kx->remote))) {
++        unsigned char remote[MUD_PUBKEY_SIZE];
++        memcpy(remote, kx->remote, sizeof(remote));
++        if (!mud_keyx(kx, remote, kx->current.aes)) {
++            kx->wait_peer = 1;
++            kx->use_next = 0;
++        }
++        sodium_memzero(remote, sizeof(remote));
++    }
+     kx->time = now;
+ 
+     return 0;
+@@ -1185,6 +1203,7 @@
+             mud->keyx.last = mud->keyx.current;
+             mud->keyx.current = mud->keyx.next;
+             mud->keyx.use_next = 0;
++            mud->keyx.wait_peer = 0;
+         } else {
+             if (mud_decrypt_opt(&mud->keyx.last, &opt) &&
+                 mud_decrypt_opt(&mud->keyx.private, &opt))
+@@ -1506,7 +1525,11 @@
+             mud->err.keyx.count++;
+             return;
+         }
+-    } else if (path->conf.state == MUD_UP) {
++    } else if (path->conf.state == MUD_UP &&
++               (!mud->keyx.wait_peer ||
++                mud_timeout(now, mud->keyx.time, 2 * MUD_ONE_SEC))) {
++        /* Black Relay: after rotating here, switch once the peer sends under
++         * the new key, or after 2 s at the latest (both ends rotated at once) */
+         mud->keyx.use_next = 1;
+     }
+     mud_send_msg(mud, path, now, sent_time,

@@ -93,6 +93,25 @@
     mode: "0755"
   register: black_relay_hub_supervisor
 
+- name: Fixed tunnel binary (until the image carries it)
+  when: black_relay_hub_glorytun_bin | length > 0
+  block:
+    - name: Copy the tunnel binary
+      ansible.builtin.copy:
+        src: "{{ black_relay_hub_glorytun_bin }}"
+        dest: "{{ black_relay_hub_dir }}/glorytun"
+        owner: root
+        group: root
+        mode: "0755"
+      register: black_relay_hub_glorytun
+
+    - name: Verify the tunnel binary is the reviewed build
+      ansible.builtin.stat:
+        path: "{{ black_relay_hub_dir }}/glorytun"
+        checksum_algorithm: sha256
+      register: black_relay_hub_glorytun_stat
+      failed_when: black_relay_hub_glorytun_stat.stat.checksum != black_relay_hub_glorytun_sha256
+
 - name: WebSocket path prefix (secret)
   ansible.builtin.template:
     src: ws.env.j2
@@ -129,7 +148,8 @@
   ansible.builtin.command: >-
     docker compose -f {{ black_relay_hub_dir }}/compose.yml up -d
     {{ '--force-recreate' if black_relay_hub_supervisor is changed
-    or black_relay_hub_ws_env is changed else '' }}
+    or black_relay_hub_ws_env is changed
+    or (black_relay_hub_glorytun is defined and black_relay_hub_glorytun is changed) else '' }}
   register: black_relay_hub_up
   changed_when: "'Started' in black_relay_hub_up.stderr or 'Recreated' in black_relay_hub_up.stderr"
 

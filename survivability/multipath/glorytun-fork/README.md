@@ -116,3 +116,12 @@ Or by hand, against a checkout of `ysurac/glorytun@203c5f2` with submodules:
 See `../docs/lab-results.md`. In the three-lane lab: in-order reconstruction of a
 39 %-out-of-order sprayed stream (ooo → 0), and 13.8 Mbit aggregated across
 8/5/3 Mbit links with 0 % loss.
+
+## 0004: key rotation (0.3.4+br7)
+
+Upstream rotation left the rotating end with a stale "next" key: the peer derived the new key
+from the new public key and switched to it, the rotating end could not decrypt anything until
+a restart (cwwk01's hub wedged 60 min after every start). The rotating end now re-derives
+"next" from its new secret and the peer's public key, and keeps sending under the current key
+until a packet under the new key arrives (2 s at most, for simultaneous rotation). Rotation
+interval, key derivation and wire format are unchanged. Lab: `analysis/experiments/brlab-rekey.sh`.

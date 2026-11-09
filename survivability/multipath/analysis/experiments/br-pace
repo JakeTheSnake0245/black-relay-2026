@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""br-pace: run the tunnel as fast as the slowest link allows, never changing who carries what.
+
+The sliders (UPLINKS in br0.conf) set each connection's SHARE of the traffic: its cap
+over the sum of the connected ones' caps. That share is the security setting (how much
+of any stream one carrier can ever see), so br-pace never changes it. It only sets the
+TOTAL rate, every second, so that no link is fed more than it can carry:
+
+  - a link that is fed too much queues: its lanes' round-trip time climbs above its own
+    baseline. Packets then arrive too late for the reorder hold and get sent twice, and
+    the whole tunnel slows to a crawl (measured on cwwk01: 70% of delivered bytes were
+    resends at caps 1000/1000);
+  - so: any link queuing -> total down to just under what was really delivered;
+    every link clear and the tunnel busy -> total up 15%; idle -> hold.
+
+Upload and download are paced separately (each has its own shares and total). The
+total never exceeds the sum of the sliders, so a slider is also a hard ceiling.
+
+  br-pace            run (service)
+  br-pace status     what it is doing now (JSON)
+
+Env (testing): BR_DEV, BR_CONF, BR_LANES, BR_PORT, BR_IFS ("up0 up2 up3": counters).
+"""
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+
+GT = "/usr/lib/black-relay/glorytun"
+DEV = os.environ.get("BR_DEV", "br0")
+CONF = os.environ.get("BR_CONF", "/etc/black-relay/br0.conf")
+STATE = os.environ.get("BR_STATE", "/run/black-relay/pace.json")
+TICK = 1.0
+LO_MS, HI_MS = 30.0, 70.0      # queueing above a link's own baseline: clear / too much
+BASE_WIN = 600.0               # baseline = lowest RTT seen in this window (incl. probes)
+PROBE_EVERY, PROBE_LEN = 60.0, 3.0   # a link busy the whole time never shows its empty RTT:
+PROBE_SHARE = 0.3                    # so every minute, 3 s at 30 % of the rate to measure it
+UP, DOWN_CUT, MIN_TOTAL = 1.15, 0.85, 2.0
+OVERHEAD = 1.12                # lane bytes on the modem per tunnel byte (TLS + WebSocket + TCP)
+
+
+def sh(*a):
+    return subprocess.run(a, capture_output=True, text=True, timeout=10).stdout
+
+
+def conf():
+    c = {}
+    try:
+        for line in open(CONF):
+            m = re.match(r'^([A-Z_]+)=(.*)$', line.strip())
+            if m:
+                c[m.group(1)] = m.group(2).strip().strip('"')
+    except OSError:
+        pass
+    lanes = int(os.environ.get("BR_LANES") or c.get("WSS_LANES") or 1)
+    ups = []
+    for i, spec in enumerate(c.get("UPLINKS", "").split()):
+        ifc, _, m = spec.partition(":")
+        m = m.split(":")[0]
+        if "/" in m:
+            tx, rx = m.split("/")
+        else:
+            tx = rx = m
+        if not (tx.isdigit() and rx.isdigit()):
+            continue          # "auto" uplinks are left alone
+        ups.append({"if": ifc, "i": i, "tx": int(tx), "rx": int(rx),
+                    "lanes": [f"127.0.1.{i * lanes + j + 1}" for j in range(lanes)]})
+    return ups, lanes, int(os.environ.get("BR_PORT") or c.get("PORT") or 5001)
+
+
+def table(kind):
+    rows = {}
+    for line in sh(GT, "path", "dev", DEV, "show", kind).splitlines():
+        p = line.split()
+        if p and p[0] == "path" and len(p) >= 4:
+            rows[p[2].rsplit(".", 1)[0]] = p[3:]
+    return rows
+
+
+def ifbytes():
+    out = {}
+    try:
+        for line in open("/proc/net/dev").read().splitlines()[2:]:
+            name, data = line.split(":", 1)
+            f = data.split()
+            out[name.strip()] = (int(f[0]), int(f[8]))
+    except OSError:
+        pass
+    return out
+
+
+def setrate(lane, port, tx_bps, rx_bps):
+    subprocess.run([GT, "path", "dev", DEV, "addr", "127.0.0.1", "to", "addr", lane, "port", str(port),
+                    "set", "rate", "fixed", "tx", str(max(1250, int(tx_bps))), "rx", str(max(1250, int(rx_bps)))],
+                   capture_output=True, timeout=10)
+
+
+class Dir:
+    """One direction: its total (Mbit) and its controller."""
+
+    def __init__(self, name):
+        self.name, self.total, self.applied = name, None, None
+
+    def step(self, ceiling, delivered, busy, queued, clear):
+        if self.total is None:
+            self.total = min(ceiling, 20.0)
+        if queued and busy:
+            self.total = max(MIN_TOTAL, min(self.total, delivered) * DOWN_CUT)
+        elif clear and busy:
+            self.total = min(ceiling, self.total * UP)
+        self.total = min(self.total, ceiling)
+        return self.total
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "status":
+        try:
+            print(open(STATE).read())
+        except OSError:
+            print(json.dumps({"running": False}))
+        return
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    hist = {}                      # lane uplink if -> [(t, rtt)]
+    up, down = Dir("up"), Dir("down")
+    prev, prev_t = ifbytes(), time.time()
+    sig, last_set = None, 0.0
+    probe_until, next_probe = time.time() + PROBE_LEN, time.time() + PROBE_EVERY   # probe at start too
+    saved = None
+    while True:
+        time.sleep(TICK)
+        ups, nl, port = conf()
+        now = time.time()
+        cur = ifbytes()
+        dt = max(0.2, now - prev_t)
+        rtt = table("rtt")
+        live = []
+        for u in ups:
+            rs = [float(rtt[a][0]) for a in u["lanes"] if a in rtt and float(rtt[a][0]) > 0]
+            if not rs:
+                continue      # uplink not in the tunnel (empty port)
+            r = statistics.median(rs)
+            h = hist.setdefault(u["if"], [])
+            h.append((now, r))
+            while h and now - h[0][0] > BASE_WIN:
+                h.pop(0)
+            base = min(x for _, x in h)
+            c, p = cur.get(u["if"]), prev.get(u["if"])
+            rx = (c[0] - p[0]) * 8 / dt / 1e6 / OVERHEAD if c and p else 0.0
+            tx = (c[1] - p[1]) * 8 / dt / 1e6 / OVERHEAD if c and p else 0.0
+            live.append(dict(u, rtt=r, base=base, q=r - base, rx_mbit=rx, tx_mbit=tx))
+        prev, prev_t = cur, now
+        if not live:
+            continue
+        # a slider change (or a tunnel restart) starts over from the new sliders
+        s = json.dumps([(u["if"], u["tx"], u["rx"]) for u in live])
+        if s != sig:
+            sig, up.total, down.total, up.applied, down.applied = s, None, None, None, None
+        srx, stx = sum(u["rx"] for u in live), sum(u["tx"] for u in live)
+        d_del, u_del = sum(u["rx_mbit"] for u in live), sum(u["tx_mbit"] for u in live)
+        d_busy = d_del > 0.6 * (down.total or 20.0)
+        u_busy = u_del > 0.6 * (up.total or 20.0)
+        if now < probe_until:
+            # probing: hold both totals low (same shares) so every link's queue drains
+            if saved is None:
+                saved = (down.total or min(srx, 20.0), up.total or min(stx, 20.0))
+            td, tu = max(MIN_TOTAL, saved[0] * PROBE_SHARE), max(MIN_TOTAL, saved[1] * PROBE_SHARE)
+        else:
+            if saved is not None:
+                down.total, up.total, saved = saved[0], saved[1], None
+            if now >= next_probe and (d_busy or u_busy):
+                probe_until, next_probe = now + PROBE_LEN, now + PROBE_EVERY
+            queued = any(u["q"] > HI_MS for u in live)
+            clear = all(u["q"] < LO_MS for u in live)
+            # which direction is queuing: the busy one (both if both busy)
+            td = down.step(srx, d_del, d_busy, queued and (d_busy or not u_busy), clear)
+            tu = up.step(stx, u_del, u_busy, queued and (u_busy or not d_busy), clear)
+        changed = False
+        for d, tot in ((down, td), (up, tu)):
+            if d.applied is None or abs(tot - d.applied) / d.applied >= 0.04:
+                d.applied, changed = tot, True
+        # re-assert every 10 s too: a tunnel restart puts the sliders' rates back
+        if changed or now - last_set > 10:
+            last_set = now
+            for u in live:
+                share_rx, share_tx = u["rx"] / srx, u["tx"] / stx
+                for a in u["lanes"]:
+                    setrate(a, port, up.applied * 125000 * share_tx / nl, down.applied * 125000 * share_rx / nl)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"t": now, "down_mbit": round(down.applied, 1), "up_mbit": round(up.applied, 1),
+                       "links": [{"if": u["if"], "share_down": round(u["rx"] / srx, 3), "share_up": round(u["tx"] / stx, 3),
+                                  "rtt": round(u["rtt"]), "base": round(u["base"]), "queue_ms": round(u["q"]),
+                                  "rx_mbit": round(u["rx_mbit"], 1), "tx_mbit": round(u["tx_mbit"], 1)} for u in live]}, f)
+        os.replace(tmp, STATE)
+
+
+if __name__ == "__main__":
+    main()

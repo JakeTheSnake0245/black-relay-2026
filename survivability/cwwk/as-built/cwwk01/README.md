@@ -36,7 +36,7 @@ only on the Proxmox host in `/root/black-relay/` (root-only) and are never copie
    - 101 `br-edge`: Debian 13, unprivileged, nesting, `/dev/net/tun`.
    - 102 `br-router`: OpenWrt LXC image.
    - 103 `br-controller`: Debian 13.
-2. **Edge (101):** install `black-relay-glorytun` 0.3.4+br6 or later (`survivability/multipath/packaging/build.sh`), join the
+2. **Edge (101):** install `black-relay-glorytun` 0.3.4+br7 or later (`survivability/multipath/packaging/build.sh`), join the
    hub with a site token (`black-relay-setup join <token>`, issued by the hub admin). Restore
    `edge/etc/` (nftables, networkd files, systemd drop-ins, `black-relay/` incl. `carriers.conf`) and
    `edge/usr/local/sbin/`; enable `br-lane-nurse`, `br-watchdog`, `br-dash`, `br-uplinks-recheck.timer`. Set `WSS_PREFIX` from

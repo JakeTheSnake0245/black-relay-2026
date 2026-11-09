@@ -12,6 +12,12 @@ black_relay_hub_image_ids:
   - "sha256:3712e7238ec32ffaf17d8c4164d0698c112913508b067ef5cb803cd668dcbe1b"
   - "sha256:a706e0d7a68d8826aea74c42d03c9bcac280840e7dbdc6809732649b6c77328e"
 black_relay_hub_dir: /srv/black-relay
+# Fixed tunnel binary bind-mounted over the image's own until the next image
+# build carries it (0.3.4+br7: hourly key rotation no longer wedges the hub).
+# Static x86_64 build from multipath/packaging/build.sh; placed in files/ like
+# the image archive (not in git). Empty = use the image's binary.
+black_relay_hub_glorytun_bin: "glorytun-0.3.4+br7-x86_64"
+black_relay_hub_glorytun_sha256: "4425808e3916d4781d68d7d782be7d96edfe58cc07d67ab3f651fc298d887b32"
 black_relay_hub_container: survivability-black-relay
 black_relay_hub_public_ip: "{{ ansible_default_ipv4.address }}"
 black_relay_hub_port_base: 5000

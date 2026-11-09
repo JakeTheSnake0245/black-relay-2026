@@ -166,7 +166,7 @@ EOF
 	pct start $EDGE; wait_ct $EDGE
 	for _ in $(seq 1 20); do pct exec $EDGE -- getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done
 	pct exec $EDGE -- sh -c 'apt-get update -q >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -q dnsmasq nftables sshpass curl python3 >/dev/null'
-	ct_push $EDGE "$KIT/pkgs/black-relay-glorytun_0.3.4+br6_amd64.deb" /root/br.deb
+	ct_push $EDGE "$KIT/pkgs/black-relay-glorytun_0.3.4+br7_amd64.deb" /root/br.deb
 	pct exec $EDGE -- sh -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -q /root/br.deb >/dev/null && rm /root/br.deb'
 	tar -xzf "$KIT/pkgs/wstunnel_11.1.0_linux_amd64.tar.gz" -C $D wstunnel
 	ct_push $EDGE $D/wstunnel /usr/local/bin/wstunnel 0755; rm $D/wstunnel
