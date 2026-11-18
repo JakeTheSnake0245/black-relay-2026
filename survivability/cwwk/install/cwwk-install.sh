@@ -11,7 +11,7 @@
 #                                            itself after 15 minutes unless confirmed.
 #   bash cwwk-install.sh finish              once modems are in: tunnel check, tailnet,
 #                                            self-test, keep the port layout.
-#   bash cwwk-install.sh check               state of everything
+#   bash cwwk-install.sh check               state of everything (runs br-verify: PASS/WARN/FAIL)
 #
 # Then, as on cwwk01: br-vault-init (USB stick in; site lock), br-controller-oidc
 # (Pocket ID), spitz-setup.sh (Wi-Fi on the site LAN). See README.md.
@@ -90,7 +90,7 @@ cmd_install() {
 	printf 'N=%s\nIDX=%s\nHN=%s\nPORTS="%s"\n' "$N" "$IDX" "$HN" "${P[*]}" >$ST
 	install -m 0600 "$J" $D/$SITE.join
 
-	say "1/7 host packages"
+	say "1/8 host packages"
 	for f in /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/sources.list.d/ceph.sources; do
 		if [ -f "$f" ] && ! grep -q '^Enabled: no' "$f"; then echo 'Enabled: no' >>"$f"; fi
 	done
@@ -114,7 +114,7 @@ EOF
 	install -m 0644 "$KIT/templates/$TPL" /var/lib/vz/template/cache/$TPL
 	install -m 0644 "$KIT/templates/br-router-rootfs.tar.xz" /var/lib/vz/template/cache/br-router-rootfs.tar.xz
 
-	say "2/7 internal bridges (no cables involved; vmbr0 stays as it is)"
+	say "2/8 internal bridges (no cables involved; vmbr0 stays as it is)"
 	if ! grep -q '^auto vmbr10' /etc/network/interfaces; then
 		cp -p /etc/network/interfaces $D/interfaces.before-install
 		cat >>/etc/network/interfaces <<EOF
@@ -155,7 +155,7 @@ EOF
 	fi
 	ip -4 route show default | grep -q . || die "internet route lost after adding bridges (backup: $D/interfaces.before-install)"
 
-	say "3/7 br-edge (CT $EDGE): multipath tunnel"
+	say "3/8 br-edge (CT $EDGE): multipath tunnel"
 	nets=(-net0 "name=tr0,bridge=vmbr2,ip=$T.1/30,type=veth" -net9 "name=eth9,bridge=vmbr0,ip=dhcp,type=veth")
 	for i in "${!P[@]}"; do nets+=(-net$((i + 1)) "name=up$i,bridge=vmbr10,tag=$((BASE + i)),ip=manual,type=veth"); done
 	pct create $EDGE local:vztmpl/$TPL --hostname br-edge --cores 2 --memory 1024 --swap 256 \
@@ -202,7 +202,7 @@ PY
 	pct set $EDGE -delete net9
 	pct set $EDGE -nameserver 127.0.0.1
 
-	say "4/7 br-router (CT $ROUTER): OpenWrt, DHCP/DNS/firewall"
+	say "4/8 br-router (CT $ROUTER): OpenWrt, DHCP/DNS/firewall"
 	pct create $ROUTER local:vztmpl/br-router-rootfs.tar.xz --hostname br-router --cores 1 --memory 256 --swap 0 \
 		--rootfs local-lvm:1 --unprivileged 1 --ostype unmanaged --arch amd64 --onboot 1 --startup order=2 \
 		-net0 name=eth0,bridge=vmbr1,type=veth -net1 name=eth1,bridge=vmbr2,type=veth -net2 name=eth2,bridge=vmbr3,type=veth \
@@ -227,7 +227,7 @@ PY
 		openssl x509 -in $D/.router.crt -out $D/router.pem || die "router certificate unreadable"
 	rm -f $D/.router.crt
 
-	say "5/7 br-controller (CT $CTRL): web UI"
+	say "5/8 br-controller (CT $CTRL): web UI"
 	pct create $CTRL local:vztmpl/$TPL --hostname br-controller --cores 1 --memory 512 --swap 256 \
 		--rootfs local-lvm:4 --unprivileged 1 --features nesting=1 --onboot 1 --startup order=3 \
 		--nameserver $L.1 --searchdomain lan --ostype debian \
@@ -259,7 +259,7 @@ PY
 	hk=$(pct exec $EDGE -- cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}')
 	echo "$T.1 $hk" | pct exec $CTRL -- sh -c 'cat > /root/.ssh/known_hosts; chmod 600 /root/.ssh/known_hosts'
 
-	say "6/7 Proxmox access for the controller, site lock service, host tools"
+	say "6/8 Proxmox access for the controller, site lock service, host tools"
 	pveum role list --output-format json | grep -q '"BlackRelayController"' ||
 		pveum role add BlackRelayController -privs "Datastore.Audit,Sys.Audit,VM.Audit,VM.PowerMgmt"
 	pveum user list --output-format json | grep -q '"br-controller@pve"' || pveum user add br-controller@pve --comment "Black Relay controller (API token only)"
@@ -268,13 +268,14 @@ PY
 	pveum user token add br-controller@pve ui --privsep 1 --output-format json >$D/pve-token.json
 	pveum acl modify / --tokens 'br-controller@pve!ui' --roles BlackRelayController
 	W=$(mktemp -d); cp "$KIT"/host/* "$W/"; render "$W"/*
-	for f in br-port-roles br-port-layout br-hostinfo br-lockd br-vault-init br-port-lock br-controller-oidc br-rotate-secrets; do
+	for f in br-port-roles br-port-layout br-hostinfo br-lockd br-vault-init br-port-lock br-controller-oidc br-rotate-secrets br-verify br-svc; do
 		install -m 0755 "$W/$f" /usr/local/sbin/$f
 	done
 	for f in br-port-roles.service br-hostinfo.service br-lockd.service br-port-lock.service; do
 		install -m 0644 "$W/$f" /etc/systemd/system/$f
 	done
 	rm -rf "$W"
+	printf '#!/bin/sh\nexec /usr/local/sbin/br-verify --summary "$@"\n' >/usr/local/sbin/br-status; chmod 755 /usr/local/sbin/br-status
 	sed -i "s#https://headscale.l8s.dev/cwwk/#https://headscale.l8s.dev/cwwk$N/#g" /usr/local/sbin/br-controller-oidc
 	mkdir -p /etc/br-lockd; chmod 700 /etc/br-lockd
 	printf '{\n  "site": "%s",\n  "controller": "%s",\n  "listen": ["%s", 8092]\n}\n' "$SITE" "$L.10" "$L.2" >/etc/br-lockd/config.json
@@ -287,7 +288,7 @@ PY
 	systemctl enable -q --now br-hostinfo br-lockd br-port-lock
 	systemctl enable -q br-port-roles   # starts with the port layout
 
-	say "7/7 controller settings"
+	say "7/8 controller settings"
 	apw=$(head -c 18 /dev/urandom | base64 | tr -d '+/=' | cut -c1-16)
 	printf '%s\n' "$apw" >$D/controller-admin.pw
 	{ printf '%s\n' "$apw"; cat $D/router-root.pw; cat /etc/br-lockd/token; echo; } |
@@ -318,6 +319,9 @@ PY
 	pct exec $CTRL -- sh -c 'systemctl daemon-reload; systemctl enable -q --now br-controller'
 	sleep 3
 	pct exec $CTRL -- systemctl is-active -q br-controller || die "controller did not start (pct exec $CTRL -- journalctl -u br-controller)"
+
+	say "8/8 services host (CT 104): Docker for the Sensor Fusion services"
+	/usr/local/sbin/br-svc init || echo "  services host not ready: run  br-svc init  later (the proof will say so)"
 
 	cat <<EOF
 
@@ -389,7 +393,7 @@ cmd_finish() {
 	else
 		echo "  left as is: put your SSH key in /root/.ssh/authorized_keys, then run finish again"
 	fi
-	cmd_check
+	cmd_check || true
 	cat <<EOF
 
 Done: $SITE is on the hub and runs like cwwk01.
@@ -401,14 +405,7 @@ EOF
 # ------------------------------------------------------------------ check
 cmd_check() {
 	load
-	say "check $SITE"
-	for id in $EDGE $ROUTER $CTRL; do printf '  CT %s %-14s %s\n' $id "$(pct config $id | sed -n 's/^hostname: //p')" "$(pct status $id | cut -d' ' -f2)"; done
-	for u in br-hostinfo br-lockd br-port-roles tailscaled; do printf '  host %-14s %s\n' $u "$(systemctl is-active $u)"; done
-	printf '  tunnel        %s\n' "$(pct exec $EDGE -- ping -c1 -W2 -I br0 10.255.$IDX.1 >/dev/null 2>&1 && echo up || echo down)"
-	printf '  lanes         %s\n' "$(pct exec $EDGE -- sh -c 'systemctl list-units --no-legend "black-relay-lane-*" 2>/dev/null | grep -c running' || echo 0)"
-	printf '  controller    %s\n' "$(pct exec $CTRL -- systemctl is-active br-controller)"
-	printf '  site lock     %s\n' "$(/usr/local/sbin/br-lockd status 2>/dev/null | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s.get("state"), "vault" if s.get("vault") else "no vault yet (br-vault-init)")' 2>/dev/null || echo '?')"
-	pct exec $EDGE -- /usr/local/sbin/br-selftest 2>/dev/null | tail -15 || true
+	if [ -x /usr/local/sbin/br-verify ]; then /usr/local/sbin/br-verify "$@"; else bash "$KIT/host/br-verify" "$@"; fi
 }
 
 case "${1:-}" in
@@ -416,6 +413,6 @@ case "${1:-}" in
 	install) cmd_install "${2:-}" "${3:-}" ;;
 	ports) cmd_ports ;;
 	finish) cmd_finish ;;
-	check) cmd_check ;;
+	check) shift; cmd_check "$@" ;;
 	*) sed -n '2,20p' "$0"; exit 2 ;;
 esac

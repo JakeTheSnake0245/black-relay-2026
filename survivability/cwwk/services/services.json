@@ -1,0 +1,21 @@
+{
+  "_about": "Services developed on sf-dev that every CWWK site should run. svc-sync.sh reads this. One entry per compose project. 'card' is the controller tile the site shows for it.",
+  "source": "dev@sf-dev",
+  "services": [
+    {
+      "name": "rf-central",
+      "root": "/srv/sensor-fusion/detection/rf-subsystem",
+      "workdir": "central",
+      "compose": ["docker-compose.yml", "docker-compose.fusion.yml"],
+      "profiles": ["console"],
+      "card": {
+        "id": "rf-console",
+        "name": "RF Console",
+        "kind": "sensors",
+        "port": 8080,
+        "path": "/",
+        "description": "RF detection: Kismet server, MQTT broker and the WBT Console (live RF map, nodes, alerts)."
+      }
+    }
+  ]
+}

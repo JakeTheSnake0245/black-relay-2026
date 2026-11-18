@@ -1,0 +1,228 @@
+#!/bin/bash
+# br-svc: the site's services host. Run as root on the Proxmox host.
+#
+#   br-svc init                    create CT 104 "br-services" (Docker) on the services network
+#   br-svc deploy BUNDLE.tar       load a bundle made on sf-dev (svc-sync.sh) and start it
+#   br-svc status [--json]         what runs here, which version, healthy or not
+#   br-svc creds NAME              print the generated logins for a service (on request only)
+#   br-svc logs NAME [SERVICE]     recent logs
+#   br-svc remove NAME [--volumes] stop it (data volumes stay unless --volumes)
+#
+# CT 104: unprivileged, Docker CE + compose, address .20 on the services network
+# (10.(41+8(N-1)).0.20), tagged br-gated so the site lock stops it with the rest of the box.
+# Services publish on that address, so laptops on the site LAN and devices on the services
+# network reach them. Bundles carry images (no registry, no internet needed); each site makes
+# its own passwords on first deploy (/srv/services/NAME/central/.env inside the CT, mode 0600).
+set -uo pipefail
+export LC_ALL=C LANG=C
+SVC=104 CTRL=103 BASE=/srv/services
+TPL=debian-13-standard_13.6-1_amd64.tar.zst
+[ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
+A=$(ip -4 -o addr show vmbr1 2>/dev/null | sed -n 's/.* 10\.\([0-9]*\)\.0\.2\/24 .*/\1/p' | head -1)
+[ -n "$A" ] || { echo "no site LAN on vmbr1: not a site box"; exit 1; }
+S=10.$((A + 1)).0 SITE=cwwk$(printf %02d $(( (A - 40) / 8 + 1 )))
+say() { printf '\n== %s\n' "$*"; }
+die() { echo "STOP: $*" >&2; exit 1; }
+ctx() { pct exec $SVC -- "$@"; }
+up()  { [ "$(pct status $SVC 2>/dev/null | cut -d' ' -f2)" = running ]; }
+
+# ------------------------------------------------------------------ init
+cmd_init() {
+	if pct status $SVC >/dev/null 2>&1; then
+		up || pct start $SVC
+		echo "CT $SVC exists: checking Docker"
+	else
+		[ -f /var/lib/vz/template/cache/$TPL ] || die "container template $TPL missing"
+		say "creating CT $SVC br-services ($S.20)"
+		pct create $SVC local:vztmpl/$TPL --hostname br-services --cores 4 --memory 4096 --swap 512 \
+			--rootfs local-lvm:60 --unprivileged 1 --features nesting=1,keyctl=1 --onboot 1 --startup order=4 \
+			--nameserver $S.1 --searchdomain lan --ostype debian --tags br-gated \
+			-net0 "name=eth0,bridge=vmbr3,ip=$S.20/24,gw=$S.1,type=veth" \
+			--description "Black Relay services host ($SITE): Docker for the Sensor Fusion services. Address $S.20. Use br-svc on the Proxmox host." >/dev/null || die "pct create failed"
+		pct start $SVC
+	fi
+	for _ in $(seq 1 30); do ctx true 2>/dev/null && break; sleep 1; done
+	ctx true 2>/dev/null || die "CT $SVC did not start"
+	# internet for the package install: the temporary install network if it still exists (new site
+	# before 'ports'), otherwise the normal route through the router and tunnel
+	TMPNET=0
+	if ! ctx getent hosts deb.debian.org >/dev/null 2>&1; then
+		if ip link show vmbr0 >/dev/null 2>&1; then
+			pct set $SVC -net9 "name=eth9,bridge=vmbr0,ip=dhcp,type=veth" && TMPNET=1
+			pct reboot $SVC >/dev/null 2>&1 || { pct stop $SVC; pct start $SVC; }
+			for _ in $(seq 1 30); do ctx getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done
+		fi
+	fi
+	ctx getent hosts deb.debian.org >/dev/null 2>&1 || die "CT $SVC has no internet (check the tunnel, or the install network)"
+	if ! ctx sh -c 'command -v docker >/dev/null && docker compose version >/dev/null 2>&1'; then
+		say "Docker in CT $SVC"
+		ctx sh -c 'export DEBIAN_FRONTEND=noninteractive
+			apt-get update -q >/dev/null && apt-get install -y -q ca-certificates curl gnupg python3 >/dev/null
+			install -m 0755 -d /etc/apt/keyrings
+			curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && chmod a+r /etc/apt/keyrings/docker.asc
+			echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable" >/etc/apt/sources.list.d/docker.list
+			apt-get update -q >/dev/null
+			apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null' || die "Docker install failed"
+	fi
+	ctx sh -c 'mkdir -p /etc/docker /srv/services /srv/bundles
+		[ -f /etc/docker/daemon.json ] || printf "{\n  \"log-driver\": \"json-file\",\n  \"log-opts\": {\"max-size\": \"10m\", \"max-file\": \"3\"}\n}\n" >/etc/docker/daemon.json
+		systemctl enable -q docker >/dev/null 2>&1; systemctl restart docker'
+	for _ in $(seq 1 20); do ctx docker info >/dev/null 2>&1 && break; sleep 1; done
+	ctx docker info >/dev/null 2>&1 || die "Docker does not start in CT $SVC (journalctl -u docker inside it)"
+	# can a container actually run here? (unprivileged LXC + AppArmor sometimes blocks runc)
+	if ! ctx docker run --rm alpine:3 true >/dev/null 2>&1; then
+		echo "  containers do not start under the default AppArmor profile: relaxing it for this CT"
+		grep -q '^lxc.apparmor.profile' /etc/pve/lxc/$SVC.conf || echo 'lxc.apparmor.profile: unconfined' >>/etc/pve/lxc/$SVC.conf
+		pct reboot $SVC >/dev/null 2>&1; sleep 8
+		for _ in $(seq 1 30); do ctx docker info >/dev/null 2>&1 && break; sleep 2; done
+		ctx docker run --rm alpine:3 true >/dev/null 2>&1 || die "containers cannot run in CT $SVC (docker run alpine failed)"
+	fi
+	ctx docker network inspect fusion >/dev/null 2>&1 || ctx docker network create fusion >/dev/null
+	if [ $TMPNET = 1 ]; then pct stop $SVC; pct set $SVC -delete net9; pct start $SVC
+		for _ in $(seq 1 30); do ctx docker info >/dev/null 2>&1 && break; sleep 2; done; fi
+	echo "services host ready: CT $SVC, $S.20, Docker $(ctx docker version --format '{{.Server.Version}}' 2>/dev/null), network 'fusion'"
+}
+
+# ------------------------------------------------------------------ deploy
+cmd_deploy() {
+	B=${1:-}; [ -r "$B" ] || die "usage: br-svc deploy BUNDLE.tar"
+	up || die "CT $SVC is not running (br-svc init)"
+	W=$(mktemp -d); trap 'rm -rf "$W"' RETURN
+	tar -xf "$B" -C "$W" || die "cannot read $B"
+	( cd "$W" && sha256sum -c --quiet SHA256SUMS ) || die "bundle damaged (SHA256SUMS)"
+	eval "$(python3 - "$W/manifest.json" <<'PY'
+import json, shlex, sys
+m = json.load(open(sys.argv[1]))
+print("NAME=%s VERSION=%s WORKDIR=%s COMPOSE=%s PROFILES=%s" % tuple(shlex.quote(x) for x in (
+    m["name"], m["version"], m["workdir"], ",".join(m["compose"]), ",".join(m["profiles"]))))
+PY
+)"
+	[[ "$NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "bad service name in the bundle"
+	say "deploying $NAME $VERSION"
+	ctx mkdir -p /srv/bundles/$NAME
+	for f in project.tar.gz images.tar.gz manifest.json; do pct push $SVC "$W/$f" /srv/bundles/$NAME/$f || die "copy into CT failed"; done
+	ctx bash -s -- "$NAME" "$VERSION" "$WORKDIR" "$COMPOSE" "$PROFILES" "$S.20" <<'IN' || die "deploy failed (see above)"
+set -eu
+NAME=$1 VERSION=$2 WORKDIR=$3 COMPOSE=$4 PROFILES=$5 ADDR=$6
+D=/srv/services/$NAME; mkdir -p $D
+tar -xzf /srv/bundles/$NAME/project.tar.gz -C $D --no-same-owner
+echo "  loading images (a minute or two)"
+docker load -i /srv/bundles/$NAME/images.tar.gz | sed 's/^/    /'
+cd $D/$WORKDIR
+if [ ! -f .env ]; then
+	( umask 077; : >.env )
+	if [ -f .env.example ]; then
+		while IFS= read -r line || [ -n "$line" ]; do
+			case "$line" in
+				BIND_ADDR=*) echo "BIND_ADDR=$ADDR" ;;
+				*PASSWORD=|*PASSWORD=change-me|*TOKEN=|*TOKEN=change-me|*SECRET=|*SECRET=change-me)
+					echo "${line%%=*}=$(head -c 24 /dev/urandom | base64 | tr -d '+/=' | cut -c1-20)" ;;
+				*) echo "$line" ;;
+			esac
+		done <.env.example >.env
+	else
+		echo "BIND_ADDR=$ADDR" >.env
+	fi
+	echo "  made this site's own .env (BIND_ADDR=$ADDR, fresh passwords)"
+else
+	grep -q '^BIND_ADDR=' .env && sed -i "s/^BIND_ADDR=.*/BIND_ADDR=$ADDR/" .env || echo "BIND_ADDR=$ADDR" >>.env
+	if [ -f .env.example ]; then for k in $(sed -n 's/^\([A-Z_]*\)=.*/\1/p' .env.example); do
+		grep -q "^$k=" .env || echo "  note: .env has no $k (new in this version; the default applies)"; done; fi
+fi
+chmod 600 .env
+args=""; for f in $(echo "$COMPOSE" | tr , ' '); do args="$args -f $f"; done
+for p in $(echo "$PROFILES" | tr , ' '); do args="$args --profile $p"; done
+docker compose $args up -d --no-build --remove-orphans 2>&1 | tail -15
+ok=0
+for _ in $(seq 1 60); do
+	bad=$(docker compose $args ps -a --format '{{.Service}} {{.State}} {{.Health}}' | awk '$2!="running" || $3=="starting" || $3=="unhealthy"' | wc -l)
+	[ "$bad" = 0 ] && { ok=1; break; }; sleep 2
+done
+[ $ok = 1 ] || { docker compose $args ps -a; echo "STOP: not all containers are running and healthy after 2 minutes"; exit 1; }
+printf '{"name":"%s","version":"%s","deployed":"%s","workdir":"%s","compose":"%s","profiles":"%s"}\n' "$NAME" "$VERSION" "$(date -Is)" "$WORKDIR" "$COMPOSE" "$PROFILES" >$D/.br-deployed.json
+echo "  all containers running and healthy"
+IN
+	# controller tile
+	python3 - "$W/manifest.json" "$S.20" "$VERSION" >"$W/card.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); card = m.get("card")
+if card:
+    base = "http://%s:%d%s" % (sys.argv[2], card["port"], card.get("path", "/"))
+    print(json.dumps({"id": card["id"], "name": card["name"], "kind": card["kind"], "description": card.get("description", ""),
+                      "url": base, "health_url": base, "deployed": True}))
+PY
+	if [ -s "$W/card.json" ]; then
+		pct push $CTRL "$W/card.json" /tmp/card.json >/dev/null
+		pct exec $CTRL -- python3 - <<'PY' && pct exec $CTRL -- systemctl restart br-controller && echo "  controller tile updated"
+import json, os
+p = "/etc/br-controller/config.json"
+c = json.load(open(p)); card = json.load(open("/tmp/card.json"))
+svcs = [s for s in c.get("services", []) if s.get("id") != card["id"]]
+old = next((s for s in c.get("services", []) if s.get("id") == card["id"]), {})
+svcs.append({**old, **card})
+c["services"] = svcs
+tmp = p + ".new"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, json.dumps(c, indent=2).encode()); os.close(fd)
+os.replace(tmp, p); os.unlink("/tmp/card.json")
+PY
+	fi
+	echo "done: $NAME $VERSION  ->  http://$S.20 (see: br-svc status; logins: br-svc creds $NAME)"
+}
+
+# ------------------------------------------------------------------ status
+cmd_status() {
+	up || { [ "${1:-}" = --json ] && echo '{"host":false,"services":[]}' || echo "CT $SVC (services host) is not running"; return 1; }
+	J=$(ctx python3 - <<'PY'
+import glob, json, subprocess
+out = []
+for f in sorted(glob.glob("/srv/services/*/.br-deployed.json")):
+    d = json.load(open(f)); base = f.rsplit("/", 1)[0]
+    args = []
+    for x in d["compose"].split(","): args += ["-f", x]
+    for x in [p for p in d["profiles"].split(",") if p]: args += ["--profile", x]
+    p = subprocess.run(["docker", "compose"] + args + ["ps", "-a", "--format", "json"], cwd=base + "/" + d["workdir"], capture_output=True, text=True)
+    rows = []
+    for l in p.stdout.splitlines():
+        try: rows.append(json.loads(l))
+        except ValueError: pass
+    d["containers"] = len(rows)
+    d["running"] = sum(1 for r in rows if r.get("State") == "running")
+    d["unhealthy"] = sum(1 for r in rows if r.get("Health") in ("unhealthy", "starting"))
+    d["names"] = [r.get("Service") for r in rows]
+    out.append(d)
+print(json.dumps({"host": True, "services": out}))
+PY
+)
+	if [ "${1:-}" = --json ]; then echo "$J"; return; fi
+	echo "services host CT $SVC ($S.20): $(ctx docker version --format 'Docker {{.Server.Version}}' 2>/dev/null)"
+	echo "$J" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["services"]
+if not d: print("  nothing deployed yet (svc-sync.sh push, or br-svc deploy BUNDLE.tar)")
+for s in d:
+    ok = s["running"] == s["containers"] and s["unhealthy"] == 0 and s["containers"] > 0
+    print("  %-14s %-13s %d/%d running%s  since %s" % (s["name"], s["version"], s["running"], s["containers"], "" if ok else "  <-- NOT HEALTHY", s["deployed"][:16]))'
+}
+
+cmd_creds() {
+	N=${1:-}; [ -n "$N" ] || die "usage: br-svc creds NAME"
+	ctx sh -c "f=\$(ls $BASE/$N/*/.env 2>/dev/null | head -1); [ -n \"\$f\" ] || exit 1; grep -E '(USER|PASSWORD|TOKEN)=' \$f" || die "no .env for $N"
+}
+cmd_logs() { N=${1:-}; [ -n "$N" ] || die "usage: br-svc logs NAME [SERVICE]"; shift
+	ctx bash -c "cd $BASE/$N && d=\$(python3 -c \"import json;print(json.load(open('.br-deployed.json'))['workdir'])\") && cd \$d && docker compose logs --tail 80 $*"; }
+cmd_remove() {
+	N=${1:-}; [ -n "$N" ] || die "usage: br-svc remove NAME [--volumes]"
+	ctx bash -c "cd $BASE/$N/\$(python3 -c \"import json;print(json.load(open('$BASE/$N/.br-deployed.json'))['workdir'])\") && docker compose \$(for p in \$(python3 -c \"import json;print(json.load(open('$BASE/$N/.br-deployed.json'))['profiles'].replace(',',' '))\"); do printf -- '--profile %s ' \$p; done) down ${2:-}" &&
+		ctx rm -f $BASE/$N/.br-deployed.json && echo "removed $N (data volumes kept unless --volumes; files stay in $BASE/$N)"
+}
+
+case "${1:-}" in
+	init) cmd_init ;;
+	deploy) shift; cmd_deploy "$@" ;;
+	status) shift; cmd_status "$@" ;;
+	creds) shift; cmd_creds "$@" ;;
+	logs) shift; cmd_logs "$@" ;;
+	remove) shift; cmd_remove "$@" ;;
+	*) sed -n '2,12p' "$0"; exit 2 ;;
+esac

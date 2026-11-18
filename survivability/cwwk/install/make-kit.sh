@@ -26,8 +26,8 @@ DEB=black-relay-glorytun_0.3.4+br7_amd64.deb WST=wstunnel_11.1.0_linux_amd64.tar
 TPL=debian-13-standard_13.6-1_amd64.tar.zst
 
 echo "== sources"
-cp "$HERE/cwwk-install.sh" "$HERE/spitz-setup.sh" "$HERE/README.md" "$K/"
-for f in br-port-roles br-port-layout br-hostinfo br-lockd br-vault-init br-port-lock br-controller-oidc br-rotate-secrets; do
+cp "$HERE/cwwk-install.sh" "$HERE/cwwk-bootstrap.sh" "$HERE/spitz-setup.sh" "$HERE/README.md" "$K/"
+for f in br-port-roles br-port-layout br-hostinfo br-lockd br-vault-init br-port-lock br-controller-oidc br-rotate-secrets br-verify br-svc; do
 	cp "$CT/$f" "$K/host/"
 done
 cp "$CT"/br-port-roles.service "$CT"/br-lockd.service "$CT"/br-port-lock.service "$K/host/"
@@ -57,6 +57,14 @@ cp "$MP/edge/br-uplinks-recheck.timer" "$K/edge/etc/systemd/system/"
 cp "$AB/edge/enabled-units.txt" "$K/edge/"
 sed -n '/^# Multithread/,$p' "$AB/edge/etc/black-relay/br0.conf" | grep -v '^WSS_PREFIX=' >"$K/edge/br0.wss.conf"
 cp "$DIST/$DEB" "$DIST/$WST" "$K/pkgs/"
+
+# service bundles (made by svc-sync.sh export): the site runs them from the kit, no sf-dev needed
+BUN=${BUNDLES:-$HOME/Desktop/cwwk-bundles}
+if ls "$BUN"/*.tar >/dev/null 2>&1; then
+	mkdir -p "$K/bundles"; cp "$BUN"/*.tar "$K/bundles/"; echo "== service bundles: $(ls "$K/bundles" | tr '\n' ' ')"
+else
+	echo "== no service bundles in $BUN (run: bash svc-sync.sh export); the site gets them later with svc-sync.sh push"
+fi
 
 echo "== Debian template (from cwwk01)"
 scp -q "$SRC:/var/lib/vz/template/cache/$TPL" "$K/templates/"
