@@ -2,6 +2,9 @@
 # cwwk-install.sh: turn a fresh Proxmox VE 9 CWWK into Black Relay site N, the same
 # build as cwwk01. Run as root on the new box, from the unpacked kit (make-kit.sh).
 #
+# Easiest: don't run this by hand. From the Mac:  bash new-site.sh   then at the box console:
+# bash cwwk-bootstrap.sh   (it calls this script's stages in order and ends with br-verify).
+#
 #   bash cwwk-install.sh plan N              show the site's addresses, change nothing
 #   bash cwwk-install.sh install N JOINFILE  host packages, bridges, br-edge / br-router /
 #                                            br-controller, keys, host tools. The box keeps

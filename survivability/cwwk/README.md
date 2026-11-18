@@ -10,7 +10,7 @@ or switch goes in any port.
 | Host shell | `ssh root@100.64.0.11` (tailnet), then `pct enter 101/102/103` |
 | Field card | `docs/Black-Relay-Field-Card.pdf` (print one page; source `docs/field-card.html`) |
 | Runbook | `controller/README.md`: layout, ports, remote access, self-healing, hardening, host tools |
-| Another site box | `install/README.md`: kit + installer, site N on its own addresses, ~30 min |
+| Another site box | `bash install/new-site.sh` (asks for site number + address), then `bash cwwk-bootstrap.sh` at the new box's console. `install/README.md` has the whole flow. `br-status` shows installed/up; `br-verify` is the full proof |
 | Rebuild from bare metal | `as-built/cwwk01/README.md` |
 
 ## Folders
@@ -19,7 +19,8 @@ or switch goes in any port.
 |---|---|
 | `controller/` | Controller app (`app.py`, `index.html`, `status.html`) and the host tools (`br-hostinfo`, `br-port-roles`, `br-port-layout`, `br-rotate-secrets`, `br-controller-oidc`, `br-lockd`, `br-vault-init`, `br-port-lock`) |
 | `as-built/cwwk01/` | Redacted copy of the box's live configuration (host, edge, router, controller) |
-| `install/` | Quick install for another CWWK: `make-kit.sh` (Mac), `hub-add-site.sh` / `hub-publish-site.sh` (BR2026), `cwwk-install.sh` (new box), `spitz-setup.sh` |
+| `install/` | Quick install for another CWWK: `new-site.sh` (Mac, one command), `cwwk-bootstrap.sh` (new box, guided), `svc-sync.sh` (sf-dev services to sites + drift), and the parts they run: `make-kit.sh`, `hub-add-site.sh` / `hub-publish-site.sh` (BR2026), `cwwk-install.sh`, `spitz-setup.sh` |
+| `services/` | What runs from sf-dev on every site: `services.json` (catalogue), `br-svc-export` (packs a project into a bundle) |
 | `scripts/` | `snapshot-cwwk.sh` (refresh `as-built/`), `capture-cold-start.sh` (logs after a power-off test) |
 | `docs/` | Field card and site architecture HTML sources (with their PDFs), cold-start test |
 
