@@ -1,6 +1,6 @@
 # cwwk01: CWWK site box, as built
 
-Point-in-time copy of the CWWK's configuration, taken by `survivability/cwwk/scripts/snapshot-cwwk.sh`
+Point-in-time copy of the CWWK's configuration, taken by `ops/cwwk/scripts/snapshot-cwwk.sh`
 (time in `SNAPSHOT_TIME`). Re-run the script after any change on the box; it replaces
 `host/`, `edge/`, `router/` and `controller/` and keeps this file.
 
@@ -13,7 +13,7 @@ only on the Proxmox host in `/root/black-relay/` (root-only) and are never copie
 | path | what it is |
 |---|---|
 | `host/etc/network/interfaces` | Proxmox bridges: `vmbr10` all physical ports (VLAN-aware, STP; per-port untagged VLAN 100+i to `br-edge`, Wi-Fi VLAN 40 tagged), `vmbr1` site LAN, `vmbr2` edge↔router transit, `vmbr3` services |
-| `host/etc/pve/lxc/10{1,2,3}.conf` | Container definitions: NICs, bridges, VLAN tags, MACs, features (`/dev/net/tun`, nesting) |
+| `host/etc/pve/lxc/10{1,2,3,4}.conf` | Container definitions: NICs, bridges, VLAN tags, MACs, features (`/dev/net/tun`, nesting); 104 = br-services (Docker: RF console, Kismet, MQTT) |
 | `host/etc/systemd/system/br-*.service`, `host/usr/local/sbin/br-*` | Host tools: `br-port-roles` (client devices, rogue-DHCP guard), `br-port-layout` (any-port bridge), `br-hostinfo` (ports, temperatures, port blink), `br-controller-oidc`, `br-rotate-secrets` |
 | `host/etc/sysctl.d/` | Host kernel settings |
 | `host/tailscale.txt` | Tailnet name, address, tags (no Serve config: remote access goes through BR2026) |
@@ -25,7 +25,10 @@ only on the Proxmox host in `/root/black-relay/` (root-only) and are never copie
 | `edge/root/.ssh/authorized_keys` | Forced-command entry for the controller key (key blob removed) |
 | `router/uci-*.txt` | OpenWrt router: `uci export` of network, firewall, DHCP, wireless, system |
 | `controller/etc/br-controller/config.json` | Controller config with every secret field redacted |
-| `controller/deployed-sha256.txt` | Hashes of the deployed controller files, to compare with `survivability/cwwk/controller/` |
+| `state/` | What was actually running at snapshot time (evidence, not config): host bridges/VLANs/ports, edge addresses, `ip rule`, route tables 200/201, uplink caps, tunnel log, services |
+| `host/etc/br-port-roles.root-ok` | Ports exempt from STP root-guard (`nic0 nic1 nic2`; nic3 = Spitz keeps it): the venue switch can be the STP root |
+| `host/etc/sysctl.d/91-black-relay-subnet-router.conf`, `host/tailscale.txt` | The host is a Tailscale subnet router for 10.40.0.0/24 and 10.41.0.0/24 (all teams, via the BR2026 policy) |
+| `controller/deployed-sha256.txt` | Hashes of the deployed controller files, to compare with `ops/cwwk/controller/` |
 
 ## Rebuilding the box from this
 
@@ -36,7 +39,7 @@ only on the Proxmox host in `/root/black-relay/` (root-only) and are never copie
    - 101 `br-edge`: Debian 13, unprivileged, nesting, `/dev/net/tun`.
    - 102 `br-router`: OpenWrt LXC image.
    - 103 `br-controller`: Debian 13.
-2. **Edge (101):** install `black-relay-glorytun` 0.3.4+br7 or later (`survivability/multipath/packaging/build.sh`), join the
+2. **Edge (101):** install `black-relay-glorytun` 0.3.4+br7 or later (`multipath/packaging/build.sh`), join the
    hub with a site token (`black-relay-setup join <token>`, issued by the hub admin). Restore
    `edge/etc/` (nftables, networkd files, systemd drop-ins, `black-relay/` incl. `carriers.conf`) and
    `edge/usr/local/sbin/`; enable `br-lane-nurse`, `br-watchdog`, `br-dash`, `br-uplinks-recheck.timer`. Set `WSS_PREFIX` from
@@ -44,21 +47,21 @@ only on the Proxmox host in `/root/black-relay/` (root-only) and are never copie
 3. **Router (102):** `uci import` each `router/uci-*.txt`, re-enter the redacted values, set the root
    password (`/root/black-relay/router-root.pw` on the host). The LAN zone must forward within the
    zone (Wi-Fi and wired site devices share it).
-4. **Controller (103):** copy `survivability/cwwk/controller/` to `/opt/br-controller`, install the unit
+4. **Controller (103):** copy `ops/cwwk/controller/` to `/opt/br-controller`, install the unit
    with `br-controller-network.conf` (same folder) as a drop-in, restore `config.json` and fill the
    redacted fields:
    - admin password hash: set it from Settings, or regenerate
    - Proxmox token secret and router password: run `br-rotate-secrets` on the host
    - Pocket ID client: run `br-controller-oidc` on the host
-5. **Host tools and tailnet:** restore `host/` units and scripts (`br-port-roles`, `br-hostinfo`; sources in `survivability/cwwk/controller/`),
+5. **Host tools and tailnet:** restore `host/` units and scripts (`br-port-roles`, `br-hostinfo`; sources in `ops/cwwk/controller/`),
    `systemctl enable --now` them, SSH drop-in (keys only), and enroll Tailscale with a tag-only
    pre-auth key for `tag:proxmox-subnet-router`.
-6. **Site lock:** install `br-lockd` (+ unit) from `survivability/cwwk/controller/`, enable it, give the
+6. **Site lock:** install `br-lockd` (+ unit) from `ops/cwwk/controller/`, enable it, give the
    controller its cert and token (`lockd` in `config.json`), load the edge `nftables.conf` (it has
    the `site_open` gate), then run `br-vault-init` on the host with the USB stick plugged in. From
    then on the box starts locked.
 7. **Prove it:** controller **Setup → Run self-test**, everything green; then a cold start
-   (`survivability/cwwk/scripts/capture-cold-start.sh`, `survivability/cwwk/docs/cold-start-test.md`).
+   (`ops/cwwk/scripts/capture-cold-start.sh`, `ops/cwwk/docs/cold-start-test.md`).
 
 ## Where secrets come from (never in git)
 
@@ -70,3 +73,14 @@ only on the Proxmox host in `/root/black-relay/` (root-only) and are never copie
 | Router root password | `/root/black-relay/router-root.pw` (host) |
 | Proxmox API token | `/root/black-relay/pve-token.json` (host) |
 | Pocket ID client secret | Pocket ID admin UI; stored with `br-controller-oidc` |
+
+## Changes since the first snapshot (2026-11-08), all in this tree now
+- **2026-11-20 recovery:** port lock and USB lock files removed (GRUB recovery), root password reset (not stored), vault unlocked by the BRKEY stick.
+- **Edge boot race fixed:** `br-edge-routes` copies the tr0 routes into table 201 after they exist (new kits get this).
+- **STP root-guard:** `br-port-roles` reads `/etc/br-port-roles.root-ok`; the venue's managed switch is the STP root on nic1.
+- **Subnet router:** the host advertises 10.40.0.0/24 and 10.41.0.0/24 to the tailnet (policy: every team group; BR2026 `headscale-policy.hujson`).
+- **Spitz:** now cabled by its WAN port as the trunk to nic3 and on its own T-Mobile SIM: see `SPITZ.md`. Real carrier diversity: lanes arrive from two public IPs.
+- **Edge package is `black-relay-glorytun 0.3.4+br6`** while the hub and new kits run `br7` (same wire protocol; cwwk01 has not been upgraded: do it deliberately, not as part of a snapshot).
+- Snapshot script now also takes CT 104, `state/`, root-ok file, advertised routes.
+
+Hub side (BR2026) at the same time: see `../hub/README.md`.

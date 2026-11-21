@@ -236,7 +236,9 @@ wd_check() {
 	if ping -c 1 -W 2 -I "$d" "$peer" >/dev/null 2>&1; then
 		echo 0 >"$RUN/$n.wd"; return 0
 	fi
-	running=$(/usr/lib/black-relay/glorytun path dev "$d" show 2>/dev/null | grep -c " running ")
+	# grep -c prints 0 AND exits 1 when no path is running (site offline); under set -e that ended the
+	# whole supervisor, and with it every site's tunnel. An offline site is an outage, not a crash.
+	running=$(/usr/lib/black-relay/glorytun path dev "$d" show 2>/dev/null | grep -c " running " || true)
 	[ "$running" -gt 0 ] || { echo 0 >"$RUN/$n.wd"; return 0; }
 	f=$(( $(cat "$RUN/$n.wd" 2>/dev/null || echo 0) + 1 ))
 	echo "$f" >"$RUN/$n.wd"

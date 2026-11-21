@@ -20,4 +20,10 @@ if ip link show dev br0 2>/dev/null | grep -q ",UP"; then
 	ip route replace default dev br0 table $T
 	ip route replace default dev br0 metric 10
 fi
+# Keep the site table (201, copied by 'br-uplinks apply' before the tunnel starts) in step with the routes
+# above. On a cold boot apply runs before these routes exist, so the hub could not reach the site LAN
+# (remote controller 502, "host unreachable") until the tunnel was restarted by hand.
+if ip link show dev tr0 >/dev/null 2>&1; then
+	ip -4 route show dev tr0 | while read -r r; do ip route replace $r dev tr0 table 201 2>/dev/null; done
+fi
 exit 0

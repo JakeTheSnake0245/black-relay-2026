@@ -4,6 +4,7 @@
 #
 #   sudo bash hub-add-site.sh 2
 #
+# TRANSIT_LEN=29 registers a /29 transit (edge .1, firewall .2, controller .3: the Quezada / cwwk02 build).
 # Site N gets: transit 10.(39+8(N-1)).0.0/30, LAN 10.(40+8(N-1)).0.0/24,
 # services 10.(41+8(N-1)).0.0/24 (all inside 10.32.0.0/11), routed through its tunnel.
 # Writes ~/cwwkNN.join (0600, owned by you): the tunnel join token, the HTTPS lane
@@ -14,7 +15,7 @@ N=${1:-}
 [[ "$N" =~ ^[2-9]$ ]] || { echo "usage: sudo bash hub-add-site.sh <site number 2-9>"; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 SITE=cwwk$(printf %02d "$N"); O=$((8 * (N - 1)))
-TR=10.$((39 + O)).0.0/30 LAN=10.$((40 + O)).0.0/24 SVC=10.$((41 + O)).0.0/24
+TR=10.$((39 + O)).0.0/${TRANSIT_LEN:-30} LAN=10.$((40 + O)).0.0/24 SVC=10.$((41 + O)).0.0/24
 HUB=survivability-black-relay HS=survivability-headscale
 OWNER=${SUDO_USER:-root}; HOMEDIR=$(getent passwd "$OWNER" | cut -d: -f6)
 OUT=$HOMEDIR/$SITE.join

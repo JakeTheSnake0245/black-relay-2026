@@ -225,6 +225,78 @@ class Router:
         raise RuntimeError("router session")
 
 
+class OpnRouter:
+    """OPNsense (API key + secret) standing in for the OpenWrt router. Answers the few ubus calls the
+    controller makes, in the same shapes, so a site whose router is OPNsense (the Quezada build) shows the
+    same Network page. Selected by "router": {"kind": "opnsense", "host", "key", "secret", ...}."""
+
+    NAMES = {"wan": "wan", "lan": "lan", "opt2": "svc"}
+
+    def __init__(self, c):
+        self.host, self.ca, self.insecure = c["host"], c.get("cafile"), c.get("insecure") is True
+        self.auth = "Basic " + base64.b64encode(("%s:%s" % (c["key"], c["secret"])).encode()).decode()
+
+    def _api(self, path):
+        return https_json(self.host, 443, "GET", path, headers={"Authorization": self.auth},
+                          cafile=self.ca, insecure=self.insecure)
+
+    @staticmethod
+    def _seconds(s):
+        m = re.match(r"^(?:(\d+) days?, )?(\d+):(\d+):(\d+)$", str(s or "").strip())
+        return int(m.group(1) or 0) * 86400 + int(m.group(2)) * 3600 + int(m.group(3)) * 60 + int(m.group(4)) if m else 0
+
+    def call(self, obj, method, args=None):
+        if (obj, method) == ("system", "info"):
+            t = self._api("/api/diagnostics/system/system_time")
+            mem = self._api("/api/diagnostics/system/system_resources").get("memory", {})
+            total, used = int(mem.get("total") or 0), int(mem.get("used") or 0)
+            try:
+                load = [int(float(x) * 65536) for x in str(t.get("loadavg", "")).split(",")[:3]]
+            except ValueError:
+                load = []
+            return {"uptime": self._seconds(t.get("uptime")), "load": load, "memory": {"total": total, "free": max(0, total - used)}}
+        if (obj, method) == ("system", "board"):
+            v = self._api("/api/diagnostics/system/system_information")
+            return {"hostname": v.get("name"), "model": "OPNsense (VM)", "release": {"description": (v.get("versions") or ["OPNsense"])[0]}}
+        if (obj, method) == ("network.interface", "dump"):
+            out = []
+            for r in self._api("/api/interfaces/overview/interfacesInfo").get("rows", []):
+                ident = r.get("identifier") or ""
+                if not ident or ident.startswith("lo"):
+                    continue
+                name = self.NAMES.get(ident) or (r.get("description") or ident).lower()
+                addrs = []
+                a4 = r.get("addr4") or ""
+                if "/" in a4:
+                    ip, _, mask = a4.partition("/")
+                    addrs.append({"address": ip, "mask": int(mask)})
+                out.append({"interface": name, "up": r.get("status") == "up", "ipv4-address": addrs,
+                            "l3_device": r.get("device"), "uptime": None})
+            return {"interface": out}
+        if (obj, method) == ("luci-rpc", "getDHCPLeases"):
+            rows = self._api("/api/dnsmasq/leases/search?current=1&rowCount=-1").get("rows", [])
+            now = time.time()
+            return {"dhcp_leases": [{"hostname": r.get("hostname") if r.get("hostname") not in (None, "*") else "",
+                                     "ipaddr": r.get("address"), "macaddr": r.get("hwaddr"),
+                                     "expires": max(0, int(float(r.get("expire") or 0) - now)) if r.get("expire") else 0}
+                                    for r in rows]}
+        if (obj, method) == ("service", "list"):
+            # the unit list only checks "is it running": dnsmasq from OPNsense's own service table, the rest = the API answers
+            run = {}
+            try:
+                for r in self._api("/api/core/service/search?current=1&rowCount=-1").get("rows", []):
+                    run[r.get("id") or r.get("name")] = bool(r.get("running"))
+            except Exception:
+                pass
+            up = lambda v: {"instances": {"i": {"running": bool(v)}}}
+            return {"dnsmasq": up(run.get("dnsmasq", run.get("unbound", True))), "uhttpd": up(True), "rpcd": up(True), "dropbear": up(True)}
+        raise RuntimeError("opnsense: no mapping for %s.%s" % (obj, method))
+
+
+def make_router(c):
+    return OpnRouter(c) if c.get("kind") == "opnsense" else Router(c)
+
+
 def host_info(path, body=None, timeout=4):
     """Read-only host facts (br-hostinfo on the Proxmox host): ports, temps, blink."""
     h = CONF.get("hostinfo", {"host": "10.40.0.2", "port": 8091})
@@ -1242,7 +1314,7 @@ def problems(snap, subs):
 
 
 def poller():
-    pve, router = Proxmox(CONF["proxmox"]), Router(CONF["router"])
+    pve, router = Proxmox(CONF["proxmox"]), make_router(CONF["router"])
     prev = {}
     while True:
         t0 = time.time()

@@ -21,6 +21,10 @@ TPL=debian-13-standard_13.6-1_amd64.tar.zst
 A=$(ip -4 -o addr show vmbr1 2>/dev/null | sed -n 's/.* 10\.\([0-9]*\)\.0\.2\/24 .*/\1/p' | head -1)
 [ -n "$A" ] || { echo "no site LAN on vmbr1: not a site box"; exit 1; }
 S=10.$((A + 1)).0 SITE=cwwk$(printf %02d $(( (A - 40) / 8 + 1 )))
+IE=/root/black-relay/install.env     # written by the installer: storage and install network of this box
+STORE=$(sed -n 's/^STORE=//p' $IE 2>/dev/null); STORE=${STORE:-local-lvm}
+NET9=$(sed -n 's/^NET9=//p' $IE 2>/dev/null); NET9=${NET9:-name=eth9,bridge=vmbr0,ip=dhcp,type=veth}
+MG=$(echo "$NET9" | sed -n 's/.*bridge=\([^,]*\).*/\1/p'); MG=${MG:-vmbr0}
 say() { printf '\n== %s\n' "$*"; }
 die() { echo "STOP: $*" >&2; exit 1; }
 ctx() { pct exec $SVC -- "$@"; }
@@ -29,13 +33,14 @@ up()  { [ "$(pct status $SVC 2>/dev/null | cut -d' ' -f2)" = running ]; }
 # ------------------------------------------------------------------ init
 cmd_init() {
 	if pct status $SVC >/dev/null 2>&1; then
+		pct config $SVC | grep -q '^hostname: br-services' || die "CT $SVC exists and is not br-services (it is '$(pct config $SVC | sed -n 's/^hostname: //p')'): not touching it"
 		up || pct start $SVC
 		echo "CT $SVC exists: checking Docker"
 	else
 		[ -f /var/lib/vz/template/cache/$TPL ] || die "container template $TPL missing"
 		say "creating CT $SVC br-services ($S.20)"
 		pct create $SVC local:vztmpl/$TPL --hostname br-services --cores 4 --memory 4096 --swap 512 \
-			--rootfs local-lvm:60 --unprivileged 1 --features nesting=1,keyctl=1 --onboot 1 --startup order=4 \
+			--rootfs $STORE:60 --unprivileged 1 --features nesting=1,keyctl=1 --onboot 1 --startup order=4 \
 			--nameserver $S.1 --searchdomain lan --ostype debian --tags br-gated \
 			-net0 "name=eth0,bridge=vmbr3,ip=$S.20/24,gw=$S.1,type=veth" \
 			--description "Black Relay services host ($SITE): Docker for the Sensor Fusion services. Address $S.20. Use br-svc on the Proxmox host." >/dev/null || die "pct create failed"
@@ -45,15 +50,28 @@ cmd_init() {
 	ctx true 2>/dev/null || die "CT $SVC did not start"
 	# internet for the package install: the temporary install network if it still exists (new site
 	# before 'ports'), otherwise the normal route through the router and tunnel
+	# On a new site that is the normal case: the router has no way out yet, so the CT borrows the install
+	# network exactly as br-edge does: a second NIC on the install bridge (DHCP, its own default route), the static NIC
+	# without a gateway (two default routes would race), and a public DNS (the router's DNS is a dead end).
+	# Both are put back at the end.
 	TMPNET=0
+	NET0="name=eth0,bridge=vmbr3,ip=$S.20/24,type=veth"
+	HW=$(pct config $SVC | sed -n 's/^net0:.*hwaddr=\([0-9A-Fa-f:]*\).*/\1/p')
+	[ -n "$HW" ] && NET0="$NET0,hwaddr=$HW"
 	if ! ctx getent hosts deb.debian.org >/dev/null 2>&1; then
-		if ip link show vmbr0 >/dev/null 2>&1; then
-			pct set $SVC -net9 "name=eth9,bridge=vmbr0,ip=dhcp,type=veth" && TMPNET=1
-			pct reboot $SVC >/dev/null 2>&1 || { pct stop $SVC; pct start $SVC; }
+		if ip -4 addr show $MG 2>/dev/null | grep -q 'inet '; then
+			echo "  no way out through the site router yet: using the install network for the downloads"
+			pct shutdown $SVC --timeout 20 >/dev/null 2>&1 || pct stop $SVC >/dev/null 2>&1
+			pct set $SVC -net0 "$NET0" -net9 "$NET9" -nameserver 1.1.1.1 >/dev/null && TMPNET=1
+			pct start $SVC
 			for _ in $(seq 1 30); do ctx getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done
 		fi
 	fi
-	ctx getent hosts deb.debian.org >/dev/null 2>&1 || die "CT $SVC has no internet (check the tunnel, or the install network)"
+	if ! ctx getent hosts deb.debian.org >/dev/null 2>&1; then
+		[ $TMPNET = 1 ] && { pct shutdown $SVC --timeout 20 >/dev/null 2>&1 || pct stop $SVC >/dev/null 2>&1
+			pct set $SVC -delete net9 >/dev/null; pct set $SVC -net0 "$NET0,gw=$S.1" -nameserver $S.1 >/dev/null; pct start $SVC; }
+		die "CT $SVC has no internet (check the tunnel, or the install network)"
+	fi
 	if ! ctx sh -c 'command -v docker >/dev/null && docker compose version >/dev/null 2>&1'; then
 		say "Docker in CT $SVC"
 		ctx sh -c 'export DEBIAN_FRONTEND=noninteractive
@@ -78,8 +96,14 @@ cmd_init() {
 		ctx docker run --rm alpine:3 true >/dev/null 2>&1 || die "containers cannot run in CT $SVC (docker run alpine failed)"
 	fi
 	ctx docker network inspect fusion >/dev/null 2>&1 || ctx docker network create fusion >/dev/null
-	if [ $TMPNET = 1 ]; then pct stop $SVC; pct set $SVC -delete net9; pct start $SVC
-		for _ in $(seq 1 30); do ctx docker info >/dev/null 2>&1 && break; sleep 2; done; fi
+	if [ $TMPNET = 1 ]; then   # back to the site network only: the install network ends with 'ports'
+		pct shutdown $SVC --timeout 30 >/dev/null 2>&1 || pct stop $SVC >/dev/null 2>&1
+		pct set $SVC -delete net9 >/dev/null && pct set $SVC -net0 "$NET0,gw=$S.1" -nameserver $S.1 >/dev/null || die "could not put CT $SVC back on the site network"
+		pct start $SVC
+		for _ in $(seq 1 30); do ctx docker info >/dev/null 2>&1 && break; sleep 2; done
+		ctx docker info >/dev/null 2>&1 || die "Docker did not come back in CT $SVC after leaving the install network"
+		ctx ip -4 route show default | grep -q "via $S.1" || echo "  note: default route inside CT $SVC is not via $S.1 yet (it comes with the tunnel)"
+	fi
 	echo "services host ready: CT $SVC, $S.20, Docker $(ctx docker version --format '{{.Server.Version}}' 2>/dev/null), network 'fusion'"
 }
 

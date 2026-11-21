@@ -8,12 +8,16 @@
 #             br-port-roles then switches a port to the site LAN when a client device
 #             is plugged in. Ports are discovered, not listed. Arms a 15-minute rollback.
 #   confirm   keep the layout (cancels the automatic rollback).
-#   rollback  restore the layout from before `unify`.
+#   adopt     for a box that already runs other things (install.env: ADOPT=1): only the ports
+#             listed there (free ones) join vmbr10, with the same VLAN plan. No other bridge,
+#             port, route or file is changed. Arms the same 15-minute rollback.
+#   rollback  restore the layout from before `unify` / `adopt`.
 #   status    show what is where.
 #
 # Spanning tree guards the one real failure: the same device cabled into two ports.
 set -euo pipefail
 B=/root/black-relay/port-layout-backup-unify
+IE=/root/black-relay/install.env
 IF=/etc/network/interfaces
 EDGE=101 ROUTER=102 BR=vmbr10 WIFI=40 SVC=41 BASE=100
 log() { echo "br-port-layout: $*"; logger -t br-port-layout "$*"; }
@@ -32,6 +36,9 @@ arm() {
 }
 
 unify() {
+	if [ "$(sed -n 's/^ADOPT=//p' $IE 2>/dev/null)" = 1 ]; then
+		log "this box was added to (ADOPT=1): 'unify' would take EVERY port. Use 'adopt' (only the ports in $IE)."; exit 1
+	fi
 	if [ ! -d $B ]; then
 		mkdir -p $B && chmod 700 $B
 		cp -p $IF /etc/hosts $B/
@@ -130,9 +137,81 @@ PY
 	log "unify done: any port takes anything"
 }
 
+
+# ------------------------------------------------------------------ adopt (existing box: add, don't replace)
+adopt() {
+	[ -r $IE ] || { log "no $IE: run cwwk-install.sh install first"; exit 1; }
+	local PORTS n i m P
+	PORTS=$(sed -n 's/^PORTS="\(.*\)"$/\1/p' $IE); read -ra P <<<"$PORTS"
+	[ ${#P[@]} -ge 1 ] || { log "$IE lists no ports"; exit 1; }
+	for n in "${P[@]}"; do
+		[ -e /sys/class/net/$n/device ] || { log "port $n does not exist: nothing changed"; exit 1; }
+		m=$(basename "$(readlink /sys/class/net/$n/master 2>/dev/null)" 2>/dev/null || true)
+		[ -z "$m" ] || [ "$m" = $BR ] || { log "port $n is in use by $m: not touching it. Nothing changed."; exit 1; }
+	done
+	ip link show $BR >/dev/null 2>&1 || { log "$BR is not up (cwwk-install.sh install makes it)"; exit 1; }
+	if [ ! -d $B ]; then
+		mkdir -p $B && chmod 700 $B
+		cp -p $IF /etc/hosts $B/
+		pct config $EDGE >$B/$EDGE.conf; pct config $ROUTER >$B/$ROUTER.conf
+		pct exec $ROUTER -- uci export network >$B/router-network.uci
+	fi
+	touch $B/adopt
+	# the file that boots into this state: only vmbr10's port list and the stanzas of OUR ports change
+	cp -p $B/interfaces $B/interfaces.new
+	python3 - "$B/interfaces.new" "$BR" "$WIFI" "$SVC" "$BASE" "${P[@]}" <<'PY' || { log "could not prepare the interfaces file: nothing changed"; exit 1; }
+import re, sys
+p, br, wifi, svc, base, ports = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6:]
+s = open(p).read()
+for n in ports:   # a stanza these ports may already have (only 'inet manual' ones can: they are free ports)
+    s = re.sub(r"(?m)^(auto %s\n)?iface %s inet manual\n(?:[ \t]+.*\n)*" % (re.escape(n), re.escape(n)), "", s)
+m = re.search(r"(?m)^iface %s inet manual\n(?:[ \t]+.*\n)*" % re.escape(br), s)
+if not m:
+    sys.exit("no stanza for " + br)
+blk = m.group(0)
+nb = re.sub(r"(?m)^([ \t]+bridge-ports ).*$", lambda x: x.group(1) + " ".join(ports), blk)
+nb = re.sub(r"(?m)^([ \t]+bridge-vids ).*$", lambda x: "%s%s %s %d-%d" % (x.group(1), wifi, svc, base, base + len(ports) - 1), nb)
+s = s.replace(blk, nb)
+add = ["", "# Black Relay: the ports given to the site. Each: its own untagged VLAN (a modem -> br-edge up<i>),",
+       "# the Wi-Fi / site LAN VLAN and the services VLAN tagged (an access point or a switch -> br-router)."]
+for i, n in enumerate(ports):
+    add += [f"iface {n} inet manual", f"\tbridge-pvid {base + i}", f"\tbridge-vids {wifi} {svc}", ""]
+open(p, "w").write(s.rstrip("\n") + "\n" + "\n".join(add))
+PY
+	arm
+	i=0
+	for n in "${P[@]}"; do
+		ip link set $n nomaster 2>/dev/null || true
+		ip link set $n master $BR; ip link set $n up
+		bridge vlan del dev $n vid 1 2>/dev/null || true
+		bridge vlan add dev $n vid $((BASE + i)) pvid untagged
+		bridge vlan add dev $n vid $WIFI
+		bridge vlan add dev $n vid $SVC
+		i=$((i + 1))
+	done
+	install -m 0644 $B/interfaces.new $IF
+	ifquery -a -c 2>&1 | grep -q "\[fail\]" && log "note: ifquery reports differences (see ifquery -a -c)" || true
+	pct exec $EDGE -- networkctl reconfigure $(for k in $(seq 0 $((${#P[@]} - 1))); do printf "up%s " $k; done) || true
+	systemctl enable --now br-port-roles >/dev/null 2>&1 || true
+	log "adopt done: ${P[*]} are on $BR; no other bridge, port, route or file was changed"
+}
+
+rollback_adopt() {
+	log "rolling back: the ports given to Black Relay leave $BR; nothing else is touched"
+	systemctl disable --now br-port-roles >/dev/null 2>&1
+	nft delete table bridge br_port_roles 2>/dev/null
+	local n; for n in $(sed -n 's/^PORTS="\(.*\)"$/\1/p' $IE); do ip link set $n nomaster 2>/dev/null; done
+	cp -p $B/interfaces $IF
+	pct exec $EDGE -- networkctl reconfigure up0 up1 up2 up3 up4 up5 2>/dev/null
+	rm -f $B/adopt
+	disarm
+	log "rolled back"
+}
+
 rollback() {
 	[ -d $B ] || { log "no backup: nothing to roll back"; exit 1; }
 	set +e
+	[ -f $B/adopt ] && { rollback_adopt; return; }
 	log "rolling back to the layout from before unify"
 	systemctl disable --now br-port-roles >/dev/null 2>&1
 	nft delete table bridge br_port_roles 2>/dev/null
@@ -173,8 +252,9 @@ status() {
 
 case "${1:-status}" in
 	unify) unify ;;
+	adopt) adopt ;;
 	confirm) disarm; log "kept the new layout" ;;
 	rollback) rollback ;;
 	status) status ;;
-	*) echo "usage: br-port-layout unify|confirm|rollback|status" >&2; exit 2 ;;
+	*) echo "usage: br-port-layout unify|adopt|confirm|rollback|status" >&2; exit 2 ;;
 esac

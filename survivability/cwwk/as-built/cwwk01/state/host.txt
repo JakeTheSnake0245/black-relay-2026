@@ -1,0 +1,108 @@
+# pveversion
+pve-manager/9.2.2/b9984c6d90a4bd80 (running kernel: 7.0.2-6-pve)
+
+# pct list
+VMID       Status     Lock         Name                
+101        running                 br-edge             
+102        running                 br-router           
+103        running                 br-controller       
+104        running                 br-services         
+
+# free / df
+               total        used        free      shared  buff/cache   available
+Mem:           15763        2405       12224          91        1519       13357
+Swap:           8191           0        8191
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/pve-root   68G  4.7G   60G   8% /
+/dev/mapper/pve-root   68G  4.7G   60G   8% /
+
+# host ip -br addr
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+nic0             DOWN           
+nic1             UP             
+nic2             DOWN           
+nic3             UP             
+vmbr1            UP             10.40.0.2/24 fe80::c3:94ff:fe33:f35e/64 
+vmbr2            UP             
+vmbr3            UP             
+vmbr10           UP             
+veth101i1@if2    UP             
+veth101i2@if3    UP             
+veth101i3@if4    UP             
+veth101i4@if5    UP             
+veth101i5@if6    UP             
+tailscale0       UNKNOWN        100.64.0.11/32 fe80::cdb4:e863:6c78:916/64 
+veth102i0@if2    UP             
+veth104i0@if2    UP             
+veth102i1@if3    UP             
+veth102i2@if4    UP             
+veth102i4@if5    UP             
+veth102i5@if6    UP             
+veth103i0@if2    UP             
+
+# bridge -d link
+2: nic0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 master vmbr10 state disabled priority 32 cost 5 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+3: nic1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr10 state forwarding priority 32 cost 5 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+4: nic2: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 master vmbr10 state disabled priority 32 cost 4 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+5: nic3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr10 state forwarding priority 32 cost 4 
+    hairpin off guard off root_block on fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 1 mcast_max_groups 0 
+10: veth101i1@nic0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr10 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+11: veth101i2@nic1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr10 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+12: veth101i3@nic2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr10 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+13: veth101i4@nic3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr2 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+14: veth101i5@vmbr1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr10 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+16: veth102i0@nic0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr1 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+17: veth104i0@nic0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr3 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+18: veth102i1@nic1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr2 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+19: veth102i2@nic2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr3 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+20: veth102i4@nic3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr10 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+21: veth102i5@vmbr1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr10 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+22: veth103i0@nic0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master vmbr1 state forwarding priority 32 cost 2 
+    hairpin off guard off root_block off fastleave off learning on flood on mcast_flood on bcast_flood on mcast_router 1 mcast_to_unicast off neigh_suppress off neigh_vlan_suppress off vlan_tunnel off isolated off locked off mab off mcast_n_groups 0 mcast_max_groups 0 
+
+# bridge vlan
+port              vlan-id  
+nic0              40
+                  41
+                  100 PVID Egress Untagged
+nic1              40
+                  41
+                  101 PVID Egress Untagged
+nic2              40
+                  41
+                  102 PVID Egress Untagged
+nic3              40
+                  41
+                  103 PVID Egress Untagged
+vmbr1             1 PVID Egress Untagged
+vmbr2             1 PVID Egress Untagged
+vmbr3             1 PVID Egress Untagged
+vmbr10            1 PVID Egress Untagged
+veth101i1         100 PVID Egress Untagged
+veth101i2         101 PVID Egress Untagged
+veth101i3         102 PVID Egress Untagged
+veth101i4         1 PVID Egress Untagged
+veth101i5         103 PVID Egress Untagged
+veth102i0         1 PVID Egress Untagged
+veth104i0         1 PVID Egress Untagged
+veth102i1         1 PVID Egress Untagged
+veth102i2         1 PVID Egress Untagged
+veth102i4         40 PVID Egress Untagged
+veth102i5         41 PVID Egress Untagged
+veth103i0         1 PVID Egress Untagged
+
+# failed units (host)

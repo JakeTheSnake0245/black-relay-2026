@@ -4,7 +4,8 @@
 #   ->  site N tunnel  ->  controller gateway N's LAN .10:8444  (Pocket ID sign-in)
 # Run on BR2026 (sudo) once the site's tunnel is up (cwwk-install.sh finish).
 #
-#   sudo bash hub-publish-site.sh 2
+#   sudo bash hub-publish-site.sh 2            (full site: controller at LAN .10)
+#   sudo GW=10.47.0.3 bash hub-publish-site.sh 2   (Quezada build / cwwk02: controller listener on the transit)
 #
 # Pins the controller's own certificate (fetched through the tunnel). Caddy is
 # validated before the change and restored if the reload fails. Prints no secrets.
@@ -14,6 +15,7 @@ N=${1:-}
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 SITE=cwwk$(printf %02d "$N"); L=10.$((40 + 8 * (N - 1))).0
 HP=$((8443 + N))
+GW=${GW:-$L.10}      # the controller's remote-access listener: LAN .10 on a full site; the Quezada build (cwwk02) has it on the transit: GW=10.47.0.3
 HUB=survivability-black-relay CADDY=survivability-caddy CF=/srv/edge/Caddyfile
 PUB=/srv/black-relay/etc/publish.conf
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -25,16 +27,16 @@ docker exec $HUB black-relay-hub list | awk -v s="$SITE" '$1==s && $5=="active" 
 
 echo "== the controller's certificate, through the tunnel"
 pid=$(docker inspect -f '{{.State.Pid}}' $HUB)
-der=$(nsenter -t "$pid" -n timeout 10 openssl s_client -connect "$L.10:8444" -servername br-controller </dev/null 2>/dev/null |
+der=$(nsenter -t "$pid" -n timeout 10 openssl s_client -connect "$GW:8444" -servername br-controller </dev/null 2>/dev/null |
 	openssl x509 -outform DER 2>/dev/null | base64 -w0)
-[ -n "$der" ] || { echo "no answer from $L.10:8444 through the tunnel"; exit 1; }
+[ -n "$der" ] || { echo "no answer from $GW:8444 through the tunnel"; exit 1; }
 echo "$der" | base64 -d | openssl x509 -inform DER -noout -subject -ext subjectAltName 2>/dev/null | tr -s ' \n' ' '; echo
 
-echo "== hub: multithread:$HP -> $L.10:8444"
+echo "== hub: multithread:$HP -> $GW:8444"
 if grep -qE "^$HP[[:space:]]" "$PUB"; then
 	echo "already published"
 else
-	printf '# %s controller remote access (headscale.l8s.dev/cwwk%s/)\n%s %s.10 8444\n' "$SITE" "$N" "$HP" "$L" >>"$PUB"
+	printf '# %s controller remote access (headscale.l8s.dev/cwwk%s/)\n%s %s 8444\n' "$SITE" "$N" "$HP" "$GW" >>"$PUB"
 fi
 docker exec $HUB br-supervise publish
 

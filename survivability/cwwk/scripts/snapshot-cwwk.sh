@@ -16,7 +16,7 @@ ssh -o ConnectTimeout=10 "$HOST" 'bash -s' >"$TMP/snap.tar" <<'REMOTE'
 set -euo pipefail
 T=$(mktemp -d /root/.cwwk-snap.XXXXXX); chmod 700 "$T"
 trap 'rm -rf "$T"' EXIT
-mkdir -p "$T"/{host,edge,router,controller}
+mkdir -p "$T"/{host,edge,router,controller,state}
 cp_host() { for f in "$@"; do [ -e "$f" ] || continue; mkdir -p "$T/host$(dirname "$f")"; cp -p "$f" "$T/host$f"; done; }
 ct_cat() { # ct path dest-subdir
 	pct exec "$1" -- sh -c "[ -f '$2' ] && cat '$2'" >"$T/tmpf" 2>/dev/null || { rm -f "$T/tmpf"; return 0; }
@@ -27,13 +27,15 @@ ct_glob() { # ct glob dest-subdir
 }
 
 # ---- host (Proxmox)
-cp_host /etc/network/interfaces /etc/network/interfaces.d/* /etc/pve/lxc/101.conf /etc/pve/lxc/102.conf /etc/pve/lxc/103.conf
+cp_host /etc/network/interfaces /etc/network/interfaces.d/* /etc/pve/lxc/101.conf /etc/pve/lxc/102.conf /etc/pve/lxc/103.conf /etc/pve/lxc/104.conf
+cp_host /etc/br-port-roles.root-ok /etc/br-port-layout.json /etc/hosts /etc/chrony/chrony.conf /etc/ssh/sshd_config.d/*.conf
 cp_host /etc/systemd/system/br-*.service /etc/systemd/system/br-*.timer /usr/local/sbin/br-* /etc/sysctl.d/*.conf
 cp_host /etc/br-lockd/config.json /etc/br-lockd/cert.pem /etc/pve/storage.cfg   # site lock settings (token and key stay on the host)
 for d in /etc/systemd/system/*.service.d; do [ -d "$d" ] && cp_host "$d"/*.conf; done
 { echo "# tailscale serve status"; tailscale serve status 2>&1 || true
   echo; echo "# tailscale ip / tags"; tailscale ip -4 2>&1 || true
   tailscale status --self --json 2>/dev/null | python3 -c 'import json,sys;s=json.load(sys.stdin)["Self"];print(s["DNSName"],s.get("Tags"))' || true
+  echo; echo "# advertised subnet routes"; tailscale debug prefs 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin).get("AdvertiseRoutes"))' || true
 } >"$T/host/tailscale.txt"
 { echo "# pveum role BlackRelayController"; pveum role list --output-format json 2>/dev/null | python3 -c 'import json,sys;[print(r["roleid"],r.get("privs")) for r in json.load(sys.stdin) if r["roleid"].startswith("BlackRelay")]' || true
   echo "# API tokens (ids only; secrets in /root/black-relay/pve-token.json)"; pveum user token list br-controller@pve --output-format json 2>/dev/null | python3 -c 'import json,sys;[print("br-controller@pve!"+t["tokenid"],"privsep="+str(t.get("privsep"))) for t in json.load(sys.stdin)]' || true
@@ -59,6 +61,23 @@ done
 ct_cat 103 /etc/br-controller/config.json controller
 ct_glob 103 "/etc/systemd/system/br-controller*.service" controller
 pct exec 103 -- sh -c 'cd /opt/br-controller && sha256sum app.py index.html status.html 2>/dev/null' >"$T/controller/deployed-sha256.txt" || true
+
+# ---- live state (evidence, not config): what was actually running when the snapshot was taken
+mkdir -p "$T/state"
+{ echo "# pveversion"; pveversion; echo; echo "# pct list"; pct list; echo; echo "# free / df"; free -m; df -h / /var/lib/vz 2>/dev/null
+  echo; echo "# host ip -br addr"; ip -br addr; echo; echo "# bridge -d link"; bridge -d link; echo; echo "# bridge vlan"; bridge vlan show
+  echo; echo "# failed units (host)"; systemctl --failed --no-legend || true
+} >"$T/state/host.txt" 2>&1
+{ echo "# packages"; pct exec 101 -- sh -c 'dpkg -l | grep -iE "black-relay|wstunnel|nftables|dnsmasq" || true'
+  echo; echo "# ip -br addr"; pct exec 101 -- ip -br addr
+  echo; echo "# ip rule"; pct exec 101 -- ip rule
+  echo; echo "# main routes"; pct exec 101 -- ip route
+  echo; echo "# table 201 (site routes)"; pct exec 101 -- ip route show table 201
+  echo; echo "# uplinks"; pct exec 101 -- sh -c 'cat /etc/black-relay/br0.conf | grep -E "^(UPLINKS|WSS_LANES|WSS_PREFIX|HUB|SERVER|PORT|TRANSPORT)" || true'
+  echo; echo "# units"; pct exec 101 -- systemctl --failed --no-legend
+  echo; echo "# tunnel"; pct exec 101 -- sh -c 'systemctl is-active black-relay@br0; journalctl -u black-relay@br0 -n 12 --no-pager 2>/dev/null | cut -c1-200'
+} >"$T/state/edge.txt" 2>&1
+{ pct exec 104 -- sh -c 'docker ps --format "{{.Names}}	{{.Image}}	{{.Status}}"' ; } >"$T/state/services.txt" 2>&1 || true
 
 # ---- redact everything in place (on the host)
 python3 - "$T" <<'PY'
@@ -112,6 +131,6 @@ date -u +%Y-%m-%dT%H:%M:%SZ >"$T/SNAPSHOT_TIME"
 tar -C "$T" -cf - .
 REMOTE
 
-rm -rf "$OUT"/{host,edge,router,controller} "$OUT/SNAPSHOT_TIME"
+rm -rf "$OUT"/{host,edge,router,controller,state} "$OUT/SNAPSHOT_TIME"
 tar -C "$OUT" -xf "$TMP/snap.tar"
 echo "snapshot written to $OUT ($(cat "$OUT/SNAPSHOT_TIME")); $(find "$OUT" -type f | wc -l | tr -d ' ') files"

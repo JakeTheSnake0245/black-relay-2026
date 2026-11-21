@@ -1,0 +1,3 @@
+rf-central-rf-console-1	black-relay/rf-console:dev	Up 5 hours (healthy)
+rf-central-mqtt-1	eclipse-mosquitto:2.0.22	Up 5 hours
+rf-central-kismet-server-1	black-relay/rf-kismet-server:2026-10-R1	Up 5 hours (healthy)

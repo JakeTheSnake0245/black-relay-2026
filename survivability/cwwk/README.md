@@ -8,7 +8,7 @@ or switch goes in any port.
 |---|---|
 | Controller | https://headscale.l8s.dev/cwwk/ (anywhere, Pocket ID) · https://10.40.0.10 (on site) |
 | Host shell | `ssh root@100.64.0.11` (tailnet), then `pct enter 101/102/103` |
-| Field card | `docs/Black-Relay-Field-Card.pdf` (print one page; source `docs/field-card.html`) |
+| Field card | `../../docs/Black-Relay-Field-Card.pdf` (print one page; source `docs/field-card.html`) |
 | Runbook | `controller/README.md`: layout, ports, remote access, self-healing, hardening, host tools |
 | Another site box | `bash install/new-site.sh` (asks for site number + address), then `bash cwwk-bootstrap.sh` at the new box's console. `install/README.md` has the whole flow. `br-status` shows installed/up; `br-verify` is the full proof |
 | Rebuild from bare metal | `as-built/cwwk01/README.md` |
@@ -22,10 +22,10 @@ or switch goes in any port.
 | `install/` | Quick install for another CWWK: `new-site.sh` (Mac, one command), `cwwk-bootstrap.sh` (new box, guided), `svc-sync.sh` (sf-dev services to sites + drift), and the parts they run: `make-kit.sh`, `hub-add-site.sh` / `hub-publish-site.sh` (BR2026), `cwwk-install.sh`, `spitz-setup.sh` |
 | `services/` | What runs from sf-dev on every site: `services.json` (catalogue), `br-svc-export` (packs a project into a bundle) |
 | `scripts/` | `snapshot-cwwk.sh` (refresh `as-built/`), `capture-cold-start.sh` (logs after a power-off test) |
-| `docs/` | Field card and site architecture HTML sources (with their PDFs), cold-start test |
+| `docs/` | Field card and site architecture HTML sources (PDFs in the top-level `docs/`), cold-start test |
 
 The multipath parts that run on br-edge (`br-uplinks`, `br-ctl`, the tunnel package, the live
-dashboard) are in `../multipath/`.
+dashboard) are in `../../multipath/`.
 
 ## Deploying a change
 

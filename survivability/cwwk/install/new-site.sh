@@ -8,7 +8,9 @@
 # It does, in order:  checks -> BR2026 registers the site (asks for your sudo password once)
 # -> pack the services from sf-dev -> build the kit from cwwk01 -> copy kit + join file to the new box
 # -> start the bootstrap there.
-# The bootstrap stops at the point only a person can do (network move from the console);
+# A box that already runs other things (guests, bridges) is added to, never rebuilt: only guest IDs
+# 101-104, the vmbr1/2/3/10 names and free ports are used; if one is taken it stops before changing anything.
+# On a fresh box the bootstrap stops at the point only a person can do (network move from the console);
 # the message says exactly what to type. Nothing here prints or stores a secret on the Mac
 # beyond a temporary join file, which is deleted at the end.
 #
@@ -34,10 +36,19 @@ step "1/6 checks"
 ssh "${SSHO[@]}" "root@$HOST" true 2>/dev/null || { echo "  no key login yet: setting it up (type the box's root password once)"; ssh-copy-id -o ConnectTimeout=8 "root@$HOST" || die "could not copy your SSH key to root@$HOST"; }
 ssh "${SSHO[@]}" "root@$HOST" 'pveversion | grep -q "^pve-manager/9\." && echo "  new box: Proxmox 9 ok ($(hostname))"' ||
 	die "cannot log in to root@$HOST with your SSH key, or it is not Proxmox VE 9 (ssh-copy-id root@$HOST)"
-ssh "${SSHO[@]}" "root@$HOST" 'pct status 101 >/dev/null 2>&1' && die "root@$HOST already has container 101: not a fresh box (README: Check or redo)"
-ssh "${SSHO[@]}" "${CWWK_SRC:-root@100.64.0.11}" true || die "cwwk01 is not reachable (the kit is built from it)"
+INV=$(ssh "${SSHO[@]}" "root@$HOST" 'if [ -r /root/black-relay/install.env ]; then echo INSTALLED; fi
+n=$(ls /etc/pve/nodes/*/lxc/*.conf /etc/pve/nodes/*/qemu-server/*.conf 2>/dev/null | wc -l); echo "GUESTS $n"
+for id in 101 102 103 104; do for f in /etc/pve/nodes/*/lxc/$id.conf /etc/pve/nodes/*/qemu-server/$id.conf; do [ -e "$f" ] && echo "BUSY $id $(sed -n "s/^\(hostname\|name\): //p" "$f" | head -1)"; done; done; true')
+grep -q '^INSTALLED' <<<"$INV" && die "Black Relay is already installed on root@$HOST; nothing is changed here. To continue or re-check it, at that box:  cd /root/cwwk-kit && bash cwwk-bootstrap.sh   (or: br-status)"
+grep -q '^BUSY' <<<"$INV" && die "root@$HOST already uses guest ID(s) that a site needs: $(grep '^BUSY' <<<"$INV" | awk '{print $2"="$3}' | tr '\n' ' ')(IDs 101-104 are fixed). Nothing was changed; those guests would have to move to other IDs first"
+echo "  new box has $(sed -n 's/^GUESTS //p' <<<"$INV") existing guest(s): Black Relay is added next to them, nothing existing is changed or removed"
+CACHE=${KITCACHE:-$HOME/Desktop/cwwk-kit-cache}
+if ssh "${SSHO[@]}" "${CWWK_SRC:-root@100.64.0.11}" true 2>/dev/null; then SRCMSG="cwwk01 reachable"
+elif [ -s "$CACHE/br-router-rootfs.tar.xz" ] && ls "$CACHE"/debian-13-standard_*.tar.zst >/dev/null 2>&1; then
+	SRCMSG="cwwk01 not reachable: the kit will use the router image cached $(date -r "$CACHE/br-router-rootfs.tar.xz" '+%F')"
+else die "cwwk01 is not reachable and nothing is cached in $CACHE: the first kit has to be built while cwwk01 is up (tailnet, or its LAN)"; fi
 ssh "${SSHO[@]}" "$HUB" true || die "BR2026 ($HUB) is not reachable"
-echo "  new box, cwwk01 and BR2026 all reachable"
+echo "  new box and BR2026 reachable; $SRCMSG"
 
 step "2/6 BR2026: register $SITE (sudo password prompt)"
 scp -q "$HERE/hub-add-site.sh" "$HUB:"
@@ -60,7 +71,8 @@ rm -f "$TMP/$SITE.join"
 ssh "root@$HOST" "chmod 600 /root/$SITE.join; cd /root && rm -rf cwwk-kit && tar xf $(basename "$KIT")"
 
 step "6/6 bootstrap on the new box (preflight + install, about 5 minutes)"
-ssh -t "root@$HOST" "cd /root/cwwk-kit && bash cwwk-bootstrap.sh $N"
+ssh -t "root@$HOST" "cd /root/cwwk-kit && bash cwwk-bootstrap.sh $N" ||
+	echo "  the bootstrap stopped (message above). Fix it, then at the box:  cd /root/cwwk-kit && bash cwwk-bootstrap.sh $N"
 
 cat <<EOF
 

@@ -1,6 +1,6 @@
 # Quick install: another CWWK site box
 
-Turns a fresh CWWK running Proxmox VE 9 into site N: the same build as cwwk01 (multipath
+Turns a CWWK running Proxmox VE 9 (fresh, or already running other things) into site N: the same build as cwwk01 (multipath
 edge, OpenWrt router, controller, port roles, port lock, site lock). Both sites stay on
 the BR2026 hub at the same time, each with its own tunnel and addresses.
 
@@ -73,7 +73,9 @@ yet" items; **NOT READY** = something is broken.
 - The new CWWK with **Proxmox VE 9** installed (any hostname, `local-lvm` storage), its
   management port on a network with internet, and your SSH key on it:
   `ssh-copy-id root@<install address>`.
-- cwwk01 online (the kit is copied from it) and BR2026 reachable.
+- BR2026 reachable, and cwwk01 online the first time (the kit's router image and Debian template are copied from it, then
+  cached on the Mac in `~/Desktop/cwwk-kit-cache`; after that a kit builds even while cwwk01 is off or locked, using the
+  cached router image, whose date is printed). `KITCACHE=dir` moves the cache; build with cwwk01 up to refresh it.
 - The modems for the new site, the Spitz, a USB stick for the site lock.
 
 ## Steps
@@ -165,19 +167,45 @@ Then in Pocket ID add an OIDC client "CWWK 2 controller" with callback
 headscale-users), and on the new CWWK host run `br-controller-oidc`.
 
 **9. Prove it:** `br-verify --strict` must say READY (no notes) once steps 6-8 are done, then
-controller **Setup → Lock the ports**, then a cold start (`survivability/cwwk/docs/cold-start-test.md`).
+controller **Setup → Lock the ports**, then a cold start (`ops/cwwk/docs/cold-start-test.md`).
+
+## A box that already runs things (adds, never rebuilds)
+
+Nothing special to do: `new-site.sh` and `cwwk-bootstrap.sh` look at the box first
+(`bash cwwk-install.sh survey N` shows what they found and changes nothing). If the box already has
+guests or other bridges (say, an OPNsense VM), the install **adds Black Relay next to them**:
+
+- It uses only guest IDs **101-104**, the bridge names **vmbr1, vmbr2, vmbr3, vmbr10**, and **network ports nothing
+  else uses** (not in a bridge or bond, no address). Everything else (existing guests, bridges, the host's own
+  network and default route, package sources, SSH settings) is left exactly as it is. The port step needs no console:
+  nothing existing drops, so it works over SSH.
+- If something it needs is taken, it **stops before changing anything** and says what: `guest ID 101 is already used by
+  VM opnsense`, `bridge vmbr1 already exists`, `no free network port`. IDs and bridge names are fixed (the host tools
+  and the controller use them), so the other guest has to move; for ports, `BR_PORTS="enp4s0 enp5s0"` names the ones to give.
+- Other overrides: `BR_STORE=name` (disk storage for the containers; default `local-lvm`, else the first one that holds
+  containers), `BR_TMP_IP=ADDRESS/24 BR_TMP_GW=GATEWAY` (the downloads during install need DHCP on the box's own network;
+  this gives a free static address instead), `HARDEN_SSH=1` (turn host SSH passwords off at `finish`; left alone here),
+  `ADOPT=0|1` (force the mode).
+- Undo: `br-port-layout rollback` (also automatic after 15 minutes until `finish`): the ports leave the site's bridge and
+  nothing else changes. `br-verify` knows an adopted box (the host keeps its own route; SSH passwords are a WARN, not a FAIL).
 
 ## Check or redo
 
 - `br-verify` (or `bash cwwk-install.sh check`): the full proof described above.
-- The install refuses a box that already has containers 101–103. To start over:
-  `for i in 101 102 103; do pct stop $i; pct destroy $i --purge; done` (and `br-port-layout rollback` if the ports were moved).
+- **Nothing is ever removed by the scripts.** If a Black Relay install is already on the box, `new-site.sh` says so and
+  points to `bash cwwk-bootstrap.sh` at the box, which carries on at the right stage. A half-finished install is
+  finished the same way, not deleted.
+- To start over on purpose (this destroys the site's four containers; do it by hand, and only on a box where they are all Black Relay's):
+  `for i in 101 102 103 104; do pct stop $i; pct destroy $i --purge; done`, then `br-port-layout rollback` if the ports were moved,
+  and delete `/root/black-relay/install.env`.
 - Undo the port move by hand: `br-port-layout rollback`.
 
 ## Known limits
 
 - Tested in parts against cwwk01 (address rewrite, router export, kit build, `br-verify` on the
   live box, incl. a real services deploy: 98 ok). The whole run needs the second box.
+- The add-to-a-box-already-in-use path (survey, free ports only, interfaces rewrite, rollback) is tested against stand-in
+  files and stubs only, not on a real second box.
 - A box with a different number of ports works (one modem port per network port); one with
   fewer than 2 ports is refused.
 - Hub ports allow up to 10 sites; the address plan goes to site 9 within 10.32.0.0/11.

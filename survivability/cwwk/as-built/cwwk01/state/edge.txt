@@ -1,0 +1,72 @@
+# packages
+ii  black-relay-glorytun          0.3.4+br6                            amd64        Black Relay glorytun fork - bonded multipath tunnel with reconstruction
+ii  dnsmasq                       2.91-1+deb13u2                       all          Small caching DNS proxy and DHCP/TFTP server - system daemon
+ii  dnsmasq-base                  2.91-1+deb13u2                       amd64        Small caching DNS proxy and DHCP/TFTP server - executable
+ii  libnftables1:amd64            1.1.3-1                              amd64        Netfilter nftables high level userspace API library
+ii  libnftnl11:amd64              1.2.9-1                              amd64        Netfilter nftables userspace API library
+ii  nftables                      1.1.3-1                              amd64        Program to control packet filtering rules by Netfilter project
+
+# ip -br addr
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+up0@if10         UP             
+up1@if11         UP             192.168.130.150/24 metric 101 
+up2@if12         UP             
+tr0@if13         UP             10.39.0.1/30 fe80::be24:11ff:fe97:40e/64 
+up3@if14         UP             192.168.9.107/24 metric 103 
+br0              UNKNOWN        10.255.1.2/30 fe80::1fe5:5dda:e782:cfa4/64 
+
+# ip rule
+0:	from all lookup local
+898:	from all to 10.32.0.0/11 lookup 201
+899:	from 10.32.0.0/11 to 192.168.130.1 lookup main
+899:	from 10.32.0.0/11 to 192.168.9.1 lookup main
+900:	from 10.32.0.0/11 to 10.32.0.0/11 lookup main
+901:	from 10.32.0.0/11 lookup 200
+7101:	from all fwmark 0x1bbd lookup 7101
+7103:	from all fwmark 0x1bbf lookup 7103
+32766:	from all lookup main
+32767:	from all lookup default
+
+# main routes
+default dev br0 scope link metric 10 
+default via 192.168.130.1 dev up1 proto dhcp src 192.168.130.150 metric 101 
+default via 192.168.9.1 dev up3 proto dhcp src 192.168.9.107 metric 103 
+10.39.0.0/30 dev tr0 proto kernel scope link src 10.39.0.1 
+10.40.0.0/24 via 10.39.0.2 dev tr0 
+10.41.0.0/24 via 10.39.0.2 dev tr0 
+10.255.1.0/30 dev br0 proto kernel scope link src 10.255.1.2 
+192.168.9.0/24 dev up3 proto kernel scope link src 192.168.9.107 metric 103 
+192.168.9.1 dev up3 proto dhcp scope link src 192.168.9.107 metric 103 
+192.168.130.0/24 dev up1 proto kernel scope link src 192.168.130.150 metric 101 
+192.168.130.1 dev up1 proto dhcp scope link src 192.168.130.150 metric 101 
+
+# table 201 (site routes)
+unreachable 10.32.0.0/11 metric 4096 
+10.39.0.0/30 dev tr0 proto kernel scope link src 10.39.0.1 
+10.40.0.0/24 via 10.39.0.2 dev tr0 
+10.41.0.0/24 via 10.39.0.2 dev tr0 
+
+# uplinks
+PORT=5001
+SERVER=89.167.30.202
+UPLINKS="up0:100/150 up1:500/300 up2:100/150 up3:1000/1000"
+TRANSPORT=wss
+WSS_PREFIX=<REDACTED>
+WSS_LANES=6
+
+# units
+
+# tunnel
+active
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.9:5001  tx=10416666 rx=6250000
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.10:5001  tx=10416666 rx=6250000
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.11:5001  tx=10416666 rx=6250000
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.12:5001  tx=10416666 rx=6250000
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.19:5001  tx=20833333 rx=20833333
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.20:5001  tx=20833333 rx=20833333
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.21:5001  tx=20833333 rx=20833333
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.22:5001  tx=20833333 rx=20833333
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.23:5001  tx=20833333 rx=20833333
+Nov 20 21:42:15 br-edge tunnel[327887]: path 127.0.0.1 -> 127.0.1.24:5001  tx=20833333 rx=20833333
+Nov 20 21:42:15 br-edge tunnel[327887]: client br0 up: 10.255.1.2/30, 12 path(s)
+Nov 20 21:42:15 br-edge systemd[1]: Started black-relay@br0.service - Black Relay bonded tunnel (br0).

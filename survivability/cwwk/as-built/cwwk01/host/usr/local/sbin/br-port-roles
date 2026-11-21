@@ -40,6 +40,7 @@ import time
 
 INTERFACES = "/etc/network/interfaces"
 STATE = "/run/br-port-roles.json"
+ROOT_OK = "/etc/br-port-roles.root-ok"   # one port name per word: ports that may face a switched network
 PORT_LOCK = "/etc/br-port-lock.json"   # br-port-lock: while it exists, roles are frozen
 LOCAL_OUI = "bc:24:11"     # Proxmox-generated MACs: our own containers, never "a device"
 DECIDE = 8                 # s of unanswered untagged client DHCP before switching
@@ -117,8 +118,14 @@ def guard(ports):
         f"{rules}\t}}\n}}\n"))
     if p.returncode:
         log(f"guard failed: {p.stderr.strip()[:160]}")
-    for n in ports:   # nothing outside may become spanning-tree root through a port
-        run("bridge", "link", "set", "dev", n, "root_block", "on")
+    # Nothing outside may become spanning-tree root through a port, except ports an admin lists in ROOT_OK:
+    # a port that faces a switched network (venue, ISP) hears that network's root and would be blocked for ever.
+    try:
+        root_ok = set(open(ROOT_OK).read().split())
+    except OSError:
+        root_ok = set()
+    for n in ports:
+        run("bridge", "link", "set", "dev", n, "root_block", "off" if n in root_ok else "on")
 
 
 def current_pvid(nic):

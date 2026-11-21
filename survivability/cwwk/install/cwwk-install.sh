@@ -6,6 +6,8 @@
 # bash cwwk-bootstrap.sh   (it calls this script's stages in order and ends with br-verify).
 #
 #   bash cwwk-install.sh plan N              show the site's addresses, change nothing
+#   bash cwwk-install.sh survey N            look at this box (guests, bridges, free ports), change nothing:
+#                                            says whether it adds to what runs here, and if anything blocks it
 #   bash cwwk-install.sh install N JOINFILE  host packages, bridges, br-edge / br-router /
 #                                            br-controller, keys, host tools. The box keeps
 #                                            its install network (vmbr0) and nothing is cabled.
@@ -18,6 +20,11 @@
 #
 # Then, as on cwwk01: br-vault-init (USB stick in; site lock), br-controller-oidc
 # (Pocket ID), spitz-setup.sh (Wi-Fi on the site LAN). See README.md.
+#
+# A box that already runs things is ADDED TO, never rebuilt: 'install' looks first (survey), takes only
+# guest IDs 101-104, bridges vmbr1/2/3/10 and ports nothing else uses, and leaves every existing guest,
+# bridge, package source, route and SSH setting alone. If something it needs is taken it stops before
+# changing anything. BR_PORTS="p1 p2" picks the ports, BR_STORE=name the storage, ADOPT=0|1 forces the mode.
 #
 # Address plan, site N (inside 10.32.0.0/11), o = 8(N-1):
 #   transit 10.(39+o).0.0/30   edge .1, router .2
@@ -49,6 +56,73 @@ render() {
 	sed -i -E -e "s/\b10\.39\.0\./$T./g" -e "s/\b10\.40\.0\./$L./g" -e "s/\b10\.41\.0\./$S./g" \
 		-e "s/\b10\.255\.1\.([12])\b/10.255.$IDX.\1/g" -e "s/cwwk-node01/cwwk-node$(printf %02d "$N")/g" \
 		-e "s/\bcwwk01\b/$SITE/g" "$@"
+}
+
+# ---- a box that already runs things: ADD, never replace ------------------------------------------
+# A site uses guest IDs 101-104 and bridges vmbr1/vmbr2/vmbr3/vmbr10. On a box that already has guests
+# or bridges, 'survey' switches to ADOPT mode: only those are added; if one is taken the install
+# stops BEFORE changing anything. Existing bridges, guests, package sources, the host's own route and
+# SSH settings are never touched, and only ports nothing else uses join the site.
+BR_MARK="# Black Relay site bridges"
+guest_of() { # ID -> "CT name" | "VM name" | nothing
+	local f
+	for f in /etc/pve/nodes/*/lxc/$1.conf; do [ -e "$f" ] && { echo "CT $(sed -n 's/^hostname: //p' "$f")"; return; }; done
+	for f in /etc/pve/nodes/*/qemu-server/$1.conf; do [ -e "$f" ] && { echo "VM $(sed -n 's/^name: //p' "$f")"; return; }; done
+	return 0
+}
+free_ports() { # physical ports that no bridge, bond or address uses
+	local n
+	for n in $(phys); do
+		[ -e /sys/class/net/$n/master ] && continue
+		ip -4 addr show dev $n 2>/dev/null | grep -q 'inet ' && continue
+		grep -qE "^iface $n inet (static|dhcp)" /etc/network/interfaces && continue
+		grep -E '^[[:space:]]*(bridge[-_]ports|bond[-_]slaves)' /etc/network/interfaces | grep -qw "$n" && continue
+		echo $n
+	done
+}
+pick_store() { # where the containers' disks go: BR_STORE, else local-lvm, else the first rootdir storage
+	[ -n "${BR_STORE:-}" ] && { echo "$BR_STORE"; return; }
+	local s; s=$(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 && $3=="active"{print $1}')
+	echo "$s" | grep -qx local-lvm && { echo local-lvm; return; }
+	echo "$s" | head -1
+}
+survey() { # sets ADOPT STORE MGMT NET9 P; prints what it found; returns 1 on a problem (nothing changed)
+	local id g b n note NG NB COLL=() inuse=""
+	for id in 101 102 103 104; do
+		g=$(guest_of $id); [ -n "$g" ] || continue
+		note=""
+		if [ -r $ST ] && [[ "$g" == *" br-"* ]]; then note=" (from an earlier Black Relay install here; it is NOT removed: continue with cwwk-bootstrap.sh)"; fi
+		COLL+=("guest ID $id is already used by $g$note")
+	done
+	if ! grep -qF "$BR_MARK" /etc/network/interfaces 2>/dev/null; then
+		for b in vmbr1 vmbr2 vmbr3 vmbr10; do
+			{ ip link show $b >/dev/null 2>&1 || grep -q "^iface $b " /etc/network/interfaces; } && COLL+=("bridge $b already exists (not ours)")
+		done
+	fi
+	NG=$(ls /etc/pve/nodes/*/lxc/*.conf /etc/pve/nodes/*/qemu-server/*.conf 2>/dev/null | wc -l | tr -d ' ')
+	NB=$(ls -d /sys/class/net/*/bridge 2>/dev/null | wc -l | tr -d ' ')
+	if [ -z "${ADOPT:-}" ]; then if [ "$NG" -gt 0 ] || [ "$NB" -gt 1 ]; then ADOPT=1; else ADOPT=0; fi; fi
+	STORE=$(pick_store); [ -n "$STORE" ] || COLL+=("no storage that can hold containers (set BR_STORE=name)")
+	MGMT=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+	[ -e /sys/class/net/${MGMT:-none}/bridge ] || MGMT=vmbr0
+	if [ -n "${BR_TMP_IP:-}" ]; then NET9="name=eth9,bridge=$MGMT,ip=$BR_TMP_IP,gw=${BR_TMP_GW:-},type=veth"; else NET9="name=eth9,bridge=$MGMT,ip=dhcp,type=veth"; fi
+	if [ "$ADOPT" = 1 ]; then
+		if [ -n "${BR_PORTS:-}" ]; then
+			read -ra P <<<"$BR_PORTS"
+			for n in "${P[@]}"; do [ -e /sys/class/net/$n/device ] || COLL+=("BR_PORTS: $n is not a network port"); done
+		else mapfile -t P < <(free_ports); fi
+		[ ${#P[@]} -ge 1 ] || COLL+=("no free network port (every port is used by a bridge, bond or address): free one, or choose with BR_PORTS=\"port ...\"")
+		for n in $(phys); do printf '%s\n' "${P[@]}" | grep -qx "$n" || inuse="$inuse $n"; done
+	else
+		mapfile -t P < <(phys); [ ${#P[@]} -ge 2 ] || COLL+=("found ${#P[@]} network ports, need 2 or more")
+	fi
+	echo "survey of this box:"
+	if [ "$ADOPT" = 1 ]; then echo "  mode:    ADD to what is here ($NG guest(s), $NB bridge(s)): nothing that exists is changed or removed"
+	else echo "  mode:    fresh box"; fi
+	echo "  storage: $STORE    install network (downloads): $MGMT"
+	echo "  ports:   Black Relay takes: ${P[*]:-none}${inuse:+   left alone (in use):$inuse}"
+	for g in "${COLL[@]}"; do echo "  PROBLEM: $g"; done
+	[ ${#COLL[@]} -eq 0 ]
 }
 
 ct_push() { # ct src dest mode
@@ -85,26 +159,29 @@ cmd_install() {
 	plan "$1"
 	IDX=$(printf '%s' "${JOIN_TOKEN#brj1.}" | base64 -d | sed -n 's#^BR_TUN=10\.255\.\([0-9]*\)\.2/30$#\1#p')
 	[ -n "$IDX" ] || die "join token unreadable"
-	for id in $EDGE $ROUTER $CTRL; do pct status $id >/dev/null 2>&1 && die "container $id already exists: this box is not fresh"; done
 	ip -4 route show default | grep -q . || die "no internet route: connect the install network first"
-	mapfile -t P < <(phys); [ ${#P[@]} -ge 2 ] || die "found ${#P[@]} network ports, need 2 or more"
+	survey || die "nothing was changed. Fix the PROBLEM lines above and run again (README: 'A box that already runs things')"
 	HN=$(hostname -s)
 	mkdir -p $D; chmod 700 $D
-	printf 'N=%s\nIDX=%s\nHN=%s\nPORTS="%s"\n' "$N" "$IDX" "$HN" "${P[*]}" >$ST
+	printf 'N=%s\nIDX=%s\nHN=%s\nPORTS="%s"\nADOPT=%s\nSTORE=%s\nMGMT=%s\nNET9=%s\n' "$N" "$IDX" "$HN" "${P[*]}" "$ADOPT" "$STORE" "$MGMT" "$NET9" >$ST
 	install -m 0600 "$J" $D/$SITE.join
 
 	say "1/8 host packages"
-	for f in /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/sources.list.d/ceph.sources; do
-		if [ -f "$f" ] && ! grep -q '^Enabled: no' "$f"; then echo 'Enabled: no' >>"$f"; fi
-	done
-	cat >/etc/apt/sources.list.d/proxmox.sources <<'EOF'
+	if [ "$ADOPT" = 1 ] && grep -rqsE 'download\.proxmox\.com|enterprise\.proxmox\.com' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+		echo "  Proxmox package sources are already set up here: left as they are"
+	else
+		for f in /etc/apt/sources.list.d/pve-enterprise.sources /etc/apt/sources.list.d/ceph.sources; do
+			if [ -f "$f" ] && ! grep -q '^Enabled: no' "$f"; then echo 'Enabled: no' >>"$f"; fi
+		done
+		cat >/etc/apt/sources.list.d/proxmox.sources <<'EOF'
 Types: deb
 URIs: http://download.proxmox.com/debian/pve
 Suites: trixie
 Components: pve-no-subscription
 Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
 EOF
-	chmod 644 /etc/apt/sources.list.d/proxmox.sources
+		chmod 644 /etc/apt/sources.list.d/proxmox.sources
+	fi
 	if [ ! -f /usr/share/keyrings/tailscale-archive-keyring.gpg ]; then
 		curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg -o /usr/share/keyrings/tailscale-archive-keyring.gpg
 		echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/debian trixie main" \
@@ -117,11 +194,12 @@ EOF
 	install -m 0644 "$KIT/templates/$TPL" /var/lib/vz/template/cache/$TPL
 	install -m 0644 "$KIT/templates/br-router-rootfs.tar.xz" /var/lib/vz/template/cache/br-router-rootfs.tar.xz
 
-	say "2/8 internal bridges (no cables involved; vmbr0 stays as it is)"
+	say "2/8 internal bridges (no cables involved; the existing network stays as it is)"
 	if ! grep -q '^auto vmbr10' /etc/network/interfaces; then
 		cp -p /etc/network/interfaces $D/interfaces.before-install
 		cat >>/etc/network/interfaces <<EOF
 
+$BR_MARK (added by cwwk-install.sh; nothing above this line is changed)
 auto vmbr1
 iface vmbr1 inet static
 	address $L.2/24
@@ -154,20 +232,25 @@ iface vmbr10 inet manual
 	bridge-vlan-aware yes
 	bridge-vids 40 41 $BASE-$((BASE + ${#P[@]} - 1))
 EOF
-		ifreload -a
+		if [ "$ADOPT" = 1 ]; then   # bring up only our four; the rest of the network is not reloaded
+			ifup vmbr1 vmbr2 vmbr3 vmbr10 || die "could not bring up the new bridges (backup of the file: $D/interfaces.before-install)"
+			for b in vmbr1 vmbr2 vmbr3 vmbr10; do ip link show $b >/dev/null 2>&1 || die "bridge $b did not come up (backup of the file: $D/interfaces.before-install)"; done
+		else ifreload -a; fi
 	fi
 	ip -4 route show default | grep -q . || die "internet route lost after adding bridges (backup: $D/interfaces.before-install)"
 
 	say "3/8 br-edge (CT $EDGE): multipath tunnel"
-	nets=(-net0 "name=tr0,bridge=vmbr2,ip=$T.1/30,type=veth" -net9 "name=eth9,bridge=vmbr0,ip=dhcp,type=veth")
+	nets=(-net0 "name=tr0,bridge=vmbr2,ip=$T.1/30,type=veth" -net9 "$NET9")
 	for i in "${!P[@]}"; do nets+=(-net$((i + 1)) "name=up$i,bridge=vmbr10,tag=$((BASE + i)),ip=manual,type=veth"); done
 	pct create $EDGE local:vztmpl/$TPL --hostname br-edge --cores 2 --memory 1024 --swap 256 \
-		--rootfs local-lvm:8 --unprivileged 1 --features nesting=1 --onboot 1 --startup order=1 \
+		--rootfs $STORE:8 --unprivileged 1 --features nesting=1 --onboot 1 --startup order=1 \
 		--nameserver 1.1.1.1 --searchdomain lan --ostype debian "${nets[@]}" \
 		--description "Black Relay site edge: bonded tunnel to BR2026 hub ($SITE), LAN router $L.1" >/dev/null
 	pct set $EDGE -dev0 /dev/net/tun
 	pct start $EDGE; wait_ct $EDGE
 	for _ in $(seq 1 20); do pct exec $EDGE -- getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done
+	pct exec $EDGE -- getent hosts deb.debian.org >/dev/null 2>&1 ||
+		die "br-edge has no internet on $MGMT (it needs DHCP there). Without DHCP: BR_TMP_IP=ADDRESS/24 BR_TMP_GW=GATEWAY (a free address on $MGMT). Nothing existing was changed; the containers made so far are Black Relay's own"
 	pct exec $EDGE -- sh -c 'apt-get update -q >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -q dnsmasq nftables sshpass curl python3 >/dev/null'
 	ct_push $EDGE "$KIT/pkgs/black-relay-glorytun_0.3.4+br7_amd64.deb" /root/br.deb
 	pct exec $EDGE -- sh -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -q /root/br.deb >/dev/null && rm /root/br.deb'
@@ -207,7 +290,7 @@ PY
 
 	say "4/8 br-router (CT $ROUTER): OpenWrt, DHCP/DNS/firewall"
 	pct create $ROUTER local:vztmpl/br-router-rootfs.tar.xz --hostname br-router --cores 1 --memory 256 --swap 0 \
-		--rootfs local-lvm:1 --unprivileged 1 --ostype unmanaged --arch amd64 --onboot 1 --startup order=2 \
+		--rootfs $STORE:1 --unprivileged 1 --ostype unmanaged --arch amd64 --onboot 1 --startup order=2 \
 		-net0 name=eth0,bridge=vmbr1,type=veth -net1 name=eth1,bridge=vmbr2,type=veth -net2 name=eth2,bridge=vmbr3,type=veth \
 		-net4 name=eth4,bridge=vmbr10,tag=40,type=veth -net5 name=eth5,bridge=vmbr10,tag=41,type=veth \
 		--description "Black Relay site router (OpenWrt + LuCI): LAN $L.1, services $S.1, uplink $T.2 -> br-edge ($SITE)" >/dev/null
@@ -232,7 +315,7 @@ PY
 
 	say "5/8 br-controller (CT $CTRL): web UI"
 	pct create $CTRL local:vztmpl/$TPL --hostname br-controller --cores 1 --memory 512 --swap 256 \
-		--rootfs local-lvm:4 --unprivileged 1 --features nesting=1 --onboot 1 --startup order=3 \
+		--rootfs $STORE:4 --unprivileged 1 --features nesting=1 --onboot 1 --startup order=3 \
 		--nameserver $L.1 --searchdomain lan --ostype debian \
 		-net0 "name=eth0,bridge=vmbr1,ip=$L.10/24,gw=$L.1,type=veth" \
 		--description "Black Relay CWWK controller ($SITE): health, multipath, network, Wi-Fi, compute, services. https://$L.10" >/dev/null
@@ -341,6 +424,17 @@ EOF
 cmd_ports() {
 	load
 	pct status $EDGE | grep -q running || pct start $EDGE
+	if [ "${ADOPT:-0}" = 1 ]; then   # added to a running box: only the chosen free ports move, nothing else
+		say "ports: $PORTS join the site's port bridge (automatic undo in 15 minutes unless 'finish' runs)"
+		/usr/local/sbin/br-port-layout adopt
+		systemctl start br-port-roles
+		echo
+		echo "Those ports are on the site's port bridge. Everything else on this box (bridges, guests, its own network,"
+		echo "its default route) is as it was. Plug in the modems, the Spitz, and a laptop (any of: $PORTS)."
+		echo "The laptop gets a $L.x address in about a minute: https://$L.10 (admin password: $D/controller-admin.pw)."
+		echo "Then: bash cwwk-install.sh finish   (within 15 minutes, or the ports leave the site's bridge again)"
+		return
+	fi
 	say "port layout: every port on vmbr10 (automatic undo in 15 minutes unless 'finish' runs)"
 	/usr/local/sbin/br-port-layout unify
 	# the host's way out is now the site router
@@ -372,8 +466,13 @@ cmd_finish() {
 	[ $ok = 1 ] || { pct exec $EDGE -- /usr/local/sbin/br-uplinks 2>/dev/null | head -20; die "tunnel not up yet: check modems (the layout undoes itself 15 min after 'ports')"; }
 	pct exec $EDGE -- /usr/local/sbin/br-uplinks | python3 -c 'import json,sys; [print(" ", u["port"], u["kind"], u["ip"]) for u in json.load(sys.stdin)["uplinks"] if u.get("ip")]'
 	/usr/local/sbin/br-port-layout confirm
-	say "host internet through the tunnel"
-	ping -c1 -W3 1.1.1.1 >/dev/null || die "host has no way out via $L.1"
+	if [ "${ADOPT:-0}" = 1 ]; then
+		say "host internet (its own route, unchanged)"
+		ping -c1 -W3 1.1.1.1 >/dev/null || echo "  note: the host itself has no internet on its own network (not a Black Relay matter)"
+	else
+		say "host internet through the tunnel"
+		ping -c1 -W3 1.1.1.1 >/dev/null || die "host has no way out via $L.1"
+	fi
 	say "tailnet"
 	if tailscale status >/dev/null 2>&1; then
 		echo "already on the tailnet: $(tailscale ip -4)"
@@ -389,14 +488,16 @@ cmd_finish() {
 	fi
 	sed -i 's/^TS_AUTHKEY=.*/TS_AUTHKEY=/' $D/$SITE.join
 	say "host SSH: keys only"
-	if [ -s /root/.ssh/authorized_keys ]; then
+	if [ "${ADOPT:-0}" = 1 ] && [ "${HARDEN_SSH:-0}" != 1 ]; then
+		echo "  left as it was (this box was already in use): HARDEN_SSH=1 bash cwwk-install.sh finish turns passwords off"
+	elif [ -s /root/.ssh/authorized_keys ]; then
 		printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' >/etc/ssh/sshd_config.d/10-black-relay.conf
 		systemctl reload ssh
 		echo "  password login off (your key in /root/.ssh/authorized_keys)"
 	else
 		echo "  left as is: put your SSH key in /root/.ssh/authorized_keys, then run finish again"
 	fi
-	cmd_check || true
+	[ "${BR_BOOTSTRAP:-}" = 1 ] || cmd_check || true   # cwwk-bootstrap.sh runs the proof itself, after the services
 	cat <<EOF
 
 Done: $SITE is on the hub and runs like cwwk01.
@@ -413,6 +514,7 @@ cmd_check() {
 
 case "${1:-}" in
 	plan) cmd_plan "${2:-}" ;;
+	survey) plan "${2:-}"; survey ;;
 	install) cmd_install "${2:-}" "${3:-}" ;;
 	ports) cmd_ports ;;
 	finish) cmd_finish ;;

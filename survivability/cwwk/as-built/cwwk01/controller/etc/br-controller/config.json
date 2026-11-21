@@ -60,6 +60,15 @@
       "health_url": "",
       "deployed": false,
       "description": "Environmental / RF / perimeter sensors feeding the site picture."
+    },
+    {
+      "id": "rf-console",
+      "name": "RF Console",
+      "kind": "sensors",
+      "description": "RF detection: Kismet server, MQTT broker and the WBT Console (live RF map, nodes, alerts).",
+      "url": "http://10.41.0.20:8080/",
+      "health_url": "http://10.41.0.20:8080/",
+      "deployed": true
     }
   ],
   "admin_groups": [

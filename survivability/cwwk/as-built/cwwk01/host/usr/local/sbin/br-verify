@@ -1,0 +1,265 @@
+#!/bin/bash
+# br-verify: prove a CWWK site box works end to end. Run as root on the Proxmox host.
+# Read-only: changes nothing. Works on cwwk01 and on any site made by cwwk-install.sh.
+#
+#   br-verify              full check, PASS / WARN / FAIL per line, exit 1 if anything FAILs
+#   br-verify --strict     WARN counts as a failure too (use for "ready to ship")
+#   br-verify --quiet      only WARN and FAIL lines + the verdict
+#   br-verify --summary    one screen: installed? up? per area, URLs, only the problems spelled out
+#   br-verify --section X  one of: host net edge router controller services hub security
+#
+# The site is read from the box itself (vmbr1 address -> site number, edge tunnel address ->
+# hub index), so the same script checks every site.
+#
+# Verdict: READY (all ok) / READY WITH NOTES (warnings: usually "not done yet" items such as
+# the site lock) / NOT READY (something is broken).
+EDGE=101 ROUTER=102 CTRL=103
+STRICT=0 QUIET=0 ONLY= SUMMARY=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--strict) STRICT=1 ;; --quiet|-q) QUIET=1 ;; --summary|--status) SUMMARY=1; QUIET=1 ;; --section) ONLY=${2:-}; shift ;;
+		-h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+		*) echo "unknown option $1"; exit 2 ;;
+	esac; shift
+done
+[ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
+command -v pct >/dev/null || { echo "not a Proxmox host"; exit 2; }
+
+NOK=0 NWARN=0 NFAIL=0 SEC=
+declare -A SO SW SF; ORDER=(); PROBLEMS=()
+ok()   { NOK=$((NOK + 1));     SO[$SEC]=$(( ${SO[$SEC]:-0} + 1 ));  [ $QUIET = 1 ] || printf '  ok    %s\n' "$*"; }
+warn() { NWARN=$((NWARN + 1)); SW[$SEC]=$(( ${SW[$SEC]:-0} + 1 )); PROBLEMS+=("  WARN  $*"); [ $SUMMARY = 1 ] || printf '  WARN  %s\n' "$*"; }
+fail() { NFAIL=$((NFAIL + 1)); SF[$SEC]=$(( ${SF[$SEC]:-0} + 1 )); PROBLEMS+=("  FAIL  $*"); [ $SUMMARY = 1 ] || printf '  FAIL  %s\n' "$*"; }
+chk()  { local m=$1; shift; if "$@" >/dev/null 2>&1; then ok "$m"; else fail "$m"; fi; }
+want() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
+sec()  { SEC=$1; ORDER+=("$1"); want "$1" && { [ $QUIET = 1 ] || printf '\n== %s\n' "$2"; }; }
+ctx()  { pct exec "$1" -- "${@:2}"; }                       # run inside a container
+J()    { python3 -c "import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(3)
+$1" 2>/dev/null; }                                          # tiny JSON probe on stdin
+
+# ---- who am I (derived, never configured)
+A=$(ip -4 -o addr show vmbr1 2>/dev/null | sed -n 's/.* 10\.\([0-9]*\)\.0\.2\/24 .*/\1/p' | head -1)
+if [ -z "$A" ]; then printf 'This box has no site LAN on vmbr1 (10.x.0.2/24): not a finished site install.\n'; exit 1; fi
+N=$(( (A - 40) / 8 + 1 )) SITE=cwwk$(printf %02d $(( (A - 40) / 8 + 1 )))
+T=10.$((A - 1)).0 L=10.$A.0 S=10.$((A + 1)).0
+IDX=$(ctx $EDGE sed -n 's#^TUN_ADDR=10\.255\.\([0-9]*\)\.2/30#\1#p' /etc/black-relay/br0.conf 2>/dev/null)
+[ $SUMMARY = 1 ] || printf 'br-verify  %s  (site %s)   LAN %s.0/24  services %s.0/24  transit %s.0/30  hub index %s\n' "$(date '+%F %T')" "$SITE" "$L" "$S" "$T" "${IDX:-?}"
+
+# ================================================================== host
+if sec host "Proxmox host"; want host; then
+	pveversion | grep -q '^pve-manager/9\.' && ok "Proxmox VE 9 ($(pveversion | cut -d/ -f2))" || warn "Proxmox is not version 9 ($(pveversion | cut -d/ -f2))"
+	for id in $EDGE $ROUTER $CTRL; do
+		n=$(pct config $id 2>/dev/null | sed -n 's/^hostname: //p')
+		if [ "$(pct status $id 2>/dev/null | cut -d' ' -f2)" = running ]; then ok "CT $id $n running"; else fail "CT $id ${n:-missing} is not running"; fi
+		pct config $id 2>/dev/null | grep -q '^onboot: 1' && ok "CT $id starts at boot" || fail "CT $id will not start at boot"
+	done
+	LKS=$(/usr/local/sbin/br-lockd status 2>/dev/null | J 'print(d.get("state",""))')
+	for u in br-hostinfo br-lockd br-port-roles; do
+		systemctl is-active -q $u && ok "host service $u active" || fail "host service $u is $(systemctl is-active $u)"
+	done
+	# tailscaled: the site lock starts it on unlock and stops it when locked (by design)
+	if [ "$LKS" = locked ]; then
+		systemctl is-active -q tailscaled && warn "site is locked but tailscaled is running" || ok "site locked: tailnet off by design (unlock starts it)"
+	else
+		systemctl is-active -q tailscaled && ok "host service tailscaled active" || fail "host service tailscaled is $(systemctl is-active tailscaled)"
+	fi
+	for u in br-hostinfo br-lockd br-port-roles br-port-lock; do
+		systemctl is-enabled -q $u 2>/dev/null && ok "$u enabled at boot" || fail "$u is not enabled at boot (comes back dead after a reboot)"
+	done
+	for t in br-port-roles br-port-layout br-hostinfo br-lockd br-vault-init br-port-lock br-controller-oidc br-rotate-secrets br-svc; do
+		[ -x /usr/local/sbin/$t ] || fail "host tool /usr/local/sbin/$t missing"
+	done
+	[ -z "$(find /usr/local/sbin -name 'br-*' ! -perm -u+x 2>/dev/null)" ] && ok "host tools present and executable"
+	ping -c1 -W3 1.1.1.1 >/dev/null 2>&1 && ok "host reaches the internet (through the tunnel)" || fail "host has no internet"
+	getent hosts deb.debian.org >/dev/null 2>&1 && ok "host DNS works" || fail "host DNS does not resolve"
+fi
+
+# ================================================================== net
+if sec net "Bridges and ports"; want net; then
+	for b in vmbr1 vmbr2 vmbr3 vmbr10; do ip link show $b 2>/dev/null | grep -q 'state UP' && ok "$b up" || fail "$b is not up"; done
+	[ "$(cat /sys/class/net/vmbr10/bridge/vlan_filtering 2>/dev/null)" = 1 ] && ok "vmbr10 is VLAN-aware" || fail "vmbr10 is not VLAN-aware"
+	[ "$(cat /sys/class/net/vmbr10/bridge/stp_state 2>/dev/null)" = 1 ] && ok "vmbr10 STP on (loop protection)" || fail "vmbr10 STP is off"
+	bad=
+	for d in /sys/class/net/*/device; do
+		n=${d%/device}; n=${n##*/}; [ -e /sys/class/net/$n/wireless ] && continue
+		[ "$(basename "$(readlink /sys/class/net/$n/master 2>/dev/null)")" = vmbr10 ] || bad="$bad $n"
+	done
+	[ -z "$bad" ] && ok "every network port is on the port bridge (any cable, any port)" || fail "ports not on vmbr10:$bad (run: cwwk-install.sh ports)"
+	ip link show vmbr0 >/dev/null 2>&1 && warn "install network vmbr0 still exists (ports step not done?)"
+	ip -4 route show default | grep -q "via $L.1 dev vmbr1" && ok "default route: via site router $L.1" || fail "default route is not via $L.1 ($(ip -4 route show default | head -1))"
+	armed=$(/usr/local/sbin/br-port-layout status 2>/dev/null | sed -n 's/^== rollback timer: \([0-9]*\) armed.*/\1/p')
+	[ "${armed:-0}" = 0 ] && ok "no automatic port-layout undo pending" || fail "port layout will UNDO itself (run: cwwk-install.sh finish)"
+	for v in 40 41; do bridge vlan show 2>/dev/null | grep -qw "$v" && ok "VLAN $v carried on the ports" || fail "VLAN $v missing on the ports"; done
+fi
+
+# ================================================================== edge
+if sec edge "br-edge (CT $EDGE): multipath tunnel"; want edge; then
+	for u in black-relay@br0 black-relay-watch@br0 br-dash br-edge-routes br-lane-nurse br-watchdog dnsmasq nftables systemd-networkd; do
+		ctx $EDGE systemctl is-active -q $u 2>/dev/null && ok "edge $u active" || fail "edge $u is $(ctx $EDGE systemctl is-active $u 2>/dev/null)"
+	done
+	ctx $EDGE systemctl is-enabled -q br-uplinks-recheck.timer 2>/dev/null && ok "edge recheck timer enabled" || fail "edge br-uplinks-recheck.timer not enabled"
+	ctx $EDGE ping -c2 -W3 -I br0 10.255.${IDX:-0}.1 >/dev/null 2>&1 && ok "tunnel up: hub 10.255.$IDX.1 answers on br0" || fail "tunnel down: hub 10.255.$IDX.1 does not answer"
+	R=$(ctx $EDGE ip rule 2>/dev/null)
+	grep -q 'from 10.32.0.0/11 lookup 200' <<<"$R" && ok "policy: site traffic -> tunnel table 200" || fail "policy rule 'from 10.32.0.0/11 lookup 200' missing"
+	grep -q 'to 10.32.0.0/11 lookup 201' <<<"$R" && ok "policy: no site traffic out of a raw uplink (rule 898)" || fail "policy rule 898 (lookup 201) missing"
+	ctx $EDGE ip -4 -o addr show tr0 2>/dev/null | grep -q " $T.1/30" && ok "edge transit address $T.1/30" || fail "edge tr0 is not $T.1/30"
+	ST=$(ctx $EDGE /usr/local/sbin/br-selftest 2>/dev/null)
+	if [ -z "$ST" ]; then fail "br-selftest gave no answer"; else
+		echo "$ST" | J 'sys.exit(0 if d.get("service")=="active" else 1)' && ok "self-test: tunnel service active" || fail "self-test: tunnel service not active"
+		echo "$ST" | J 'sys.exit(0 if d.get("guard") else 1)' && ok "self-test: leak guard on (nothing leaves a raw uplink)" || fail "self-test: LEAK GUARD OFF"
+		echo "$ST" | J 'sys.exit(0 if d.get("dns") else 1)' && ok "self-test: DNS through the tunnel works" || fail "self-test: DNS fails"
+		echo "$ST" | J 'sys.exit(0 if d.get("hub_ms") is not None else 1)' && ok "self-test: hub latency $(echo "$ST" | J 'print(round(d["hub_ms"]))') ms" || fail "self-test: hub unreachable"
+		eg=$(echo "$ST" | J 'print(d.get("egress") or "")')
+		srv=$(ctx $EDGE sed -n 's/^SERVER=//p' /etc/black-relay/br0.conf 2>/dev/null)
+		if [ -z "$eg" ]; then fail "self-test: no egress address"
+		elif [ -n "$srv" ] && [ "$eg" = "$srv" ]; then ok "internet exit is the hub ($eg), not a local carrier"
+		else fail "internet exit $eg is not the hub ($srv): traffic is NOT going through the tunnel"; fi
+		read -r up lanes tot < <(echo "$ST" | J 'u=[x for x in d["uplinks"] if x.get("ip")]; print(len(u), sum(x["lanes_running"] for x in u), sum(x["lanes_total"] for x in u))')
+		if [ "${up:-0}" -ge 1 ]; then ok "$up uplink(s) with an address"; else fail "no uplink has an address (no modem answering)"; fi
+		if [ "${tot:-0}" -gt 0 ] && [ "$lanes" = "$tot" ]; then ok "all $tot lanes running"; elif [ "${lanes:-0}" -gt 0 ]; then warn "only $lanes of $tot lanes running"; else fail "no lanes running"; fi
+		echo "$ST" | J '
+for x in d["uplinks"]:
+    if x.get("ip") and x.get("warn"): print("uplink %s: %s" % (x["if"], x["warn"]))' >/tmp/.brv.w
+		while read -r w; do warn "$w"; done </tmp/.brv.w; rm -f /tmp/.brv.w
+	fi
+	[ "$(ctx $EDGE stat -c %a /etc/black-relay/br0.conf 2>/dev/null)" = 600 ] && ok "tunnel key file is 0600" || fail "br0.conf is not 0600"
+	ctx $EDGE grep -q '^WSS_PREFIX=.\+' /etc/black-relay/br0.conf 2>/dev/null && ok "HTTPS (443) lanes configured" || fail "HTTPS lane prefix missing from br0.conf"
+fi
+
+# ================================================================== router
+if sec router "br-router (CT $ROUTER): OpenWrt"; want router; then
+	ctx $ROUTER nft list tables 2>/dev/null | grep -q 'inet fw4' && ok "firewall loaded (fw4)" || fail "router firewall is not loaded"
+	for s in dnsmasq uhttpd dropbear; do ctx $ROUTER /etc/init.d/$s running >/dev/null 2>&1 && ok "router $s running" || fail "router $s not running"; done
+	RA=$(ctx $ROUTER ip -4 addr 2>/dev/null)
+	for a in "$T.2/30" "$L.1/24" "$S.1/24"; do grep -q "inet $a" <<<"$RA" && ok "router has $a" || fail "router is missing $a"; done
+	ctx $ROUTER ping -c1 -W3 $T.1 >/dev/null 2>&1 && ok "router reaches the edge ($T.1)" || fail "router cannot reach the edge $T.1"
+	ctx $ROUTER nslookup example.com 127.0.0.1 >/dev/null 2>&1 && ok "router DNS answers" || fail "router DNS does not answer"
+	[ "$(ctx $ROUTER uci -q get dhcp.lan.start)" = 100 ] && [ "$(ctx $ROUTER uci -q get dhcp.lan.limit)" = 100 ] && ok "DHCP pool $L.100-199 on LAN" || fail "DHCP pool on the LAN is not .100-.199"
+	ctx $ROUTER uci -q get dhcp.svc.interface >/dev/null 2>&1 && ok "DHCP on the services network" || fail "no DHCP section for the services network"
+	grep -q "$L\." <(ctx $ROUTER uci -q show network.lan 2>/dev/null) && ok "router LAN config uses $L.x" || fail "router config does not carry this site's addresses"
+	! ctx $ROUTER grep -rqE '10\.(39|40|41)\.0\.' /etc/config/network /etc/config/dhcp /etc/config/firewall 2>/dev/null || [ "$N" = 1 ] || fail "router config still holds the first site's addresses"
+	curl -sk -m5 -o /dev/null -w '%{http_code}' https://$L.1/ 2>/dev/null | grep -q '^[23]' && ok "router web UI answers on https://$L.1" || fail "router web UI does not answer"
+	ctx $ROUTER grep -q '^root:[^*!:]' /etc/shadow 2>/dev/null && ok "router root password is set" || fail "router root password is not set"
+fi
+
+# ================================================================== controller
+if sec controller "br-controller (CT $CTRL): web UI"; want controller; then
+	ctx $CTRL systemctl is-active -q br-controller && ok "controller service active" || fail "controller service not active"
+	ctx $CTRL systemctl is-enabled -q br-controller && ok "controller enabled at boot" || fail "controller not enabled at boot"
+	code=$(curl -sk -m6 -o /dev/null -w '%{http_code}' https://$L.10/ 2>/dev/null)
+	[[ "$code" =~ ^[23] ]] && ok "controller answers on https://$L.10 ($code)" || fail "controller does not answer on https://$L.10 ($code)"
+	ctx $CTRL python3 - <<'PY' >/dev/null 2>&1 && ok "controller config: admin login, Proxmox token, router and site-lock credentials all set" || fail "controller config is missing a credential (admin_hash / token / router / lockd)"
+import json, sys
+c = json.load(open("/etc/br-controller/config.json"))
+sys.exit(0 if all([c["admin_hash"], c["proxmox"]["token_secret"], c["router"]["password"], c["lockd"]["token"]]) else 1)
+PY
+	ctx $CTRL python3 - $L $T $IDX <<'PY' >/dev/null 2>&1 && ok "controller config carries this site's addresses" || fail "controller config has the wrong site addresses"
+import json, sys
+L, T, idx = sys.argv[1:4]
+c = json.load(open("/etc/br-controller/config.json"))
+sys.exit(0 if (c["proxmox"]["host"] == L + ".2" and c["router"]["host"] == L + ".1" and c["edge"]["host"] == T + ".1"
+               and c.get("gateway_peer") == "10.255." + idx + ".1") else 1)
+PY
+	ctx $CTRL openssl x509 -checkend $((30 * 86400)) -noout -in /etc/br-controller/tls.crt >/dev/null 2>&1 && ok "controller certificate valid for 30+ days" || fail "controller certificate expires within 30 days"
+	e=$(ctx $CTRL ssh -i /root/.ssh/id_edge_ctl -o BatchMode=yes -o ConnectTimeout=6 root@$T.1 selftest 2>/dev/null)
+	echo "$e" | J 'sys.exit(0 if "uplinks" in d else 1)' && ok "controller can drive the edge (key + br-ctl)" || fail "controller cannot reach the edge over its SSH key"
+	ctx $CTRL python3 - $L <<'PY' >/dev/null 2>&1 && ok "controller trusts the Proxmox certificate" || fail "controller cannot verify the Proxmox API certificate"
+import ssl, sys, urllib.error, urllib.request
+c = ssl.create_default_context(cafile="/etc/br-controller/pve-ca.pem"); c.check_hostname = False
+try:
+    urllib.request.urlopen("https://%s.2:8006/" % sys.argv[1], context=c, timeout=5)
+except urllib.error.HTTPError:
+    pass
+PY
+	for p in "http $L.2 8091 br-hostinfo" "https $L.2 8092 br-lockd" "https $L.1 443 router"; do
+		set -- $p
+		ctx $CTRL python3 -c "import socket;socket.create_connection(('$2',$3),4)" >/dev/null 2>&1 && ok "controller reaches $4 ($2:$3)" || fail "controller cannot reach $4 ($2:$3)"
+	done
+	curl -sk -m5 -o /dev/null -w '%{http_code}' --resolve status.lan:443:$L.10 https://status.lan/ 2>/dev/null | grep -q '^[23]' && ok "public status page answers" || warn "public status page (status.lan) does not answer"
+fi
+
+# ================================================================== services
+if sec services "br-services (CT 104): Sensor Fusion services"; want services; then
+	LKS2=$(/usr/local/sbin/br-lockd status 2>/dev/null | J 'print(d.get("state",""))')
+	if ! pct status 104 >/dev/null 2>&1; then
+		fail "services host CT 104 missing (run: br-svc init)"
+	elif [ "$LKS2" = locked ]; then
+		ok "site locked: services host stopped by design (br-gated)"
+	else
+		[ "$(pct status 104 | cut -d' ' -f2)" = running ] && ok "CT 104 br-services running" || fail "CT 104 br-services is not running"
+		pct config 104 2>/dev/null | grep -q '^onboot: 1' && ok "CT 104 starts at boot" || fail "CT 104 will not start at boot"
+		pct config 104 2>/dev/null | grep -q '^tags:.*br-gated' && ok "CT 104 is behind the site lock (br-gated)" || warn "CT 104 is not tagged br-gated: it keeps running while the site is locked"
+		ctx 104 systemctl is-active -q docker 2>/dev/null && ok "Docker running" || fail "Docker is not running in CT 104"
+		ctx 104 docker network inspect fusion >/dev/null 2>&1 && ok "docker network 'fusion' exists" || fail "docker network 'fusion' missing"
+		ping -c1 -W2 $S.20 >/dev/null 2>&1 && ok "services host answers on $S.20" || fail "services host does not answer on $S.20"
+		SJ=$(/usr/local/sbin/br-svc status --json 2>/dev/null)
+		n=$(echo "$SJ" | J 'print(len(d["services"]))')
+		if [ "${n:-0}" = 0 ]; then warn "no services deployed yet (svc-sync.sh push <this box>, or br-svc deploy BUNDLE.tar)"; else
+			echo "$SJ" | J '
+for s in d["services"]:
+    good = s["containers"] > 0 and s["running"] == s["containers"] and s["unhealthy"] == 0
+    print("%s %s %s %d/%d" % ("ok" if good else "bad", s["name"], s["version"], s["running"], s["containers"]))' >/tmp/.brv.s
+			while read -r st nm ver cnt; do
+				[ "$st" = ok ] && ok "service $nm $ver: $cnt containers running and healthy" || fail "service $nm $ver: only $cnt containers running/healthy (br-svc logs $nm)"
+			done </tmp/.brv.s; rm -f /tmp/.brv.s
+		fi
+		ctx 104 sh -c 'find /srv/services -name .env ! -perm 600 | grep -q .' && fail "a service .env is not 0600" || ok "service secrets files are 0600"
+	fi
+fi
+
+# ================================================================== hub
+if sec hub "BR2026 hub and tailnet"; want hub; then
+	ctx $CTRL python3 - "$IDX" <<'PY' >/dev/null 2>&1 && ok "hub identity feed 10.255.$IDX.1:8099 reachable from the controller" || warn "hub identity feed not reachable from the controller (accounts won't sync)"
+import sys, urllib.request
+urllib.request.urlopen("http://10.255.%s.1:8099/identity.json" % sys.argv[1], timeout=5).read(1)
+PY
+	TS=$(tailscale status --json 2>/dev/null)
+	if [ "$LKS" = locked ]; then ok "site locked: tailnet checks skipped"; else
+	echo "$TS" | J 'sys.exit(0 if d.get("BackendState")=="Running" else 1)' && ok "tailnet: running ($(tailscale ip -4 2>/dev/null | head -1))" || fail "not on the tailnet (cwwk-install.sh finish, or a new key: hub-add-site.sh $N)"
+	hn=$(echo "$TS" | J 'print(d["Self"]["HostName"])')
+	[ "$hn" = "cwwk-node$(printf %02d $N)" ] && ok "tailnet name cwwk-node$(printf %02d $N)" || warn "tailnet name is '${hn:-?}', expected cwwk-node$(printf %02d $N)"
+	fi
+	ss -ltn 2>/dev/null | grep -q "$L.2:8091" && ok "host info listens on the LAN address only" || warn "br-hostinfo not listening on $L.2:8091"
+	ctx $CTRL ss -ltn 2>/dev/null | grep -q "$L.10:8444" && ok "remote-access listener $L.10:8444 up" || warn "remote-access listener $L.10:8444 not up (hub-publish-site.sh, br-controller-oidc)"
+	ctx $CTRL python3 -c "import json,sys;sys.exit(0 if json.load(open('/etc/br-controller/config.json')).get('oidc') else 1)" >/dev/null 2>&1 && ok "Pocket ID login configured (remote access)" || warn "Pocket ID login not set: run br-controller-oidc on this box"
+fi
+
+# ================================================================== security
+if sec security "Security"; want security; then
+	sshd -T 2>/dev/null | grep -qi '^passwordauthentication no' && ok "host SSH: keys only" || fail "host SSH still accepts passwords"
+	[ -s /root/.ssh/authorized_keys ] && ok "an SSH key is installed for root" || fail "no SSH key in /root/.ssh/authorized_keys (you would be locked out)"
+	[ "$(stat -c %a /root/black-relay 2>/dev/null)" = 700 ] && ok "secrets folder is 0700" || fail "/root/black-relay is not 0700"
+	loose=$(find /root/black-relay -maxdepth 1 -type f ! -perm 600 2>/dev/null | tr '\n' ' ')
+	[ -z "$loose" ] && ok "secret files are all 0600" || fail "loose permissions: $loose"
+	grep -q '^TS_AUTHKEY=.\+' /root/black-relay/$SITE.join 2>/dev/null && fail "the one-time tailnet key is still stored in $SITE.join" || ok "no one-time tailnet key left on disk"
+	[ -f /root/black-relay/$SITE.join ] && warn "the join file is still on this box (after the install: shred -u /root/black-relay/$SITE.join)"
+	LK=$(/usr/local/sbin/br-lockd status 2>/dev/null)
+	if [ -z "$LK" ]; then fail "site-lock service gives no status"; else
+		echo "$LK" | J 'sys.exit(0 if d.get("vault") else 1)' && ok "site lock: vault created (the box boots locked)" || warn "no site-lock vault yet: run br-vault-init with the USB stick in"
+	fi
+	/usr/local/sbin/br-port-lock status 2>/dev/null | J 'sys.exit(0 if d.get("locked") else 1)' && ok "ports and USB locked" || warn "ports/USB not locked (controller: Setup > Lock the ports)"
+	pub=$(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)')
+	[ -z "$pub" ] && ok "host has only private addresses (SSH and the Proxmox UI are not reachable from outside)" || warn "host has a public address ($pub): SSH and the Proxmox UI could be exposed"
+fi
+
+if [ $SUMMARY = 1 ]; then
+	declare -A NAMES=([host]="Proxmox host" [net]="Bridges and ports" [edge]="Multipath tunnel" [router]="Router (Wi-Fi, DHCP)" [controller]="Controller web UI" [services]="Services (sf-dev)" [hub]="Hub and tailnet" [security]="Security and locks")
+	st=$(grep -qx finish /root/black-relay/bootstrap.state 2>/dev/null && echo "installed" || { [ -f /root/black-relay/install.env ] && echo "installed (finish not run yet)" || echo "installed by hand (no bootstrap record)"; })
+	printf '\n  %s   %s   %s\n\n' "$SITE" "$st" "$(date '+%F %T')"
+	for k in "${ORDER[@]}"; do
+		want "$k" || continue
+		if [ "${SF[$k]:-0}" -gt 0 ]; then m="DOWN  "; elif [ "${SW[$k]:-0}" -gt 0 ]; then m="up (!)"; else m="UP    "; fi
+		printf '  %-8s %-24s %s ok%s%s\n' "$m" "${NAMES[$k]:-$k}" "${SO[$k]:-0}" "$([ "${SW[$k]:-0}" -gt 0 ] && echo ", ${SW[$k]} note(s)")" "$([ "${SF[$k]:-0}" -gt 0 ] && echo ", ${SF[$k]} FAILED")"
+	done
+	printf '\n  Controller   https://%s.10        Services   http://%s.20:8080\n' "$L" "$S"
+	[ ${#PROBLEMS[@]} -gt 0 ] && { echo; printf '%s\n' "${PROBLEMS[@]}"; }
+fi
+echo
+V="READY"; RC=0
+[ $NWARN -gt 0 ] && V="READY WITH NOTES"
+[ $STRICT = 1 ] && [ $NWARN -gt 0 ] && { V="NOT READY (strict: warnings count)"; RC=1; }
+[ $NFAIL -gt 0 ] && { V="NOT READY"; RC=1; }
+printf '== %s: %s   (%d ok, %d warn, %d fail)\n' "$SITE" "$V" $NOK $NWARN $NFAIL
+exit $RC

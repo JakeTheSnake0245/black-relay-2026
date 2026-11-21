@@ -66,21 +66,37 @@ else
 	echo "== no service bundles in $BUN (run: bash svc-sync.sh export); the site gets them later with svc-sync.sh push"
 fi
 
-echo "== Debian template (from cwwk01)"
-scp -q "$SRC:/var/lib/vz/template/cache/$TPL" "$K/templates/"
+# The two big parts (Debian template, router system) come from cwwk01 and are cached on the Mac
+# (KITCACHE, default ~/Desktop/cwwk-kit-cache), so a kit can still be built when cwwk01 is off or
+# locked. cwwk01 reachable = the router image is taken fresh and the cache refreshed; not reachable =
+# the cached copy is used (its date is printed). The cache holds nothing the kit does not.
+CACHE=${KITCACHE:-$HOME/Desktop/cwwk-kit-cache}; mkdir -p "$CACHE"
+if ssh -o BatchMode=yes -o ConnectTimeout=8 "$SRC" true 2>/dev/null; then LIVE=1; else LIVE=0; fi
 
-echo "== router system (from cwwk01, without secrets)"
+echo "== Debian template"
+if [ -s "$CACHE/$TPL" ]; then cp "$CACHE/$TPL" "$K/templates/"; echo "   from the cache"
+elif [ $LIVE = 1 ]; then scp -q "$SRC:/var/lib/vz/template/cache/$TPL" "$K/templates/" && cp "$K/templates/$TPL" "$CACHE/"
+else echo "cwwk01 ($SRC) is not reachable and $TPL is not cached in $CACHE"; exit 1; fi
+
+echo "== router system (without secrets)"
+if [ $LIVE = 1 ]; then
+echo "   from cwwk01"
 # OpenWrt rootfs; left out: passwords (shadow), SSH host keys and keys (dropbear),
 # HTTPS certificate and key (uhttpd), leases and runtime dirs.
 ssh "$SRC" 'pct exec 102 -- sh -c "printf \"%s\\n\" \"./proc/*\" \"./sys/*\" \"./dev/*\" \"./tmp/*\" ./lost+found \
 	./etc/shadow ./etc/shadow- ./etc/dropbear ./etc/uhttpd.crt ./etc/uhttpd.key ./etc/luci-uploads ./root/.ash_history \
 	>/tmp/.kitx; tar -C / -X /tmp/.kitx -cf - .; rc=\$?; rm -f /tmp/.kitx; exit \$rc"' | xz -T0 -6 >"$K/templates/br-router-rootfs.tar.xz"
+elif [ -s "$CACHE/br-router-rootfs.tar.xz" ]; then
+	cp "$CACHE/br-router-rootfs.tar.xz" "$K/templates/"
+	echo "   cwwk01 is not reachable: using the cached router image from $(date -r "$CACHE/br-router-rootfs.tar.xz" '+%F %H:%M')"
+else echo "cwwk01 ($SRC) is not reachable and no router image is cached in $CACHE"; exit 1; fi
 xz -dc "$K/templates/br-router-rootfs.tar.xz" | tar -tf - >"$K/templates/.router-list"
 if grep -qE '^\./etc/(shadow|dropbear/|uhttpd\.(crt|key))' "$K/templates/.router-list"; then
 	echo "router export still holds secrets; stopping"; exit 1
 fi
 grep -q '^\./etc/config/firewall$' "$K/templates/.router-list" || { echo "router export looks incomplete"; exit 1; }
 rm "$K/templates/.router-list"
+[ $LIVE = 1 ] && cp "$K/templates/br-router-rootfs.tar.xz" "$CACHE/br-router-rootfs.tar.xz"   # cache only a checked image
 
 ( cd "$K" && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 >SHA256SUMS )
 chmod +x "$K"/*.sh "$K"/host/br-* "$K"/edge/usr/local/sbin/*

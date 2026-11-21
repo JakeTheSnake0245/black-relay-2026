@@ -13,6 +13,10 @@
 # SSH session, log in at the console (or from a laptop on the site LAN: ssh root@10.(40+8(N-1)).0.2)
 # and run the same command again; it carries on at the right stage.
 #
+# A box that already runs other things is added to, not rebuilt: the installer looks first (survey),
+# only uses free ports, IDs 101-104 and the vmbr1/2/3/10 names, and stops before changing anything if
+# one is taken. Then the port step needs no console (nothing existing drops) and works over SSH.
+#
 # Things only a person can do stay as clear instructions at the end (USB stick for the site
 # lock, Spitz, Pocket ID client). The proof lists each as a WARN until it is done.
 set -uo pipefail
@@ -53,11 +57,13 @@ if ! done_ preflight; then
 	ip -4 route show default | grep -q . || die "no internet route: connect the install network first"
 	getent hosts deb.debian.org >/dev/null || die "DNS does not work"
 	[ "$(df --output=avail -BG /var/lib/vz | tail -1 | tr -dc 0-9)" -ge 25 ] || die "need 25 GB free on local storage"
-	pvesm status 2>/dev/null | grep -q '^local-lvm ' || die "storage 'local-lvm' is missing"
-	ports=$(for d in /sys/class/net/*/device; do n=${d%/device}; n=${n##*/}; [ -e /sys/class/net/$n/wireless ] || echo $n; done | wc -l)
-	[ "$ports" -ge 2 ] || die "found $ports network ports; need 2 or more"
-	[ -s /root/.ssh/authorized_keys ] || die "no SSH key in /root/.ssh/authorized_keys: host SSH passwords get turned off at the end"
-	echo "  Proxmox 9, kit intact, join file for $SITE, internet ok, $ports ports, SSH key present"
+	echo "  Proxmox 9, kit intact, join file for $SITE, internet ok"
+	if [ -r $D/install.env ]; then echo "  (an install from this kit already started here: not looked at again)"
+	else
+		SV=$(INST survey "$N" 2>&1); rc=$?; echo "$SV" | sed 's/^/  /'
+		[ $rc = 0 ] || die "nothing was changed. The PROBLEM lines above say what is in the way (README: 'A box that already runs things')"
+		grep -q 'mode: *ADD' <<<"$SV" || [ -s /root/.ssh/authorized_keys ] || die "no SSH key in /root/.ssh/authorized_keys: host SSH passwords get turned off at the end"
+	fi
 	mark preflight
 fi
 
@@ -73,8 +79,20 @@ if ! done_ install; then
 	mark install
 fi
 
+ADOPTED=$(sed -n 's/^ADOPT=//p' $D/install.env 2>/dev/null); PORTSEL=$(sed -n 's/^PORTS="\(.*\)"$/\1/p' $D/install.env 2>/dev/null)
+PORTHINT="any ports"; [ "$ADOPTED" = 1 ] && PORTHINT="any of these ports: $PORTSEL"
+
 # ---------------------------------------------------------------- 3 ports
-if ! done_ ports; then
+if ! done_ ports && [ "$ADOPTED" = 1 ]; then
+	say "3/7 ports: the free ports join Black Relay (the rest of this box stays as it is)"
+	cat <<TXT
+  Ports given to the site: $PORTSEL. Nothing else changes: the box's other bridges, ports and guests, its own
+  network and its route stay as they are, so this works over SSH too. It undoes itself after 15 minutes unless stage 5 runs.
+TXT
+	ask "  Add those ports now?" || { echo "  Nothing changed. Run this again when ready."; exit 0; }
+	INST ports || die "ports step failed"
+	mark ports
+elif ! done_ ports; then
 	say "3/7 ports: the network moves"
 	cat <<TXT
   Every port joins the port bridge (any cable, any port) and the install network ends.
@@ -98,8 +116,8 @@ fi
 if ! done_ modems; then
 	say "4/7 cables"
 	cat <<TXT
-  Plug in now: the modems (Starlink / ISP / the Spitz) in any ports, and a laptop in a free
-  port (it gets a $L.x address after about a minute; https://$L.10 is the controller).
+  Plug in now: the modems (Starlink / ISP / the Spitz) in $PORTHINT, and a laptop in a free
+  one of them (it gets a $L.x address after about a minute; https://$L.10 is the controller).
   The port layout undoes itself 15 minutes after stage 3, so do this now.
 TXT
 	ask "  Modems are plugged in?" || { echo "  Run this again when they are."; exit 0; }
@@ -109,7 +127,7 @@ fi
 # ---------------------------------------------------------------- 5 finish
 if ! done_ finish; then
 	say "5/7 finish: tunnel, tailnet, SSH hardening"
-	if INST finish; then mark finish
+	if BR_BOOTSTRAP=1 INST finish; then mark finish
 	else
 		echo
 		echo "  finish stopped: usually a modem with no internet yet. Fix it, then run this again."
@@ -141,6 +159,10 @@ say "7/7 proof"
 echo
 if [ $rc != 0 ]; then
 	echo "NOT READY: fix the FAIL lines, then run:  bash cwwk-bootstrap.sh --verify"
+	exit 1
+fi
+if ! done_ services; then
+	echo "NOT READY: a service bundle did not deploy (see stage 6 above). Fix it, then run:  bash cwwk-bootstrap.sh"
 	exit 1
 fi
 cat <<TXT

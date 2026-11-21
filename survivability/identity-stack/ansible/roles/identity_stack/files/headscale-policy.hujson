@@ -46,7 +46,15 @@
     "proxmox-lan": "10.73.66.0/24",
 
     // The dedicated Detection subnet-router LXC advertises only this range.
-    "detection-vlan": "10.73.200.0/24"
+    "detection-vlan": "10.73.200.0/24",
+
+    // subnet router for cwwk-02
+    "cwwk-02-services": "172.22.41.0/24",
+    "cwwk-02-networks": "172.22.100.0/24",
+
+    // subnet router for cwwk-01 (node cwwk-node01): site LAN / Wi-Fi and services
+    "cwwk-01-networks": "10.40.0.0/24",
+    "cwwk-01-services": "10.41.0.0/24"
   },
 
   "tagOwners": {
@@ -59,6 +67,10 @@
     "tag:sensor-fusion": ["group:survivability"],
     // sf-dev: the Sensor Fusion development container on BR2026.
     "tag:sf-dev": ["group:survivability"],
+    "tag:cwwk-02": ["group:survivability"],
+    // The TAK team's working space (CT 112, 172.22.41.15): full tailnet reach at Jake's explicit
+    // request, not scoped like everything else here. Revoke by deleting this tag and its grant below.
+    "tag:tak-space": ["group:survivability"],
 
     // The VPS itself, enrolled as blackrelay-vps with a short-lived
     // preauthorized key carrying this tag and no owning user. The tag owns the
@@ -75,11 +87,38 @@
     // subnet router does not need its route re-approving by hand.
     "routes": {
       "10.73.66.0/24": ["tag:proxmox-subnet-router"],
-      "10.73.200.0/24": ["tag:detection-subnet-router"]
+      "10.73.200.0/24": ["tag:detection-subnet-router"],
+      "172.22.100.0/24": ["tag:cwwk-02"],
+      "172.22.41.0/24": ["tag:cwwk-02"],
+      "10.40.0.0/24": ["tag:proxmox-subnet-router"],
+      "10.41.0.0/24": ["tag:proxmox-subnet-router"]
     }
   },
 
   "grants": [
+    {
+      "src": ["group:survivability", "group:detection", "group:sensor_fusion", "tag:sensor-fusion"],
+      "dst": ["cwwk-02-networks", "cwwk-02-services"],
+      "ip": ["*"]
+    },
+
+    // The TAK team's space (tag:tak-space, CT 112 on cwwk-02): full tailnet access, every destination,
+    // at Jake's explicit request on 2026-11-21. Not least-privilege like the rest of this policy --
+    // a deliberate exception for this one node.
+    {
+      "src": ["tag:tak-space"],
+      "dst": ["*"],
+      "ip": ["*"]
+    },
+
+    // cwwk-01 site LAN (Wi-Fi) and services, advertised by cwwk-node01. Open to every team,
+    // the same sources as cwwk-02: survivability, detection, sensor fusion (TAK) and their devices.
+    {
+      "src": ["group:survivability", "group:detection", "group:sensor_fusion", "tag:sensor-fusion"],
+      "dst": ["cwwk-01-networks", "cwwk-01-services"],
+      "ip": ["*"]
+    },
+
     // Each member reaches their own devices. Members deliberately cannot reach
     // each other's personal devices; shared infrastructure is the common
     // ground for joint testing.
